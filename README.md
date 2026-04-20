@@ -83,6 +83,19 @@ gis-agent chat --workspace ./workspace
 - 图层扫描、合并、投影转换、质量检查、地图导出
 - BAML 能力映射与启动前预检
 
+## 内置技能库
+
+### 空间分析技能
+- **缓冲区分析** (`buffer_analysis`)：对矢量数据进行缓冲区分析，生成指定距离的缓冲区多边形
+- **裁剪分析** (`clip_analysis`)：使用裁剪范围裁剪输入图层，提取指定区域内的要素
+- **相交分析** (`intersect_analysis`)：执行叠加相交分析，计算多个图层的交集区域
+
+### 数据管理技能
+- **要素融合** (`dissolve_features`)：根据指定字段合并相邻或相同属性的要素
+- **字段计算** (`field_calculator`)：批量计算或更新字段值，支持 Python 表达式
+
+所有技能均位于 `workspace/skills/` 目录，支持自定义扩展。
+
 ## 常用命令
 
 ### Agent 交互
