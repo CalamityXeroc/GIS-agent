@@ -94,6 +94,9 @@ gis-agent chat --workspace ./workspace
 - **要素融合** (`dissolve_features`)：根据指定字段合并相邻或相同属性的要素
 - **字段计算** (`field_calculator`)：批量计算或更新字段值，支持 Python 表达式
 
+### 其他技能
+还加入了一些通用技能，比如阅读pdf，word撰写等常用的技能~
+
 所有技能均位于 `workspace/skills/` 目录，支持自定义扩展。
 
 ## 常用命令
