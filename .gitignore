@@ -17,6 +17,7 @@ workspace/**
 !workspace/output/
 !workspace/temp/
 !workspace/skills/
+!workspace/skills/**
 !workspace/**/.gitkeep
 .gis_agent_state/
 .gis_agent_memory/
