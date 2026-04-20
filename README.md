@@ -1,2 +1,158 @@
-# GIS-agent
-GIS  agent是一个基于 ArcGIS Pro 3.6 的 arcpy构建的开源的地理空间智能体（AI Agent）框架。其核心设计采用独特的三层抽象架构（模型抽象、输出标准化、提示词动态适配），将您的自然语言指令与底层大语言模型及专业 GIS 工具链解耦。智能体自身能通过内置的规划器、记忆系统和执行引擎，自动将复杂任务拆解为步骤，协调调用 arcpy等工具完成从数据扫描、处理、符号化到地图导出的全流程，并具备任务恢复、质量检查与报告生成等高级能力。旨在成为连接自然语言交互与自动化专业 GIS 工作流的工程化桥梁。还在早期开发阶段可能有大量BUG欢迎指出！
+﻿# GIS agent
+
+GIS Agent 是一个基于 LLM 的智能代理，专为 ArcGIS Pro 3.6用户设计（后续可能会适配多种GIS软件），旨在通过自然语言交互简化 GIS 任务的执行。它能够理解用户的意图，规划任务步骤，并自动调用 ArcPy 或其他工具来完成复杂的 GIS 工作流程。
+
+## 前言
+
+对于非GIS专业的同学来说，利用GIS软件进行制图或分析可能会有一定的难度，因此我就想能不能做一个GIS agent来解决这一问题。这个项目来自于一个大学生的在AI的辅助下的尝试，虽然不够专业，但我希望它能为GIS的学习者提供一些帮助！
+
+
+还在早期开发阶段，很有可能会出现问题，欢迎大家提出宝贵的意见和建议！如果你也对GIS agent感兴趣，或者有相关的经验和技能，欢迎加入我们，一起完善这个项目！
+
+
+
+## 快速开始
+
+### 1. 安装
+```bash
+pip install -e .
+```
+
+使用 ArcGIS Pro Python：
+
+```bash
+"E:\ArcGISPro3.6\bin\Python\envs\arcgispro-py3\python.exe" -m pip install -e .
+```
+
+### 2. 启动
+
+推荐双击：
+
+- 一键启动.bat
+
+或命令行启动：
+
+```bash
+gis-agent chat --workspace ./workspace
+```
+
+启动脚本会自动完成：
+
+1. 检测 Python 运行时（优先 ArcGIS Pro Python，失败回退系统 Python）
+2. 同步本地 editable 安装
+3. 初始化工作区目录
+4. 以 `--workspace .\\workspace` 启动 Agent
+
+### 3. 输入输出目录
+
+- 输入数据：`workspace/input/`
+- 输出结果：`workspace/output/`
+- 临时文件：`workspace/temp/`
+- 自定义技能：`workspace/skills/`
+
+## 项目结构
+
+```text
+.
+ config/
+    execution_adapter_config.json
+    intents.json
+    llm_config.example.json
+    llm_config.json.example
+    planner_adapter_config.json
+    recovery_strategies.json
+ src/
+    baml_client/
+    gis_cli/
+ workspace/
+    input/
+    output/
+    skills/
+    temp/
+ INSTALL.md
+ pyproject.toml
+ README.md
+ 一键启动.bat
+```
+
+## 核心能力
+
+- 自然语言驱动的 GIS 任务执行
+- 任务规划、步骤编排与失败恢复
+- ArcPy 优先执行，ArcPy 不可用时自动降级
+- 图层扫描、合并、投影转换、质量检查、地图导出
+- BAML 能力映射与启动前预检
+
+## 常用命令
+
+### Agent 交互
+
+```bash
+gis-agent chat --workspace ./workspace
+```
+
+### 单次任务执行
+
+```bash
+gis-agent run "扫描并合并图层" --workspace ./workspace
+gis-agent run "制作专题图" --workspace ./workspace --execute
+```
+
+### 诊断与状态
+
+```bash
+gis-agent status
+gis-agent tools
+gis-agent skills
+gis-agent baml-check
+gis-agent baml-check --strict --require "intent,task_refine,planning,recovery"
+```
+
+## LLM 配置
+
+1. 复制模板：
+
+```bash
+cp config/llm_config.example.json config/llm_config.json
+```
+
+2. 编辑 `config/llm_config.json`，填写 `api_key/provider/model/api_base`。
+
+注意：`config/llm_config.json` 已在 `.gitignore` 中，默认不会提交。
+
+## BAML 预检（可选）
+
+```bash
+gis-agent chat --baml-precheck
+gis-agent chat --baml-precheck --baml-strict
+gis-agent chat --baml-precheck --baml-strict --baml-require "intent,planning"
+```
+
+建议发布前配置：
+
+```json
+{
+  "enable_baml_preflight": true,
+  "baml_preflight_strict": true,
+  "enable_baml_builtin_fallback": false
+}
+```
+
+## 常见问题
+
+1. 启动后识别不到数据
+- 确认数据已放入 `workspace/input/`
+- 确认启动参数包含 `--workspace ./workspace`
+
+2. 无 ArcGIS Pro 环境
+- 可运行对话与规划能力
+- 依赖 ArcPy 的步骤会自动降级，不会导致整机不可用
+
+3. 模型调用失败
+- 检查 `config/llm_config.json` 配置项是否完整
+- 检查网络与 API Key 是否有效
+
+## 说明文档
+
+- 安装与故障排查：`INSTALL.md`
+- 多模型适配开发文档：`docs/适配多种模型开发文档.md`

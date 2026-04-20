@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime outputs
+outputs/
+workspace/**
+!workspace/
+!workspace/input/
+!workspace/output/
+!workspace/temp/
+!workspace/skills/
+!workspace/**/.gitkeep
+.gis_agent_state/
+.gis_agent_memory/
+
+# Local planning/temp
+.planning/
+
+# Local config secrets
+config/llm_config.json
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

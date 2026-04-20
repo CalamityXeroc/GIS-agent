@@ -1,0 +1,66 @@
+{
+  "reason_to_prep_nodes": {
+    "missing_input": [
+      "scan_inputs"
+    ],
+    "merge_failed": [
+      "scan_inputs",
+      "merge_by_layer"
+    ],
+    "merge_or_dissolve_failed": [
+      "merge_by_layer"
+    ],
+    "arcpy_unavailable": [],
+    "implementation_pending": [],
+    "runner_exception": [
+      "scan_inputs"
+    ]
+  },
+  "implementation_fallback_nodes": {
+    "export_map_layout": [
+      "build_quality_report"
+    ]
+  },
+  "reason_recommendations": {
+    "arcpy_unavailable": "当前环境缺少 ArcPy，请切换到 ArcGIS Pro Python 环境后重试。",
+    "implementation_pending": "节点 {node} 尚未实现，建议先跳过或替换为可用节点。"
+  },
+  "rule_flags": {
+    "replace_implementation_pending_with_fallback": true,
+    "skip_implementation_pending": true,
+    "force_dry_run_when_arcpy_unavailable": true
+  },
+  "rule_priorities": {
+    "replace_implementation_pending_with_fallback": 100,
+    "skip_implementation_pending": 50,
+    "force_dry_run_when_arcpy_unavailable": 100
+  },
+  "profiles": {
+    "mapping": {
+      "implementation_fallback_nodes": {
+        "export_map_layout": [
+          "build_quality_report"
+        ]
+      },
+      "rule_priorities": {
+        "replace_implementation_pending_with_fallback": 120
+      }
+    },
+    "integration": {
+      "reason_to_prep_nodes": {
+        "merge_failed": [
+          "scan_inputs",
+          "merge_by_layer"
+        ]
+      }
+    },
+    "quality": {
+      "reason_recommendations": {
+        "implementation_pending": "质量流程节点 {node} 暂未实现，已应用降级处理。"
+      },
+      "rule_flags": {
+        "skip_implementation_pending": false
+      }
+    }
+  }
+}

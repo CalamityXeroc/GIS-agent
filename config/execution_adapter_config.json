@@ -1,0 +1,8 @@
+{
+  "mode": "legacy",
+  "guard": {
+    "min_attempts": 10,
+    "max_fallback_rate": 0.2,
+    "suggested_mode": "langchain"
+  }
+}

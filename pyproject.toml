@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gis-task-cli"
+version = "0.1.0"
+description = "General-purpose GIS task solving CLI for ArcGIS Pro workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "GIS CLI Team" }]
+dependencies = [
+  "typer>=0.12.3",
+  "pydantic>=2.8.2",
+  "rich>=13.0.0",
+  "openai>=1.0.0",
+  "litellm>=1.48.0",
+  "json5>=0.9.25",
+  "langchain>=0.3.0",
+  "langchain-community>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "langchain-text-splitters>=0.3.0",
+  "chromadb>=0.5.5",
+]
+
+[project.optional-dependencies]
+web = [
+  "fastapi>=0.111.1",
+  "uvicorn>=0.30.5",
+  "streamlit>=1.32.0",
+]
+office = [
+  "python-docx>=1.1.2",
+  "pypdf>=5.1.0",
+]
+dev = [
+  "pytest>=8.3.2",
+]
+
+[project.scripts]
+gis-cli = "gis_cli.cli:app"
+gis-cli-api = "gis_cli.web.api:run"
+gis-cli-ui = "gis_cli.web.ui_launcher:run"
+gis-agent = "gis_cli.agent.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

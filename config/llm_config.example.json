@@ -1,0 +1,55 @@
+{
+  "model": "Pro/zai-org/GLM-5",
+  "api_key": "sk-your-api-key-here",
+  "api_base": "https://api.siliconflow.cn/v1",
+  "temperature": 0.5,
+  "max_tokens": 2048,
+  "timeout": 60,
+  "provider": "siliconflow",
+  "enable_prompt_optimizer": true,
+  "enable_baml_standardizer": true,
+  "provider_models": {
+    "siliconflow": ["Qwen/Qwen3.5-32B", "Pro/zai-org/GLM-5"],
+    "openai": ["gpt-4o-mini"]
+  },
+  "routing_rules": {
+    "planning": ["Qwen/Qwen3.5-32B"],
+    "intent": ["gpt-4o-mini"],
+    "task_refine": ["Qwen/Qwen3.5-32B"]
+  },
+  "baml_functions": {
+    "planning": ["generate_gis_plan"],
+    "intent": ["infer_gis_intent"],
+    "task_refine": ["refine_gis_task"],
+    "recovery": ["suggest_gis_recovery"]
+  },
+  "enable_baml_preflight": true,
+  "baml_preflight_strict": false,
+  "baml_required_capabilities": ["intent", "task_refine", "planning", "recovery"],
+  "enable_baml_builtin_fallback": true,
+  
+  "_comment": "这是配置示例文件，请复制为 llm_config.json 并填入真实的 API Key",
+  
+  "_examples": {
+    "硅基流动 (SiliconFlow)": {
+      "api_base": "https://api.siliconflow.cn/v1",
+      "model": "Pro/zai-org/GLM-5"
+    },
+    "阿里千问 (Qwen)": {
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-turbo"
+    },
+    "DeepSeek": {
+      "api_base": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat"
+    },
+    "智谱 GLM": {
+      "api_base": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "glm-4-flash"
+    },
+    "OpenAI": {
+      "api_base": "https://api.openai.com/v1",
+      "model": "gpt-4"
+    }
+  }
+}

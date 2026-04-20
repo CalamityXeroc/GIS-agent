@@ -1,0 +1,49 @@
+{
+  "_comment": "这是配置文件示例，复制为 llm_config.json 并填入你的 API 信息",
+  "model": "Pro/zai-org/GLM-5",
+  "api_key": "YOUR_API_KEY_HERE",
+  "api_base": "https://api.siliconflow.cn/v1",
+  "temperature": 0.5,
+  "max_tokens": 2048,
+  "timeout": 60,
+  "provider": "siliconflow",
+  "enable_prompt_optimizer": true,
+  "enable_baml_standardizer": true,
+  "provider_models": {
+    "siliconflow": ["Qwen/Qwen2.5-7B-Instruct", "Pro/zai-org/GLM-5"],
+    "openai": ["gpt-4o-mini"]
+  },
+  "routing_rules": {
+    "planning": ["Qwen/Qwen2.5-7B-Instruct"],
+    "intent": ["gpt-4o-mini"]
+  },
+  "baml_functions": {
+    "planning": ["generate_gis_plan"],
+    "intent": ["infer_gis_intent"],
+    "task_refine": ["refine_gis_task"],
+    "recovery": ["suggest_gis_recovery"]
+  },
+  "enable_baml_preflight": true,
+  "baml_preflight_strict": false,
+  "baml_required_capabilities": ["intent", "task_refine", "planning", "recovery"],
+  "enable_baml_builtin_fallback": true,
+  
+  "_providers": {
+    "siliconflow": {
+      "api_base": "https://api.siliconflow.cn/v1",
+      "models": [
+        "Pro/zai-org/GLM-5",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "deepseek-ai/DeepSeek-V3"
+      ]
+    },
+    "openai": {
+      "api_base": "https://api.openai.com/v1",
+      "models": ["gpt-4", "gpt-3.5-turbo"]
+    },
+    "local": {
+      "api_base": "http://localhost:11434",
+      "models": ["llama2", "qwen"]
+    }
+  }
+}
