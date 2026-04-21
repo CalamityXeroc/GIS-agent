@@ -18,6 +18,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+def _pydantic_fallback(obj):
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 @dataclass
 class AdaptationMetrics:
@@ -157,7 +163,7 @@ class PlanStandardizer:
             "validate_gis_execution_plan",
         ]
 
-        source = json.dumps(plan_json, ensure_ascii=False)
+        source = json.dumps(plan_json, ensure_ascii=False, default=_pydantic_fallback)
         for fn_name in candidate_functions:
             fn = getattr(b, fn_name, None)
             if not callable(fn):
@@ -346,7 +352,7 @@ class BAMLBridge:
             self._candidate_functions("planning", ["generate_gis_plan", "create_gis_plan", "generate_execution_plan"]),
             task_description=task_description,
             context=context_payload,
-            context_json=json.dumps(context_payload, ensure_ascii=False),
+            context_json=json.dumps(context_payload, ensure_ascii=False, default=_pydantic_fallback),
         )
         if isinstance(result, dict):
             return result
@@ -375,9 +381,9 @@ class BAMLBridge:
             plan=plan_payload,
             failed_step=failed_step_payload,
             remaining_steps=remaining_steps_payload,
-            plan_json=json.dumps(plan_payload, ensure_ascii=False),
-            failed_step_json=json.dumps(failed_step_payload, ensure_ascii=False),
-            remaining_steps_json=json.dumps(remaining_steps_payload, ensure_ascii=False),
+            plan_json=json.dumps(plan_payload, ensure_ascii=False, default=_pydantic_fallback),
+            failed_step_json=json.dumps(failed_step_payload, ensure_ascii=False, default=_pydantic_fallback),
+            remaining_steps_json=json.dumps(remaining_steps_payload, ensure_ascii=False, default=_pydantic_fallback),
         )
         if isinstance(result, dict):
             return result

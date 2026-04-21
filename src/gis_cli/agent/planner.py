@@ -7,12 +7,22 @@ from __future__ import annotations
 
 import json
 import re
+import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 from enum import Enum
 
 from .model_adaptation import BAMLBridge, PromptAdapter, PlanStandardizer
+
+# 默认输出路径配置
+DEFAULT_OUTPUT_FOLDER = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "workspace", "output")
+)
+if not os.path.isabs(DEFAULT_OUTPUT_FOLDER):
+    # 如果路径不绝对，使用相对于当前工作目录的路径
+    DEFAULT_OUTPUT_FOLDER = os.path.abspath(os.path.join(os.getcwd(), "workspace", "output"))
 
 
 class StepStatus(str, Enum):
@@ -71,6 +81,12 @@ class PlanStep:
     
     def to_dict(self) -> dict:
         """Convert to dictionary."""
+        result_dict = self.result
+        if hasattr(result_dict, "model_dump"):
+            result_dict = result_dict.model_dump()
+        elif hasattr(result_dict, "dict"):
+            result_dict = result_dict.dict()
+            
         return {
             "id": self.id,
             "tool": self.tool,
@@ -78,7 +94,7 @@ class PlanStep:
             "input": self.input,
             "depends_on": self.depends_on,
             "status": self.status.value,
-            "result": self.result,
+            "result": result_dict,
             "error": self.error,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -415,7 +431,7 @@ class AgentPlanner:
         
         # Extract context info
         input_folder = context.get("input_folder", "./workspace/input") if context else "./workspace/input"
-        output_folder = context.get("output_folder", "./workspace/output") if context else "./workspace/output"
+        output_folder = context.get("output_folder", DEFAULT_OUTPUT_FOLDER) if context else DEFAULT_OUTPUT_FOLDER
         input_files = context.get("input_files", []) if context else []
         
         # === 首先检查是否是筛选合并任务（优先级最高）===
@@ -455,7 +471,7 @@ class AgentPlanner:
             ))
         
         # Output path helper
-        output_folder = context.get("output_folder", "./workspace/output") if context else "./workspace/output"
+        output_folder = context.get("output_folder", DEFAULT_OUTPUT_FOLDER) if context else DEFAULT_OUTPUT_FOLDER
 
         # 创建文件地理数据库（高优先级专用路径，避免落入通用占位 execute_code）
         create_gdb_markers = [
@@ -699,7 +715,7 @@ set_result({{"status": "需要LLM生成代码", "task": "{task_description[:50]}
         skill = skill_match.skill
         
         # 找到匹配的技能，生成执行计划
-        output_folder = context.get("output_folder", "./workspace/output") if context else "./workspace/output"
+        output_folder = context.get("output_folder", DEFAULT_OUTPUT_FOLDER) if context else DEFAULT_OUTPUT_FOLDER
         input_folder = context.get("input_folder", "./workspace/input") if context else "./workspace/input"
         
         # 使用技能的代码模板
@@ -1177,7 +1193,7 @@ set_result({{"output": output_path, "feature_count": count, "merged_layers": len
                         "print('Recovery fallback for failed step')\n"
                         "set_result({'recovery': 'execute_code_fallback', 'failed_step': '" + failed_step.id + "'})"
                     ),
-                    "workspace": "./workspace/output",
+                    "workspace": DEFAULT_OUTPUT_FOLDER,
                     "description": f"Recovery fallback for {failed_step.id}"
                 },
                 depends_on=[]
