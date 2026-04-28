@@ -304,14 +304,18 @@ class AgentPlanner:
     def plan(
         self,
         task_description: str,
-        context: dict[str, Any] | None = None
+        context: dict[str, Any] | None = None,
+        expert_mode: bool = True,
     ) -> Plan:
         """Generate an execution plan for a task.
-        
+
         If LLM is available, uses it for planning.
+        In expert mode, injects GIS domain knowledge into the prompt.
         Otherwise falls back to rule-based planning.
         """
         if self.llm_client:
+            if expert_mode:
+                return self._plan_with_llm_expert(task_description, context)
             return self._plan_with_llm(task_description, context)
         else:
             return self._plan_with_rules(task_description, context)
@@ -365,6 +369,179 @@ class AgentPlanner:
         plan.metadata["llm_fallback_used"] = True
         plan.metadata["llm_fallback_reason"] = fallback_reason
         return plan
+
+    def _plan_with_llm_expert(
+        self,
+        task_description: str,
+        context: dict[str, Any] | None,
+    ) -> Plan:
+        """Generate plan using LLM with GIS domain knowledge injection."""
+        from .prompts import SystemPrompts
+        from .gis_domain_prompts import GISDomainPrompts
+
+        # 1. Determine which GIS domain sections are relevant
+        domain_knowledge = GISDomainPrompts.get_relevant_sections(task_description)
+
+        # 2. Extract data_schema from context if available (strip from context_json to avoid duplication)
+        data_schema = ""
+        context_for_json = dict(context) if context else {}
+        if context and "data_schema" in context:
+            data_schema = context["data_schema"]
+            del context_for_json["data_schema"]
+
+        # 3. Build enhanced expert planning prompts
+        context_json = json.dumps(context_for_json, ensure_ascii=False, indent=2) if context else "{}"
+        prompts = self._build_expert_planning_prompts(
+            task_description, domain_knowledge, context_json, data_schema
+        )
+
+        fallback_reason = "invalid_json_or_schema"
+
+        try:
+            for prompt in prompts:
+                response = self.llm_client.chat(
+                    messages=[
+                        {"role": "system", "content": SystemPrompts.SYSTEM_EXPERT_CN},
+                        {"role": "user", "content": prompt}
+                    ],
+                    task_type="planning_expert",
+                )
+
+                plan_json = self._extract_plan_json(response)
+                if self._is_valid_plan_json(plan_json):
+                    # Extract expert_notes into plan metadata
+                    expert_notes = plan_json.pop("expert_notes", {})
+                    plan = Plan.from_dict(plan_json)
+                    plan.metadata["expert_notes"] = expert_notes
+                    plan.metadata["llm_planning"] = "success_expert"
+                    plan.metadata["llm_fallback_used"] = False
+
+                    # Self-verify plan quality
+                    verification = self._verify_expert_plan(
+                        plan, task_description
+                    )
+                    plan.metadata["plan_verification"] = verification
+                    if not verification.get("pass", False):
+                        issues = verification.get("issues", [])
+                        if issues:
+                            plan.metadata["plan_warnings"] = issues
+
+                    return plan
+        except Exception as e:
+            print(f"[Expert] LLM planning failed: {e}, falling back to standard LLM")
+            fallback_reason = "expert_llm_exception"
+
+        # Fallback: try standard LLM planning
+        plan = self._plan_with_llm(task_description, context)
+        if plan.metadata.get("llm_planning") != "fallback":
+            # standard LLM succeeded, tag it as expert fallback
+            plan.metadata["llm_planning"] = "expert_fallback_standard"
+        return plan
+
+    def _verify_expert_plan(
+        self,
+        plan: Plan,
+        task_description: str,
+    ) -> dict[str, Any]:
+        """Self-verify plan quality before presenting to user.
+
+        Checks the generated plan against a GIS best-practice checklist
+        and returns any issues found. This catches omissions that the
+        initial prompt didn't prevent (e.g. missing projection, missing
+        map elements).
+        """
+        if not self.llm_client or not plan.steps:
+            return {"pass": True, "issues": [], "note": "skipped_no_llm"}
+
+        # Build verification checklist based on task content
+        task_lower = task_description.lower()
+        checks: list[str] = []
+
+        # Check 1: Does the plan have map output elements?
+        has_map_export = any(
+            s.tool == "export_map" for s in plan.steps
+        )
+        has_execute_code = any(
+            s.tool == "execute_code" for s in plan.steps
+        )
+        expert_notes = plan.metadata.get("expert_notes", {})
+
+        if task_lower in ("", "general"):
+            return {"pass": True, "issues": [], "note": "skipped_generic"}
+
+        # 1. Projection check: distance/area tasks need projection
+        if any(kw in task_lower for kw in ["面积", "距离", "长度", "缓冲区", "buffer", "area", "distance"]):
+            if not any("project" in s.tool or "投影" in s.description for s in plan.steps):
+                checks.append("任务涉及距离/面积计算，但计划中没有投影步骤")
+
+        # 2. Map completeness check
+        if has_map_export:
+            elements = expert_notes.get("cartographic_elements", [])
+            if not elements:
+                checks.append("专题图缺少地图要素说明（图名/图例/比例尺/指北针）")
+            else:
+                element_text = " ".join(elements).lower()
+                missing = []
+                for req in ["图名", "图例", "比例尺", "指北针"]:
+                    if req not in element_text and req not in str(plan.steps):
+                        missing.append(req)
+                if missing:
+                    checks.append(f"地图缺少: {', '.join(missing)}")
+
+        # 3. Color scheme check for thematic maps
+        if has_map_export:
+            color = expert_notes.get("color_scheme", "")
+            if not color:
+                checks.append("专题图未指定配色方案")
+
+        # 4. Analysis plan check
+        if has_execute_code and not expert_notes.get("analysis", "").strip():
+            checks.append("execute_code 步骤缺少分析方案说明")
+
+        result = {
+            "pass": len(checks) == 0,
+            "issues": checks,
+            "note": "ok" if len(checks) == 0 else f"发现 {len(checks)} 个问题",
+        }
+        return result
+
+    def _build_expert_planning_prompts(
+        self,
+        task_description: str,
+        domain_knowledge: str,
+        context_json: str,
+        data_schema: str = "",
+    ) -> list[str]:
+        """Build progressive prompts for expert mode planning."""
+        from .prompts import SystemPrompts
+
+        base_prompt = SystemPrompts.get_planning_prompt(
+            task_description,
+            expert_mode=True,
+            domain_knowledge=domain_knowledge,
+            context_json=context_json,
+            data_schema=data_schema,
+        )
+
+        strict_retry = (
+            f"{base_prompt}\n\n"
+            "重要：仅输出一个合法 JSON 对象，不要包含 markdown 代码块，不要解释。\n"
+            "JSON 必须包含字段：id, goal, steps, expected_outputs, expert_notes。\n"
+            "每个 step 必须包含：id, tool, description, input, depends_on。\n"
+            "所有参数值必须具体明确，不要使用占位符。"
+        )
+
+        model_hint = self._get_model_hint()
+        return [
+            self.prompt_adapter.adapt_prompt(base_prompt, task_type="planning", model_hint=model_hint),
+            self.prompt_adapter.adapt_prompt(strict_retry, task_type="planning", model_hint=model_hint),
+        ]
+
+    def _get_model_hint(self) -> str:
+        """Get model hint string for prompt adapter."""
+        if self.llm_client and hasattr(self.llm_client, 'config'):
+            return f"{self.llm_client.config.provider}/{self.llm_client.config.model}"
+        return ""
 
     def _build_planning_prompts(
         self,

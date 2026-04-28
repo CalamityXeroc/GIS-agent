@@ -1,0 +1,5 @@
+[console_scripts]
+gis-agent = gis_cli.agent.cli:main
+gis-cli = gis_cli.cli:app
+gis-cli-api = gis_cli.web.api:run
+gis-cli-ui = gis_cli.web.ui_launcher:run

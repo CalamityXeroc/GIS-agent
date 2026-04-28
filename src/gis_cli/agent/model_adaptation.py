@@ -232,6 +232,9 @@ class PlanStandardizer:
             "steps": normalized_steps,
             "expected_outputs": plan_json.get("expected_outputs") if isinstance(plan_json.get("expected_outputs"), list) else [],
         }
+        # Preserve expert_notes for expert mode planning
+        if "expert_notes" in plan_json:
+            normalized["expert_notes"] = plan_json["expert_notes"]
         return normalized
 
     def _extract_tool_and_input(self, step: dict[str, Any]) -> tuple[str, dict[str, Any]]:

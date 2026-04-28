@@ -64,6 +64,9 @@ class AgentConfig:
     workspace_path: Path | None = None
     output_dir: Path | None = None
 
+    # Expert mode (default: enabled)
+    expert_mode: bool = True
+
 
 @dataclass 
 class AgentResponse:
@@ -307,6 +310,8 @@ class GISAgent:
             response = self._handle_preview(message)
         elif intent == "cancel":
             response = self._handle_cancel(message)
+        elif intent == "skip_step":
+            response = self._handle_skip_step(message)
         else:
             response = self._handle_general_query(message)
         
@@ -581,7 +586,7 @@ class GISAgent:
         snapshot = self.context_hub.discover()
         context.update(self.context_hub.build_planner_payload(snapshot))
         
-        plan = self.planner.plan(task_description, context)
+        plan = self.planner.plan(task_description, context, expert_mode=self.config.expert_mode)
         if plan is None:
             plan = Plan(
                 id=f"plan_fallback_{int(time.time())}",
@@ -680,6 +685,7 @@ class GISAgent:
             resume_markers = [
                 "继续执行", "继续", "重试", "retry", "resume", "接着执行", "继续跑",
                 "再试", "再试试", "换个方法", "换个方式", "试试别的", "继续之前", "继续上一个",
+                "重写代码", "代码重写", "重写", "重做", "重新", "换一种", "换种", "换一下",
             ]
             if any(marker in stripped_pending for marker in resume_markers):
                 return "confirm_action"
@@ -935,12 +941,20 @@ class GISAgent:
         return "general"
     
     def _handle_suggestion_selection(self, selection: str) -> str:
-        """Handle numeric suggestion selection."""
+        """Handle numeric suggestion selection, context-aware."""
         idx = int(selection) - 1
-        
+
         # Check if we have a current plan (user is selecting action for plan)
         if self.current_plan and not self.current_plan.is_complete:
-            # Suggestions were: ["执行计划", "预览 dry-run", "取消"]
+            if self.current_plan.has_failed:
+                # Recovery suggestions: ["查看详细错误信息", "重试失败的步骤", "跳过失败步骤继续"]
+                recovery_actions = ["query_status", "confirm_action", "skip_step"]
+                if 0 <= idx < len(recovery_actions):
+                    if recovery_actions[idx] == "confirm_action":
+                        self._pending_confirmation_mode = ExecutionMode.EXECUTE
+                    return recovery_actions[idx]
+
+            # Normal suggestions: ["执行计划", "预览 dry-run", "取消"]
             if idx == 0:
                 self._pending_confirmation_mode = ExecutionMode.EXECUTE
                 return "confirm_action"  # Execute
@@ -1479,6 +1493,13 @@ class GISAgent:
     def _handle_confirmation(self, message: str) -> AgentResponse:
         """Handle confirmation response."""
         if self.current_plan and not self.current_plan.is_complete:
+            if self.current_plan.has_failed and self._contains_retry_intent(message):
+                user_feedback = self._extract_user_feedback(message)
+                retry_prompt = self._build_retry_replan_prompt(
+                    self.current_plan, self.last_result, user_feedback
+                )
+                return self._handle_task_execution(retry_prompt)
+
             # Execute the pending plan
             mode = self._pending_confirmation_mode or ExecutionMode.EXECUTE
             self._pending_confirmation_mode = None
@@ -1515,7 +1536,8 @@ class GISAgent:
                 content=content,
                 action_taken="execute",
                 plan=self.current_plan,
-                execution_result=result
+                execution_result=result,
+                suggestions=self._get_recovery_suggestions(result) if not result.success else []
             )
         else:
             if self._message_implies_document_usage(message) or (
@@ -1595,8 +1617,53 @@ class GISAgent:
                 content="当前没有待取消的计划。",
                 action_taken="cancel"
             )
-    
+
+    def _handle_skip_step(self, message: str) -> AgentResponse:
+        """Skip the failed step(s) and continue execution."""
+        if not self.current_plan:
+            return AgentResponse(
+                content="当前没有正在执行的计划。",
+                action_taken="skip"
+            )
+
+        skipped = []
+        for step in self.current_plan.get_failed_steps():
+            step.status = StepStatus.SKIPPED
+            step.error = None
+            skipped.append(step.id)
+
+        if not skipped:
+            return AgentResponse(
+                content="没有可跳过的失败步骤。",
+                action_taken="skip"
+            )
+
+        result, recovery_notes = self._execute_with_recovery(
+            self.current_plan, ExecutionMode.EXECUTE
+        )
+
+        content = f"已跳过步骤：{', '.join(skipped)}。"
+        if result.success:
+            delivered = self._collect_output_candidates(result)
+            if delivered:
+                content += f"\n\n后续步骤执行成功！\n\n输出文件：\n{self._format_outputs(delivered)}"
+            else:
+                content += "\n\n后续步骤执行完成。"
+        else:
+            content += f"\n\n后续步骤执行失败：{result.error}"
+
+        if recovery_notes:
+            content += "\n\n恢复日志：\n" + "\n".join(f"- {n}" for n in recovery_notes)
+
+        return AgentResponse(
+            content=content,
+            action_taken="skip",
+            plan=self.current_plan,
+            execution_result=result,
+        )
+
     def _handle_general_query(self, message: str) -> AgentResponse:
+        """Handle general query."""
         """Handle general query."""
         if self.last_result and self._is_why_empty_output_query(message):
             return self._handle_status_query(message)
@@ -1760,7 +1827,7 @@ class GISAgent:
     def _format_plan_summary(self, plan: Plan) -> str:
         """Format plan as readable summary."""
         lines = [f"**目标**: {plan.goal}", "", "**执行步骤**:"]
-        
+
         for i, step in enumerate(plan.steps, 1):
             status_icon = ""
             if step.status.value == "completed":
@@ -1769,9 +1836,17 @@ class GISAgent:
                 status_icon = ""
             elif step.status.value == "running":
                 status_icon = ""
-            
+
             lines.append(f"{i}. {status_icon} [{step.tool}] {step.description}")
-        
+
+        # Add plan warnings from self-verification
+        warnings = plan.metadata.get("plan_warnings", [])
+        if warnings:
+            lines.append("")
+            lines.append("**⚠️ 规划建议**:")
+            for w in warnings:
+                lines.append(f"- {w}")
+
         return "\n".join(lines)
 
     def _format_outputs(self, outputs: list[str]) -> str:
@@ -1905,7 +1980,7 @@ class GISAgent:
     def _get_recovery_suggestions(self, result: ExecutionResult) -> list[str]:
         """Get recovery suggestions for failed execution."""
         suggestions = []
-        
+
         if not result.success:
             suggestions.append("查看详细错误信息")
             suggestions.append("重试失败的步骤")
@@ -1913,10 +1988,12 @@ class GISAgent:
 
             if self._is_output_exists_error(result.error):
                 suggestions.append("直接覆盖现有输出并重试")
-            
-            if "arcpy" in (result.error or "").lower():
-                suggestions.append("切换到 ArcGIS Pro 环境执行")
-        
+
+            # Only suggest switching to ArcGIS Pro if not already using it
+            if not self.context.arcpy_available:
+                if "arcpy" in (result.error or "").lower():
+                    suggestions.append("切换到 ArcGIS Pro 环境执行")
+
         return suggestions
 
     def _contains_overwrite_intent(self, message: str) -> bool:
@@ -1926,6 +2003,79 @@ class GISAgent:
             "overwrite", "force overwrite"
         ]
         return any(m in lowered for m in markers)
+
+    def _contains_retry_intent(self, message: str) -> bool:
+        lowered = message.lower().strip()
+        markers = [
+            "继续", "继续执行", "继续跑", "重试", "再试", "再试试",
+            "换个方法", "换个方式", "试试别的",
+            "重写代码", "代码重写", "重写", "重做", "重新",
+            "换一种", "换种", "换一下",
+            "retry", "resume", "try again", "redo",
+        ]
+        return any(m in lowered for m in markers)
+
+    def _build_retry_replan_prompt(
+        self,
+        plan: Plan,
+        result: ExecutionResult | None,
+        user_feedback: str = "",
+    ) -> str:
+        failed_steps = plan.get_failed_steps()
+        failed_lines: list[str] = []
+        for step in failed_steps[:3]:
+            err = (step.error or "未知错误").strip()
+            failed_lines.append(f"- 步骤 {step.id}（{step.tool}）：{err[:220]}")
+
+        if not failed_lines and result and result.error:
+            failed_lines.append(f"- 上次错误：{str(result.error)[:220]}")
+
+        failure_text = "\n".join(failed_lines) if failed_lines else "- 上次执行失败，但未记录到明确失败步骤"
+
+        feedback_section = ""
+        if user_feedback:
+            feedback_section = (
+                "\n用户修正意见（必须采纳）：\n"
+                f"{user_feedback}\n"
+            )
+
+        return (
+            "请重新规划并执行同一任务，避免重复之前失败路径。\n"
+            f"任务目标：{plan.goal}\n"
+            "上次失败摘要：\n"
+            f"{failure_text}\n"
+            f"{feedback_section}"
+            "要求：\n"
+            "1. 优先保留原目标，不要机械复用原失败步骤。\n"
+            "2. 必要时调整工具选择或参数后再执行。\n"
+            "3. 若存在可替代路径，优先选择成功率更高的方案。\n"
+            "4. 用户修正意见优先级最高，必须严格遵循。"
+        )
+
+    def _extract_user_feedback(self, message: str) -> str:
+        """Extract substantive user feedback from retry message.
+
+        Strips known retry/action keywords to isolate the user's specific
+        guidance about how to fix the issue.
+
+        Examples:
+        - "换个方法用KEEP_COMMON" → "用KEEP_COMMON"
+        - "重写代码，用arcpy.KEEP_COMMON" → "用arcpy.KEEP_COMMON"
+        - "重试" → "" (no specific feedback)
+        """
+        retry_keywords = [
+            "继续执行", "继续跑", "继续",
+            "重试", "重写代码", "代码重写", "重写", "重做", "重新",
+            "再试", "再试试",
+            "换个方法", "换个方式", "试试别的",
+            "换一种", "换种", "换一下",
+            "retry", "resume", "try again", "redo",
+        ]
+        feedback = message
+        for kw in sorted(retry_keywords, key=len, reverse=True):
+            feedback = feedback.replace(kw, "")
+        feedback = feedback.strip().strip("，,。.!！；;:：")
+        return feedback
 
     def _is_output_exists_error(self, error_text: str | None) -> bool:
         lowered = (error_text or "").lower()

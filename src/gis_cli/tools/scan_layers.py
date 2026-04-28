@@ -67,6 +67,10 @@ class LayerInfo(BaseModel):
     extension: str
     spatial_reference: str | None = None
     feature_count: int | None = None
+    fields: list[dict] = []  # e.g. [{"name": "FIELD1", "type": "String"}, ...]
+    wkid: int | None = None  # CRS factory code (e.g. 4326 for WGS84)
+    has_z: bool = False
+    has_m: bool = False
 
 
 class ScanLayersOutput(BaseModel):
@@ -153,7 +157,11 @@ class ScanLayersTool(Tool[ScanLayersInput, ScanLayersOutput]):
                             type=layer_type,
                             extension=Path(layer_data.get("path", "")).suffix.lower(),
                             spatial_reference=layer_data.get("spatial_reference"),
-                            feature_count=layer_data.get("feature_count")
+                            feature_count=layer_data.get("feature_count"),
+                            fields=layer_data.get("fields", []),
+                            wkid=layer_data.get("wkid"),
+                            has_z=layer_data.get("has_z", False),
+                            has_m=layer_data.get("has_m", False),
                         )
                         layers.append(layer_info)
                         by_type[layer_type] = by_type.get(layer_type, 0) + 1

@@ -106,6 +106,7 @@ def create_agent(
     baml_precheck: bool = True,
     baml_strict: bool = False,
     baml_require: Optional[list[str]] = None,
+    expert_mode: bool = True,
 ) -> GISAgent:
     """Create and configure the GIS Agent."""
     workspace_root = workspace or Path.cwd()
@@ -116,7 +117,8 @@ def create_agent(
         memory_path=workspace_root / ".gis_agent_memory",
         state_path=workspace_root / ".gis_agent_state" / "workflow_state.json",
         default_mode=ExecutionMode.DRY_RUN if dry_run else ExecutionMode.EXECUTE,
-        llm_enabled=llm_enabled
+        llm_enabled=llm_enabled,
+        expert_mode=expert_mode,
     )
     
     llm_client = None
@@ -680,7 +682,7 @@ def eval_loop(
     """运行第三阶段评测闭环并生成报告。"""
     workspace_root = workspace or Path.cwd()
     memory_dir = workspace_root / ".gis_agent_memory"
-    evaluation_dir = workspace_root / "output" / "evaluation"
+    evaluation_dir = workspace_root / "workspace" / "output" / "evaluation"
     exec_history = workspace_root / "config" / "execution_adapter_history.json"
 
     loop = AgentEvaluationLoop(
@@ -741,7 +743,7 @@ def benchmark_models(
         base_config = LLMConfig.from_env()
 
     benchmark = MultiModelBenchmark(
-        output_dir=workspace_root / "output" / "evaluation",
+        output_dir=workspace_root / "workspace" / "output" / "evaluation",
         base_config=base_config,
     )
     report = benchmark.run(models=selected_models, tasks=tasks, repeats=max(1, repeats))

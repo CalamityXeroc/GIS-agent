@@ -9,6 +9,7 @@ from .quality_check import QualityCheckTool
 from .execute_code import ExecuteCodeTool
 from .read_word import ReadWordTool
 from .read_pdf import ReadPdfTool
+from .web_search import WebSearchTool
 
 __all__ = [
     "ScanLayersTool",
@@ -19,6 +20,7 @@ __all__ = [
     "ExecuteCodeTool",
     "ReadWordTool",
     "ReadPdfTool",
+    "WebSearchTool",
 ]
 
 
@@ -35,6 +37,7 @@ def register_all_tools() -> None:
         ExecuteCodeTool(),
         ReadWordTool(),
         ReadPdfTool(),
+        WebSearchTool(),
     ]
     
     for tool in tools:

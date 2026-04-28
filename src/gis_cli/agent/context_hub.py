@@ -89,7 +89,7 @@ class ContextHub:
         if not shapefiles and not geodatabases:
             unresolved.append("未发现输入数据（.shp/.gdb）")
 
-        output_root = str(self.workspace / "output")
+        output_root = str(self.workspace / "workspace" / "output")
         snapshot = ContextSnapshot(
             workspace_path=str(self.workspace),
             input_roots=[str(r) for r in roots],
@@ -135,7 +135,61 @@ class ContextHub:
             "smart_hints": hints,
             "detected_project_path": self.best_project_path(snapshot),
             "detected_input_root": self.best_input_root(snapshot),
+            "data_schema": self._build_data_schema(snapshot),
         }
+
+    def _build_data_schema(self, snapshot: ContextSnapshot) -> str:
+        """Build a formatted data schema string from discovered layers.
+
+        This produces a compact summary that gets injected into the LLM
+        planning prompt so generated ArcPy code knows actual field names,
+        types, and CRS info.
+        """
+        parts: list[str] = []
+
+        # Basic schema from file-based discovery
+        for shp in snapshot.shapefiles[:20]:
+            p = Path(shp)
+            parts.append(f"  {p.name}: path={shp}, type=Shapefile")
+
+        for gdb in snapshot.geodatabases[:10]:
+            p = Path(gdb)
+            parts.append(f"  {p.name}: path={gdb}, type=FileGeodatabase")
+
+        # Try enriching with ArcPy if available (fields, wkid, geometry)
+        if snapshot.shapefiles or snapshot.geodatabases:
+            try:
+                from ..arcpy_bridge import scan_workspace_layers
+                for root in snapshot.input_roots:
+                    result = scan_workspace_layers(root)
+                    if result.status == "success" and result.data:
+                        for layer in result.data.get("layers", []):
+                            name = layer.get("name", "")
+                            geom = layer.get("type", "Unknown")
+                            sr = layer.get("spatial_reference", "Unknown")
+                            wkid = layer.get("wkid")
+                            fields = layer.get("fields", [])
+                            # Truncate fields list to 20 max
+                            field_strs = [f"{f['name']}({f['type']})" for f in fields[:20]]
+                            field_str = ", ".join(field_strs)
+                            if len(fields) > 20:
+                                field_str += f" (+{len(fields)-20} more)"
+                            wkid_str = f" (WKID {wkid})" if wkid else ""
+                            parts.append(
+                                f"  {name}: geom={geom}, sr={sr}{wkid_str}, "
+                                f"fields={{{field_str}}}"
+                            )
+                        break  # Use first input root's scan
+            except ImportError:
+                pass  # ArcPy not available
+            except Exception:
+                pass  # Non-fatal; fall back to basic schema
+
+        if not parts:
+            return ""
+
+        lines = ["\n## 数据 Schema"] + parts
+        return "\n".join(lines)
 
     def _candidate_input_roots(self) -> list[Path]:
         roots: list[Path] = []

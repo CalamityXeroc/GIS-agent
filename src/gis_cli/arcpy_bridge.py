@@ -494,34 +494,44 @@ def scan_workspace_layers(workspace: str) -> ArcPyExecutionResult:
         
         layers = []
         
+        def _read_layer_info(path, name):
+            """Extract full layer metadata including fields and CRS."""
+            desc = arcpy.Describe(path)
+            sr = desc.spatialReference
+            fields = []
+            for f in arcpy.ListFields(path):
+                fields.append({{
+                    "name": f.name,
+                    "type": f.type,
+                }})
+            return {{
+                "name": name,
+                "type": desc.shapeType,
+                "path": path,
+                "feature_type": "FeatureClass",
+                "spatial_reference": sr.name if sr else None,
+                "wkid": sr.factoryCode if sr else None,
+                "has_z": desc.hasZ,
+                "has_m": desc.hasM,
+                "fields": fields,
+                "feature_count": arcpy.management.GetCount(path).getOutput(0),
+            }}
+
         # 扫描要素类
         for fc in arcpy.ListFeatureClasses() or []:
             try:
-                desc = arcpy.Describe(fc)
-                layers.append({{
-                    "name": fc,
-                    "type": desc.shapeType,
-                    "path": os.path.join(workspace, fc),
-                    "feature_type": "FeatureClass",
-                    "spatial_reference": desc.spatialReference.name if desc.spatialReference else None,
-                }})
+                full_path = os.path.join(workspace, fc)
+                layers.append(_read_layer_info(full_path, fc))
             except:
                 pass
-        
+
         # 递归扫描子目录
         for dirpath, dirnames, filenames in arcpy.da.Walk(workspace, datatype="FeatureClass"):
             for filename in filenames:
                 full_path = os.path.join(dirpath, filename)
                 if full_path not in [l["path"] for l in layers]:
                     try:
-                        desc = arcpy.Describe(full_path)
-                        layers.append({{
-                            "name": filename,
-                            "type": desc.shapeType,
-                            "path": full_path,
-                            "feature_type": "FeatureClass",
-                            "spatial_reference": desc.spatialReference.name if desc.spatialReference else None,
-                        }})
+                        layers.append(_read_layer_info(full_path, filename))
                     except:
                         pass
         
