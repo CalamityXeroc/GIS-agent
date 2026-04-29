@@ -250,6 +250,7 @@ def _build_runner_script() -> str:
             "__file__": str(payload_path.with_name("user_code.py")),
         }
         namespace["__arcgis_result__"] = None
+        namespace["__result__"] = None  # 兼容旧代码
 
         def set_result(value):
             namespace["__arcgis_result__"] = value
@@ -500,10 +501,27 @@ def scan_workspace_layers(workspace: str) -> ArcPyExecutionResult:
             sr = desc.spatialReference
             fields = []
             for f in arcpy.ListFields(path):
-                fields.append({{
+                info = {{
                     "name": f.name,
                     "type": f.type,
-                }})
+                }}
+                # Sample values for non-geometry, non-OID fields
+                if f.type not in ("Geometry", "OID", "Blob", "Raster"):
+                    try:
+                        samples = []
+                        with arcpy.da.SearchCursor(path, [f.name]) as cursor:
+                            for row in cursor:
+                                val = row[0]
+                                if val is not None and str(val).strip():
+                                    samples.append(str(val))
+                                    if len(samples) >= 3:
+                                        break
+                            del cursor
+                        if samples:
+                            info["samples"] = samples
+                    except Exception:
+                        pass
+                fields.append(info)
             return {{
                 "name": name,
                 "type": desc.shapeType,

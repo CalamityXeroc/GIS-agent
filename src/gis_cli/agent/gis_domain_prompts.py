@@ -128,35 +128,58 @@ class GISDomainPrompts:
 - **Quantile (分位数)**: 适合偏态分布,每类包含相同数量要素
 - **Manual Breaks (手动)**: 已知特定阈值时使用
 
-### 分层设色 (Graduated Colors) 实现
+### 分层设色 (Graduated Colors) 完整流程（已验证通过）
 
-使用 ArcGIS Pro CIM API（不要用 layer.symbology，那是旧版 ArcMap API）：
+⚠️ 关键提醒（写代码前先看，避免报错）：
+- `layer.symbology` 是**属性**（getter+setter），不是 `getSymbology()`/`setSymbology()`
+- 布局要用 `layout.createMapFrame(polygon, map)` 创建地图框，不能用 `listElements('MAPFRAME_ELEMENT')` —— 新布局没有地图框元素
+- `aprx.createLayout(w, h, unit)` 三个参数都必须传
+- 中文版 ArcGIS Pro 没有英文色带名，用 `aprx.listColorRamps()[0]` 作为兜底
 
 ```python
-import arcpy
 from arcpy import mp
+import arcpy
 
-# 打开项目
+# 1. 打开项目和数据
 aprx = mp.ArcGISProject(r"{project_path}")
 m = aprx.listMaps()[0]
+layer = m.addDataFromPath(r"{input_path}")
 
-# 添加数据
-layer = m.addDataFromPath(r"{input_layer}")
-
-# 获取符号（ArcGIS Pro CIM 方式）
-sym = layer.getSymbology()
-
-# 设置分级设色渲染
+# 2. 设置分级设色渲染（.symbology 是属性，不是 getSymbology()）
+sym = layer.symbology
 sym.updateRenderer('GraduatedColorsRenderer')
-sym.renderer.classificationField = "FIELD_NAME"       # 统计字段
+sym.renderer.classificationField = "FIELD_NAME"       # 数值字段名
 sym.renderer.breakCount = 5                            # 分级数
 sym.renderer.classificationMethod = "NaturalBreaks"    # 分类方法
+# 色带：用第一个可用色带（中文版ArcPro没有英文色带名）
+ramps = aprx.listColorRamps()
+if ramps:
+    sym.renderer.colorRamp = ramps[0]
+layer.symbology = sym   # 写回（不是 setSymbology()）
 
-# 设置色带（从项目中获取）
-sym.renderer.colorRamp = aprx.listColorRamps("YlOrRd")[0]
+# 3. 创建布局 + 地图框
+layout = aprx.createLayout(297, 420, "MILLIMETER")  # A3横版尺寸
+poly = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(10, 10), arcpy.Point(287, 10),
+    arcpy.Point(287, 300), arcpy.Point(10, 300),
+    arcpy.Point(10, 10),
+]))
+layout.createMapFrame(poly, m, "Main Map")  # 不是 listElements()
 
-# 写回符号
-layer.setSymbology(sym)
+# 4. 导出PDF
+layout.exportToPDF(r"{output_path}")
+```
+
+### 仅渲染不导出（若任务只需要设置符号）
+```python
+sym = layer.symbology
+sym.updateRenderer('GraduatedColorsRenderer')
+sym.renderer.classificationField = "FIELD_NAME"
+sym.renderer.breakCount = 5
+ramps = aprx.listColorRamps()
+if ramps:
+    sym.renderer.colorRamp = ramps[0]
+layer.symbology = sym
 ```
 
 ### 图层顺序
@@ -241,49 +264,31 @@ layer.setSymbology(sym)
 
 ### ArcPy 布局代码模板
 
+⚠️ 创建新布局时地图框不存在，必须用 `createMapFrame()` 创建，不能用 `listElements()`
+⚠️ 不要用 `createTextElement`/`createLegendElement` —— 这些方法在 ArcPro 3.6 中不存在
+⚠️ 最小化导出流程：创建布局 → 创建地图框 → 导出（不要添加其他地图元素）
+
 ```python
-import arcpy
 from arcpy import mp
+import arcpy
 
 aprx = mp.ArcGISProject(r"{project_path}")
+m = aprx.listMaps()[0]
 
-# 获取或创建布局
-if aprx.listLayouts():
-    layout = aprx.listLayouts()[0]
-else:
-    layout = layout.create("{page_size}")  # 如 "A4", "A3"
+# 创建布局（A4: 210x297mm, A3: 297x420mm）
+layout = aprx.createLayout(297, 420, "MILLIMETER")
 
-# 添加地图框
-mf = layout.listElements("MAPFRAME_ELEMENT")[0]
+# 创建地图框（用 arcpy.Polygon 定义位置，不是 listElements 获取）
+poly = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(10, 10), arcpy.Point(287, 10),
+    arcpy.Point(287, 300), arcpy.Point(10, 300),
+    arcpy.Point(10, 10),
+]))
+layout.createMapFrame(poly, m, "Main Map")
 
-# 添加图例
-legend = layout.createLegendElement(mf)
-legend.elementPositionX = x_position
-legend.elementPositionY = y_position
-legend.title = "图例"
-
-# 添加比例尺
-scale_bar = layout.createScaleBarElement(mf)
-scale_bar.elementPositionX = x_pos
-scale_bar.elementPositionY = y_pos
-scale_bar.style = "Scale Line 1"
-
-# 添加指北针
-north_arrow = layout.createNorthArrowElement(mf)
-north_arrow.elementPositionX = x_pos
-north_arrow.elementPositionY = y_pos
-north_arrow.style = "Compass Rose 1"
-
-# 添加标题文本
-title = layout.createTextElement(
-    text="{地图标题}",
-    elementPositionX=x_pos,
-    elementPositionY=y_pos,
-    fontSize=18
-)
-
-# 导出
+# 导出PDF（不要添加图例/指北针/标题，这些API不稳定）
 layout.exportToPDF(r"{output_path}")
+```
 ```
 
 ### 纸张尺寸选择

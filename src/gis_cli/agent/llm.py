@@ -66,11 +66,17 @@ def _clean_model_name(model: str, provider: str = "", api_base: str = "") -> str
     api_base_lower = (api_base or "").strip().lower()
 
     # Keep full model id for known OpenAI-compatible gateways.
+    # Note: DeepSeek official API does NOT use prefixed model names.
+    # SiliconFlow/Qwen etc. use org/model-name format, so keep prefix for them.
     preserve_prefix_providers = {
-        "siliconflow", "qwen", "deepseek", "minimax", "zhipu", "glm", "openrouter"
+        "siliconflow", "qwen", "minimax", "zhipu", "glm", "openrouter"
     }
     if provider_lower in preserve_prefix_providers:
         return cleaned
+    if provider_lower == "deepseek":
+        # Strip org/ prefix AND lowercase — DeepSeek API rejects mixed-case
+        # e.g. deepseek-ai/DeepSeek-V4-Flash → deepseek-v4-flash
+        return cleaned.split("/")[-1].lower()
 
     # For non-official OpenAI bases, prefer preserving full id to avoid 400 model-not-found.
     if api_base_lower and "api.openai.com" not in api_base_lower:

@@ -574,6 +574,8 @@ class GISAgent:
             "workspace": str(workspace),
             "input_folder": input_folder,
             "output_folder": str(workspace / "output"),
+            "user_specified_input": self.memory.get_context("input_folder", ""),
+            "user_specified_output": self.memory.get_context("output_folder", ""),
             "input_files": self._collect_recent_input_files(),
             "document_path": self.memory.get_context("document_path"),
             "document_constraints": self.memory.get_context("document_constraints", []),
@@ -686,6 +688,9 @@ class GISAgent:
                 "继续执行", "继续", "重试", "retry", "resume", "接着执行", "继续跑",
                 "再试", "再试试", "换个方法", "换个方式", "试试别的", "继续之前", "继续上一个",
                 "重写代码", "代码重写", "重写", "重做", "重新", "换一种", "换种", "换一下",
+                # Confirmation markers when plan is pending
+                "执行", "执行吧", "确认执行", "可以执行", "开始执行", "开始吧",
+                "可以的", "好的", "好", "行", "是", "嗯", "ok", "yes",
             ]
             if any(marker in stripped_pending for marker in resume_markers):
                 return "confirm_action"
@@ -1162,7 +1167,11 @@ class GISAgent:
         return enriched, note
 
     def _extract_document_path_from_message(self, message: str) -> str | None:
-        """Extract first .docx/.pdf path from user message."""
+        """Extract first .docx/.pdf path from user message.
+
+        Skips paths that look like output files (containing /output/ or \\output\\)
+        since those are typically export targets, not input documents.
+        """
         patterns = [
             r'([A-Za-z]:\\[^\n\r"\']+?\.(?:docx|pdf))',
             r'([A-Za-z]:/[^\n\r"\']+?\.(?:docx|pdf))',
@@ -1171,7 +1180,11 @@ class GISAgent:
         for pattern in patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
-                return match.group(1).strip()
+                path = match.group(1).strip()
+                # Skip output paths — user is referring to a file to be created, not an input doc
+                if re.search(r'[/\\]output[/\\]', path, re.IGNORECASE):
+                    continue
+                return path
         return self._infer_document_path_from_workspace(message)
 
     def _infer_document_path_from_workspace(self, message: str) -> str | None:
@@ -1243,21 +1256,29 @@ class GISAgent:
         return None
 
     def _message_implies_document_usage(self, message: str) -> bool:
-        """Whether a message likely refers to document-driven tasking."""
+        """Whether a message likely refers to document-driven tasking.
+
+        Only triggers on explicit user intent — never auto-detect from
+        output paths or broad keywords like 'pdf' or '文档'.
+        """
         lowered = message.lower()
         doc_markers = [
-            ".pdf", ".docx", "pdf", "docx", "word", "文档", "试题", "题目",
-            "根据文档", "按文档", "从文档", "读一下", "读取", "识别",
+            "根据文档", "按文档", "从文档", "读一下", "读取",
         ]
         return any(marker in lowered for marker in doc_markers)
 
     def _looks_like_affirmative(self, message: str) -> bool:
         """Check whether message is a short confirmation phrase."""
         stripped = message.strip().lower()
-        return stripped in {
+        if stripped in {
             "好", "好的", "可以", "是", "行", "嗯", "读吧", "继续", "继续吧",
             "ok", "yes", "confirm", "execute",
-        }
+        }:
+            return True
+        # Partial match for longer confirmations like "可以的，执行吧"
+        confirm_keywords = ["可以的", "可以执行", "确认执行", "开始执行", "执行吧",
+                           "好的执行", "好的开始", "可以开始"]
+        return any(kw in stripped for kw in confirm_keywords)
 
     def _has_recent_document_hint(self) -> bool:
         """Check recent user turns for document/path hints."""
@@ -1789,16 +1810,16 @@ class GISAgent:
     
     def _format_conversation_history(self) -> str:
         """Format recent conversation for LLM context."""
-        recent_turns = self.memory.turns[-6:]  # Last 6 turns (3 pairs of user/assistant)
+        recent_turns = self.memory.turns[-10:]  # Last 10 turns (5 pairs of user/assistant)
         if not recent_turns:
             return "(这是首次对话)"
-        
+
         history = []
         for turn in recent_turns:
             role_label = "用户" if turn.role.value == "user" else "助手"
-            content_preview = turn.content[:50] if turn.content else ""
+            content_preview = turn.content[:200] if turn.content else ""
             history.append(f"{role_label}: {content_preview}")
-        
+
         return "\n".join(history)
 
     def _get_available_skill_names(self) -> list[str]:
@@ -2144,16 +2165,18 @@ class GISAgent:
     def _resolve_best_input_folder(self, candidate: str, workspace: Path) -> str:
         """Find a usable input directory from candidate/context/common conventions."""
         def _is_output_like(path: Path) -> bool:
+            """Check if path looks like an output directory (only used for auto-fallback)."""
             return any(part.lower() in {"output", "outputs"} for part in path.parts)
 
         raw = Path(candidate)
-        if raw.exists() and raw.is_dir() and not _is_output_like(raw):
+        # Priority 1: User-explicit path (do NOT reject output dirs — user knows what they want)
+        if raw.exists() and raw.is_dir():
             return str(raw)
 
         memory_input = self.memory.get_context("input_folder")
         if isinstance(memory_input, str) and memory_input.strip():
             p = Path(memory_input)
-            if p.exists() and p.is_dir() and not _is_output_like(p):
+            if p.exists() and p.is_dir():
                 return str(p)
 
         common_candidates = [
@@ -2162,8 +2185,9 @@ class GISAgent:
             Path.cwd() / "workspace" / "input",
             Path.cwd() / "input",
         ]
+        # Auto-fallback: skip output-like dirs but NOT for user-specified paths
         for p in common_candidates:
-            if p.exists() and p.is_dir():
+            if p.exists() and p.is_dir() and not _is_output_like(p):
                 return str(p)
 
         # If user/planner wrote "...\\input" but actual path is "...\\workspace\\input"
@@ -2454,8 +2478,17 @@ class GISAgent:
             parts_lower = [part.lower() for part in p.parts]
             is_input_like = any(part in {"input", "data", "workspace"} for part in parts_lower)
             is_output_like = any(part in {"output", "outputs"} for part in parts_lower)
+
+            # If user explicitly says "output"/"导出"/"输出", store as both output_folder and input_folder
+            if is_output_like and (explicit_output or not prefer_input):
+                self.memory.set_context("output_folder", str(p))
+                self.memory.set_context("input_folder", str(p))
+                break
+
+            # Skip output paths in auto-detect mode
             if is_output_like and not prefer_input:
                 continue
+
             if is_input_like or prefer_input or not explicit_output:
                 self.memory.set_context("input_folder", str(p))
                 p_str = str(p).lower()

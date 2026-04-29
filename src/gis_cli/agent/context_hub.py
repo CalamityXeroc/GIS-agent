@@ -10,6 +10,7 @@ can share the same source of truth for:
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ class ContextSnapshot:
     aprx_files: list[str] = field(default_factory=list)
     shapefiles: list[str] = field(default_factory=list)
     geodatabases: list[str] = field(default_factory=list)
+    output_data: list[str] = field(default_factory=list)
     unresolved: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -34,6 +36,7 @@ class ContextSnapshot:
             "aprx_files": self.aprx_files,
             "shapefiles": self.shapefiles,
             "geodatabases": self.geodatabases,
+            "output_data": self.output_data,
             "unresolved": self.unresolved,
         }
 
@@ -81,15 +84,24 @@ class ContextHub:
                 if len(geodatabases) >= max_items:
                     break
 
+        # Also scan output folder for data produced by previous runs
+        output_root = str(self.workspace / "workspace" / "output")
+        output_data: list[str] = []
+        output_dir = Path(output_root)
+        if output_dir.exists() and output_dir.is_dir():
+            for p in output_dir.rglob("*.shp"):
+                output_data.append(str(p))
+            for p in output_dir.rglob("*.gdb"):
+                output_data.append(str(p))
+
         unresolved: list[str] = []
         if not roots:
             unresolved.append("未发现可用输入目录")
         if not aprx_files:
             unresolved.append("未发现 .aprx 项目文件")
-        if not shapefiles and not geodatabases:
+        if not shapefiles and not geodatabases and not output_data:
             unresolved.append("未发现输入数据（.shp/.gdb）")
 
-        output_root = str(self.workspace / "workspace" / "output")
         snapshot = ContextSnapshot(
             workspace_path=str(self.workspace),
             input_roots=[str(r) for r in roots],
@@ -97,6 +109,7 @@ class ContextHub:
             aprx_files=sorted(dict.fromkeys(aprx_files)),
             shapefiles=sorted(dict.fromkeys(shapefiles)),
             geodatabases=sorted(dict.fromkeys(geodatabases)),
+            output_data=sorted(dict.fromkeys(output_data)),
             unresolved=unresolved,
         )
         self._cache_snapshot = self._clone_snapshot(snapshot)
@@ -127,6 +140,8 @@ class ContextHub:
             hints.append(
                 f"检测到输入数据: shp={len(snapshot.shapefiles)}, gdb={len(snapshot.geodatabases)}"
             )
+        if snapshot.output_data:
+            hints.append(f"检测到输出目录历史数据: {len(snapshot.output_data)} 个文件")
         if snapshot.unresolved:
             hints.extend([f"待澄清: {item}" for item in snapshot.unresolved])
 
@@ -150,40 +165,83 @@ class ContextHub:
         # Basic schema from file-based discovery
         for shp in snapshot.shapefiles[:20]:
             p = Path(shp)
-            parts.append(f"  {p.name}: path={shp}, type=Shapefile")
+            parts.append(f"  [input] {p.name}: path={shp}, type=Shapefile")
 
         for gdb in snapshot.geodatabases[:10]:
             p = Path(gdb)
-            parts.append(f"  {p.name}: path={gdb}, type=FileGeodatabase")
+            parts.append(f"  [input] {p.name}: path={gdb}, type=FileGeodatabase")
+
+        for out in snapshot.output_data[:10]:
+            p = Path(out)
+            parts.append(f"  [output] {p.name}: path={out}, type=Shapefile (先前产出数据)")
 
         # Try enriching with ArcPy if available (fields, wkid, geometry)
-        if snapshot.shapefiles or snapshot.geodatabases:
+        if snapshot.shapefiles or snapshot.geodatabases or snapshot.output_data:
             try:
                 from ..arcpy_bridge import scan_workspace_layers
+                # Enrich input data
                 for root in snapshot.input_roots:
                     result = scan_workspace_layers(root)
                     if result.status == "success" and result.data:
                         for layer in result.data.get("layers", []):
                             name = layer.get("name", "")
                             geom = layer.get("type", "Unknown")
+                            fc = layer.get("feature_count", "")
                             sr = layer.get("spatial_reference", "Unknown")
                             wkid = layer.get("wkid")
                             fields = layer.get("fields", [])
-                            # Truncate fields list to 20 max
-                            field_strs = [f"{f['name']}({f['type']})" for f in fields[:20]]
+                            field_strs = []
+                            for f in fields[:20]:
+                                s = f"{f['name']}({f['type']})"
+                                samples = f.get("samples")
+                                if samples:
+                                    s += f": {json.dumps(samples, ensure_ascii=False)}"
+                                field_strs.append(s)
                             field_str = ", ".join(field_strs)
                             if len(fields) > 20:
                                 field_str += f" (+{len(fields)-20} more)"
                             wkid_str = f" (WKID {wkid})" if wkid else ""
+                            fc_str = f", features={fc}" if fc else ""
+                            # Remove the basic [input] line for this layer if exists
+                            parts = [p for p in parts if not p.endswith(f": type=Shapefile") or name not in p]
                             parts.append(
-                                f"  {name}: geom={geom}, sr={sr}{wkid_str}, "
+                                f"  [input] {name}: geom={geom}, sr={sr}{wkid_str}{fc_str}, "
                                 f"fields={{{field_str}}}"
                             )
-                        break  # Use first input root's scan
+                        break
+
+                # Enrich output data
+                out_dir = Path(snapshot.output_root)
+                if out_dir.exists() and out_dir.is_dir():
+                    result = scan_workspace_layers(str(out_dir))
+                    if result.status == "success" and result.data:
+                        for layer in result.data.get("layers", []):
+                            name = layer.get("name", "")
+                            geom = layer.get("type", "Unknown")
+                            fc = layer.get("feature_count", "")
+                            sr = layer.get("spatial_reference", "Unknown")
+                            fields = layer.get("fields", [])
+                            field_strs = []
+                            for f in fields[:20]:
+                                s = f"{f['name']}({f['type']})"
+                                samples = f.get("samples")
+                                if samples:
+                                    s += f": {json.dumps(samples, ensure_ascii=False)}"
+                                field_strs.append(s)
+                            field_str = ", ".join(field_strs)
+                            if len(fields) > 20:
+                                field_str += f" (+{len(fields)-20} more)"
+                            fc_str = f", features={fc}" if fc else ""
+                            # Remove basic [output] line if exists
+                            parts = [p for p in parts if not (p.startswith(f"  [output] {name}") or p.endswith(f": {name}: type=Shapefile"))]
+                            parts.append(
+                                f"  [output] {name}: geom={geom}, sr={sr}{fc_str}, "
+                                f"fields={{{field_str}}}"
+                            )
             except ImportError:
-                pass  # ArcPy not available
+                pass
             except Exception:
-                pass  # Non-fatal; fall back to basic schema
+                pass
 
         if not parts:
             return ""
@@ -247,5 +305,6 @@ class ContextHub:
             aprx_files=list(snapshot.aprx_files),
             shapefiles=list(snapshot.shapefiles),
             geodatabases=list(snapshot.geodatabases),
+            output_data=list(snapshot.output_data),
             unresolved=list(snapshot.unresolved),
         )
