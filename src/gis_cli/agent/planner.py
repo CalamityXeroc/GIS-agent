@@ -714,8 +714,8 @@ print(f"Created FileGDB: {{target}}")
             }, ["step_2"])
             add_step("quality_check", "数据质量检查", {"input_path": f"{output_folder}/projected.shp"}, ["step_3"])
             add_step("export_map", "导出地图", {
-                "output_path": f"{output_folder}/map.pdf",
-                "format": "PDF"
+                "output_path": f"{output_folder}/map.jpg",
+                "format": "JPG"
             }, ["step_4"])
         
         # 数据整合 / 入库（普通合并，不涉及名称筛选）

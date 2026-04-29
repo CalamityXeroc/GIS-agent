@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 import json
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,6 +17,13 @@ from enum import Enum
 from ..core import ToolRegistry, ToolContext, ToolResult, ExecutionContext
 from .context_hub import ContextHub
 from .planner import Plan, PlanStep, StepStatus
+
+# 默认输出路径配置
+DEFAULT_OUTPUT_FOLDER = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "workspace", "output")
+)
+if not os.path.isabs(DEFAULT_OUTPUT_FOLDER):
+    DEFAULT_OUTPUT_FOLDER = os.path.abspath(os.path.join(os.getcwd(), "workspace", "output"))
 
 
 class ExecutionMode(str, Enum):
@@ -303,7 +311,7 @@ class Executor:
             actual_tool_name = effective_tool_name
             if effective_tool_name == "merge_layers" and "_filter_pattern" in resolved_input:
                 filter_pattern = resolved_input.pop("_filter_pattern")
-                output_path = resolved_input.get("output_path", "./workspace/output/merged.shp")
+                output_path = resolved_input.get("output_path", f"{DEFAULT_OUTPUT_FOLDER}/merged.shp")
                 actual_tool_name, resolved_input = self._resolve_merge_with_filter(
                     step, plan, filter_pattern, output_path
                 )
@@ -456,7 +464,7 @@ class Executor:
                 if project_path:
                     payload["project_path"] = project_path
             if not payload.get("output_path"):
-                payload["output_path"] = str(Path(snapshot.output_root) / "map.pdf")
+                payload["output_path"] = str(Path(snapshot.output_root) / "map.jpg")
 
             if not payload.get("project_path"):
                 result["blocked"] = True
@@ -735,7 +743,7 @@ class Executor:
     def _infer_project_output_path(self, step: PlanStep, input_path: str | None) -> str | None:
         """Infer a stable output path for project_layers when LLM omitted it."""
         workspace = self.context.workspace.workspace_path
-        base_dir = Path(str(workspace)) / "output" if workspace else Path("./workspace/output")
+        base_dir = Path(str(workspace)) / "workspace" / "output" if workspace else Path(DEFAULT_OUTPUT_FOLDER)
         hint = f"{step.description} {step.tool}".lower()
 
         suffix = "projected"
@@ -1033,7 +1041,7 @@ class Executor:
 
             if is_create_gdb_task:
                 workspace = normalized.get("workspace") or params.get("workspace")
-                default_output_dir = str(Path(workspace)) if isinstance(workspace, str) and workspace.strip() else "./workspace/output"
+                default_output_dir = str(Path(workspace)) if isinstance(workspace, str) and workspace.strip() else DEFAULT_OUTPUT_FOLDER
 
                 requested_output = (
                     normalized.get("output_path")
@@ -1050,7 +1058,7 @@ class Executor:
                     f"requested_output = {str(requested_output)!r}\n"
                     "if not requested_output.lower().endswith('.gdb'):\n"
                     "    requested_output = requested_output + '.gdb'\n"
-                    "output_dir = os.path.dirname(requested_output) or './workspace/output'\n"
+                    f"output_dir = os.path.dirname(requested_output) or {DEFAULT_OUTPUT_FOLDER!r}\n"
                     "os.makedirs(output_dir, exist_ok=True)\n"
                     "gdb_name = os.path.basename(requested_output)\n"
                     "target = os.path.join(output_dir, gdb_name)\n"

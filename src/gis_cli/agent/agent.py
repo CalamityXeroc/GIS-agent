@@ -640,7 +640,7 @@ class GISAgent:
                 if best_project and not step.input.get("project_path"):
                     step.input["project_path"] = best_project
                 if not step.input.get("output_path"):
-                    step.input["output_path"] = str(Path(snapshot.output_root) / "map.pdf")
+                    step.input["output_path"] = str(Path(snapshot.output_root) / "map.jpg")
     
     def call_tool(
         self,

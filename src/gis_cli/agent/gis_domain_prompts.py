@@ -160,14 +160,27 @@ layer.symbology = sym   # 写回（不是 setSymbology()）
 # 3. 创建布局 + 地图框
 layout = aprx.createLayout(297, 420, "MILLIMETER")  # A3横版尺寸
 poly = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(10, 10), arcpy.Point(287, 10),
-    arcpy.Point(287, 300), arcpy.Point(10, 300),
-    arcpy.Point(10, 10),
+    arcpy.Point(20, 50), arcpy.Point(277, 50),
+    arcpy.Point(277, 300), arcpy.Point(20, 300),
+    arcpy.Point(20, 50),
 ]))
-layout.createMapFrame(poly, m, "Main Map")  # 不是 listElements()
+mf = layout.createMapFrame(poly, m, "Main Map")  # 不是 listElements()
 
-# 4. 导出PDF
-layout.exportToPDF(r"{output_path}")
+# 4. 添加地图元素（用 createMapSurroundElement，不是不存在的 createLegendElement 等）
+layout.createMapSurroundElement(arcpy.Point(260, 330), "NORTH_ARROW", mf)
+legend_geom = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(20, 10), arcpy.Point(100, 10),
+    arcpy.Point(100, 40), arcpy.Point(20, 40), arcpy.Point(20, 10),
+]))
+layout.createMapSurroundElement(legend_geom, "LEGEND", mf)
+sb_geom = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(180, 10), arcpy.Point(277, 10),
+    arcpy.Point(277, 30), arcpy.Point(180, 30), arcpy.Point(180, 10),
+]))
+layout.createMapSurroundElement(sb_geom, "SCALE_BAR", mf)
+
+# 5. 导出JPG
+layout.exportToJPEG(r"{output_path}")
 ```
 
 ### 仅渲染不导出（若任务只需要设置符号）
@@ -265,8 +278,8 @@ layer.symbology = sym
 ### ArcPy 布局代码模板
 
 ⚠️ 创建新布局时地图框不存在，必须用 `createMapFrame()` 创建，不能用 `listElements()`
-⚠️ 不要用 `createTextElement`/`createLegendElement` —— 这些方法在 ArcPro 3.6 中不存在
-⚠️ 最小化导出流程：创建布局 → 创建地图框 → 导出（不要添加其他地图元素）
+⚠️ 图例/指北针/比例尺用 `createMapSurroundElement()` 创建
+⚠️ 不要用 `createTextElement`/`createLegendElement` —— 这些方法不存在
 
 ```python
 from arcpy import mp
@@ -278,17 +291,35 @@ m = aprx.listMaps()[0]
 # 创建布局（A4: 210x297mm, A3: 297x420mm）
 layout = aprx.createLayout(297, 420, "MILLIMETER")
 
-# 创建地图框（用 arcpy.Polygon 定义位置，不是 listElements 获取）
+# 创建地图框
 poly = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(10, 10), arcpy.Point(287, 10),
-    arcpy.Point(287, 300), arcpy.Point(10, 300),
-    arcpy.Point(10, 10),
+    arcpy.Point(20, 50), arcpy.Point(277, 50),
+    arcpy.Point(277, 300), arcpy.Point(20, 300),
+    arcpy.Point(20, 50),
 ]))
-layout.createMapFrame(poly, m, "Main Map")
+mf = layout.createMapFrame(poly, m, "Main Map")
 
-# 导出PDF（不要添加图例/指北针/标题，这些API不稳定）
-layout.exportToPDF(r"{output_path}")
-```
+# 添加图例（用 Polygon 定义位置）
+legend_geom = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(20, 10), arcpy.Point(100, 10),
+    arcpy.Point(100, 40), arcpy.Point(20, 40),
+    arcpy.Point(20, 10),
+]))
+layout.createMapSurroundElement(legend_geom, "LEGEND", mf)
+
+# 添加指北针（用 Point 定义位置）
+layout.createMapSurroundElement(arcpy.Point(260, 330), "NORTH_ARROW", mf)
+
+# 添加比例尺
+sb_geom = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(180, 10), arcpy.Point(277, 10),
+    arcpy.Point(277, 30), arcpy.Point(180, 30),
+    arcpy.Point(180, 10),
+]))
+layout.createMapSurroundElement(sb_geom, "SCALE_BAR", mf)
+
+# 导出JPG
+layout.exportToJPEG(r"{output_path}")
 ```
 
 ### 纸张尺寸选择

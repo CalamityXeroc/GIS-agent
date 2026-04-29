@@ -89,7 +89,7 @@ class ExportMapTool(Tool[ExportMapInput, ExportMapOutput]):
     
     def validate_input(self, input_data: ExportMapInput) -> ValidationResult:
         # Validate format
-        valid_formats = {"PDF", "PNG", "JPEG", "TIFF", "BMP", "GIF"}
+        valid_formats = {"PDF", "PNG", "JPEG", "JPG", "TIFF", "BMP", "GIF"}
         if input_data.format.upper() not in valid_formats:
             return ValidationResult.failure(
                 f"Invalid format: {input_data.format}. Valid: {', '.join(valid_formats)}",
@@ -191,7 +191,7 @@ class ExportMapTool(Tool[ExportMapInput, ExportMapOutput]):
                     str(output_path),
                     resolution=input_data.resolution
                 )
-            elif fmt == "JPEG":
+            elif fmt in ("JPEG", "JPG"):
                 layout.exportToJPEG(
                     str(output_path),
                     resolution=input_data.resolution
