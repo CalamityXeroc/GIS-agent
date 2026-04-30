@@ -135,10 +135,18 @@ class GISDomainPrompts:
 - 布局要用 `layout.createMapFrame(polygon, map)` 创建地图框，不能用 `listElements('MAPFRAME_ELEMENT')` —— 新布局没有地图框元素
 - `aprx.createLayout(w, h, unit)` 三个参数都必须传
 - 中文版 ArcGIS Pro 没有英文色带名，用 `aprx.listColorRamps()[0]` 作为兜底
+- **布局坐标已经过验证互不重叠，不要修改坐标值**
 
 ```python
 from arcpy import mp
 import arcpy
+
+# ==== 布局坐标常量（请勿修改，修改会导致元素重叠） ====
+MF_L, MF_B, MF_R, MF_T = 15, 55, 280, 305   # 地图框位置
+NA_X, NA_Y = 260, 325                          # 指北针位置（右上）
+LG_L, LG_B, LG_R, LG_T = 15, 10, 110, 45      # 图例位置（左下）
+SB_L, SB_B, SB_R, SB_T = 170, 10, 280, 35     # 比例尺位置（右下）
+# =====================================================
 
 # 1. 打开项目和数据
 aprx = mp.ArcGISProject(r"{project_path}")
@@ -155,31 +163,39 @@ sym.renderer.classificationMethod = "NaturalBreaks"    # 分类方法
 ramps = aprx.listColorRamps()
 if ramps:
     sym.renderer.colorRamp = ramps[0]
-layer.symbology = sym   # 写回（不是 setSymbology()）
+layer.symbology = sym
 
-# 3. 创建布局 + 地图框
-layout = aprx.createLayout(297, 420, "MILLIMETER")  # A3横版尺寸
-poly = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(20, 50), arcpy.Point(277, 50),
-    arcpy.Point(277, 300), arcpy.Point(20, 300),
-    arcpy.Point(20, 50),
+# 3. 创建布局
+layout = aprx.createLayout(297, 420, "MILLIMETER")  # A3横版
+
+# 4. 创建地图框（坐标见上方常量区，勿改）
+mf_geom = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(MF_L, MF_B), arcpy.Point(MF_R, MF_B),
+    arcpy.Point(MF_R, MF_T), arcpy.Point(MF_L, MF_T),
+    arcpy.Point(MF_L, MF_B),
 ]))
-mf = layout.createMapFrame(poly, m, "Main Map")  # 不是 listElements()
+mf = layout.createMapFrame(mf_geom, m, "Main Map")
 
-# 4. 添加地图元素（用 createMapSurroundElement，不是不存在的 createLegendElement 等）
-layout.createMapSurroundElement(arcpy.Point(260, 330), "NORTH_ARROW", mf)
+# 5. 添加指北针（右上）
+layout.createMapSurroundElement(arcpy.Point(NA_X, NA_Y), "NORTH_ARROW", mf)
+
+# 6. 添加图例（左下）
 legend_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(20, 10), arcpy.Point(100, 10),
-    arcpy.Point(100, 40), arcpy.Point(20, 40), arcpy.Point(20, 10),
+    arcpy.Point(LG_L, LG_B), arcpy.Point(LG_R, LG_B),
+    arcpy.Point(LG_R, LG_T), arcpy.Point(LG_L, LG_T),
+    arcpy.Point(LG_L, LG_B),
 ]))
 layout.createMapSurroundElement(legend_geom, "LEGEND", mf)
+
+# 7. 添加比例尺（右下）
 sb_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(180, 10), arcpy.Point(277, 10),
-    arcpy.Point(277, 30), arcpy.Point(180, 30), arcpy.Point(180, 10),
+    arcpy.Point(SB_L, SB_B), arcpy.Point(SB_R, SB_B),
+    arcpy.Point(SB_R, SB_T), arcpy.Point(SB_L, SB_T),
+    arcpy.Point(SB_L, SB_B),
 ]))
 layout.createMapSurroundElement(sb_geom, "SCALE_BAR", mf)
 
-# 5. 导出JPG
+# 8. 导出JPG
 layout.exportToJPEG(r"{output_path}")
 ```
 
@@ -277,44 +293,50 @@ layer.symbology = sym
 
 ### ArcPy 布局代码模板
 
-⚠️ 创建新布局时地图框不存在，必须用 `createMapFrame()` 创建，不能用 `listElements()`
-⚠️ 图例/指北针/比例尺用 `createMapSurroundElement()` 创建
-⚠️ 不要用 `createTextElement`/`createLegendElement` —— 这些方法不存在
+⚠️ 创建新布局时地图框不存在，必须用 `createMapFrame()` 创建
+⚠️ 图例/指北针/比例尺用 `createMapSurroundElement()`，不是不存在的 createLegendElement
+⚠️ **布局坐标互不重叠，不要修改坐标值**
 
 ```python
 from arcpy import mp
 import arcpy
 
+# 布局坐标常量（勿改）
+MF_L, MF_B, MF_R, MF_T = 15, 55, 280, 305
+NA_X, NA_Y = 260, 325
+LG_L, LG_B, LG_R, LG_T = 15, 10, 110, 45
+SB_L, SB_B, SB_R, SB_T = 170, 10, 280, 35
+
 aprx = mp.ArcGISProject(r"{project_path}")
 m = aprx.listMaps()[0]
 
-# 创建布局（A4: 210x297mm, A3: 297x420mm）
+# 创建布局
 layout = aprx.createLayout(297, 420, "MILLIMETER")
 
 # 创建地图框
-poly = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(20, 50), arcpy.Point(277, 50),
-    arcpy.Point(277, 300), arcpy.Point(20, 300),
-    arcpy.Point(20, 50),
+mf_geom = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(MF_L, MF_B), arcpy.Point(MF_R, MF_B),
+    arcpy.Point(MF_R, MF_T), arcpy.Point(MF_L, MF_T),
+    arcpy.Point(MF_L, MF_B),
 ]))
-mf = layout.createMapFrame(poly, m, "Main Map")
+mf = layout.createMapFrame(mf_geom, m, "Main Map")
 
-# 添加图例（用 Polygon 定义位置）
+# 图例（左下）
 legend_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(20, 10), arcpy.Point(100, 10),
-    arcpy.Point(100, 40), arcpy.Point(20, 40),
-    arcpy.Point(20, 10),
+    arcpy.Point(LG_L, LG_B), arcpy.Point(LG_R, LG_B),
+    arcpy.Point(LG_R, LG_T), arcpy.Point(LG_L, LG_T),
+    arcpy.Point(LG_L, LG_B),
 ]))
 layout.createMapSurroundElement(legend_geom, "LEGEND", mf)
 
-# 添加指北针（用 Point 定义位置）
-layout.createMapSurroundElement(arcpy.Point(260, 330), "NORTH_ARROW", mf)
+# 指北针（右上）
+layout.createMapSurroundElement(arcpy.Point(NA_X, NA_Y), "NORTH_ARROW", mf)
 
-# 添加比例尺
+# 比例尺（右下）
 sb_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(180, 10), arcpy.Point(277, 10),
-    arcpy.Point(277, 30), arcpy.Point(180, 30),
-    arcpy.Point(180, 10),
+    arcpy.Point(SB_L, SB_B), arcpy.Point(SB_R, SB_B),
+    arcpy.Point(SB_R, SB_T), arcpy.Point(SB_L, SB_T),
+    arcpy.Point(SB_L, SB_B),
 ]))
 layout.createMapSurroundElement(sb_geom, "SCALE_BAR", mf)
 
