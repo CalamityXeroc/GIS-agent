@@ -85,7 +85,7 @@ class ContextHub:
                     break
 
         # Also scan output folder for data produced by previous runs
-        output_root = str(self.workspace / "workspace" / "output")
+        output_root = str(self.workspace / "output")
         output_data: list[str] = []
         output_dir = Path(output_root)
         if output_dir.exists() and output_dir.is_dir():
@@ -268,6 +268,7 @@ class ContextHub:
                 self.workspace / "input",
                 self.workspace / "workspace" / "input",
                 self.workspace,
+                self.workspace / "output",
                 Path.cwd() / "workspace" / "input",
                 Path.cwd() / "input",
             ]

@@ -130,74 +130,29 @@ class GISDomainPrompts:
 
 ### 分层设色 (Graduated Colors) 完整流程（已验证通过）
 
-⚠️ 关键提醒（写代码前先看，避免报错）：
-- `layer.symbology` 是**属性**（getter+setter），不是 `getSymbology()`/`setSymbology()`
-- 布局要用 `layout.createMapFrame(polygon, map)` 创建地图框，不能用 `listElements('MAPFRAME_ELEMENT')` —— 新布局没有地图框元素
-- `aprx.createLayout(w, h, unit)` 三个参数都必须传
-- 中文版 ArcGIS Pro 没有英文色带名，用 `aprx.listColorRamps()[0]` 作为兜底
-- **布局坐标已经过验证互不重叠，不要修改坐标值**
+使用 `build_graduated_colors_code()` 生成完整代码后执行（自动自适应纸张/图廓/内嵌布局）：
 
 ```python
-from arcpy import mp
-import arcpy
+from gis_cli.arcpy_bridge import build_graduated_colors_code
 
-# ==== 布局坐标常量（请勿修改，修改会导致元素重叠） ====
-MF_L, MF_B, MF_R, MF_T = 15, 55, 280, 305   # 地图框位置
-NA_X, NA_Y = 260, 325                          # 指北针位置（右上）
-LG_L, LG_B, LG_R, LG_T = 15, 10, 110, 45      # 图例位置（左下）
-SB_L, SB_B, SB_R, SB_T = 170, 10, 280, 35     # 比例尺位置（右下）
-# =====================================================
-
-# 1. 打开项目和数据
-aprx = mp.ArcGISProject(r"{project_path}")
-m = aprx.listMaps()[0]
-layer = m.addDataFromPath(r"{input_path}")
-
-# 2. 设置分级设色渲染（.symbology 是属性，不是 getSymbology()）
-sym = layer.symbology
-sym.updateRenderer('GraduatedColorsRenderer')
-sym.renderer.classificationField = "FIELD_NAME"       # 数值字段名
-sym.renderer.breakCount = 5                            # 分级数
-sym.renderer.classificationMethod = "NaturalBreaks"    # 分类方法
-# 色带：用第一个可用色带（中文版ArcPro没有英文色带名）
-ramps = aprx.listColorRamps()
-if ramps:
-    sym.renderer.colorRamp = ramps[0]
-layer.symbology = sym
-
-# 3. 创建布局
-layout = aprx.createLayout(297, 420, "MILLIMETER")  # A3横版
-
-# 4. 创建地图框（坐标见上方常量区，勿改）
-mf_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(MF_L, MF_B), arcpy.Point(MF_R, MF_B),
-    arcpy.Point(MF_R, MF_T), arcpy.Point(MF_L, MF_T),
-    arcpy.Point(MF_L, MF_B),
-]))
-mf = layout.createMapFrame(mf_geom, m, "Main Map")
-
-# 5. 添加指北针（右上）
-layout.createMapSurroundElement(arcpy.Point(NA_X, NA_Y), "NORTH_ARROW", mf)
-
-# 6. 添加图例（左下）
-legend_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(LG_L, LG_B), arcpy.Point(LG_R, LG_B),
-    arcpy.Point(LG_R, LG_T), arcpy.Point(LG_L, LG_T),
-    arcpy.Point(LG_L, LG_B),
-]))
-layout.createMapSurroundElement(legend_geom, "LEGEND", mf)
-
-# 7. 添加比例尺（右下）
-sb_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(SB_L, SB_B), arcpy.Point(SB_R, SB_B),
-    arcpy.Point(SB_R, SB_T), arcpy.Point(SB_L, SB_T),
-    arcpy.Point(SB_L, SB_B),
-]))
-layout.createMapSurroundElement(sb_geom, "SCALE_BAR", mf)
-
-# 8. 导出JPG
-layout.exportToJPEG(r"{output_path}")
+code = build_graduated_colors_code(
+    input_path=r"{input_path}",
+    field_name="FIELD_NAME",
+    output_path=r"{output_path}",
+    title="地图标题（可选，不传自动生成）",
+    color_ramp_name="色带名称如 YlOrRd（可选）",
+    legend_style="图例样式关键词如 Legend 1（可选）",
+    scale_bar_style="比例尺样式关键词如 Scale Bar 1（可选）",
+    north_arrow_style="指北针样式关键词如 North Arrow 1（可选）",
+)
+exec(compile(code, "graded", "exec"))
 ```
+
+该函数自动完成：获取数据范围→选择纸张→分级设色→创建图廓→添加图名/图例/指北针/比例尺→导出JPG。
+- 纸张大小根据数据宽高比自动选择（A3横版/A4竖版）
+- 所有要素在图廓线内，不重叠
+- 图例大小根据要素数量自动调整
+- 样式参数支持关键词匹配（如 legend_style="Legend 1"、scale_bar_style="Scale Bar 1"、north_arrow_style="North Arrow 1"）
 
 ### 仅渲染不导出（若任务只需要设置符号）
 ```python
@@ -291,58 +246,23 @@ layer.symbology = sym
 6. **数据来源** — 左下角小字
 7. **投影/坐标系统说明** — 右下角小字
 
-### ArcPy 布局代码模板
+### 布局导出必须使用预置代码生成器
 
-⚠️ 创建新布局时地图框不存在，必须用 `createMapFrame()` 创建
-⚠️ 图例/指北针/比例尺用 `createMapSurroundElement()`，不是不存在的 createLegendElement
-⚠️ **布局坐标互不重叠，不要修改坐标值**
+请使用 `build_graduated_colors_code()` 生成布局导出代码，不要手写：
 
 ```python
-from arcpy import mp
-import arcpy
+from gis_cli.arcpy_bridge import build_graduated_colors_code
 
-# 布局坐标常量（勿改）
-MF_L, MF_B, MF_R, MF_T = 15, 55, 280, 305
-NA_X, NA_Y = 260, 325
-LG_L, LG_B, LG_R, LG_T = 15, 10, 110, 45
-SB_L, SB_B, SB_R, SB_T = 170, 10, 280, 35
-
-aprx = mp.ArcGISProject(r"{project_path}")
-m = aprx.listMaps()[0]
-
-# 创建布局
-layout = aprx.createLayout(297, 420, "MILLIMETER")
-
-# 创建地图框
-mf_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(MF_L, MF_B), arcpy.Point(MF_R, MF_B),
-    arcpy.Point(MF_R, MF_T), arcpy.Point(MF_L, MF_T),
-    arcpy.Point(MF_L, MF_B),
-]))
-mf = layout.createMapFrame(mf_geom, m, "Main Map")
-
-# 图例（左下）
-legend_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(LG_L, LG_B), arcpy.Point(LG_R, LG_B),
-    arcpy.Point(LG_R, LG_T), arcpy.Point(LG_L, LG_T),
-    arcpy.Point(LG_L, LG_B),
-]))
-layout.createMapSurroundElement(legend_geom, "LEGEND", mf)
-
-# 指北针（右上）
-layout.createMapSurroundElement(arcpy.Point(NA_X, NA_Y), "NORTH_ARROW", mf)
-
-# 比例尺（右下）
-sb_geom = arcpy.Polygon(arcpy.Array([
-    arcpy.Point(SB_L, SB_B), arcpy.Point(SB_R, SB_B),
-    arcpy.Point(SB_R, SB_T), arcpy.Point(SB_L, SB_T),
-    arcpy.Point(SB_L, SB_B),
-]))
-layout.createMapSurroundElement(sb_geom, "SCALE_BAR", mf)
-
-# 导出JPG
-layout.exportToJPEG(r"{output_path}")
+code = build_graduated_colors_code(
+    input_path=r"数据路径",
+    field_name="分级字段名",
+    output_path=r"输出JPG路径",
+    title="地图标题（不传则自动按字段名生成）",
+)
+exec(compile(code, "graded", "exec"))
 ```
+
+禁止手写布局导出代码（createTextElement/createLegendElement 等方法均不存在）。
 
 ### 纸张尺寸选择
 - **A4 (210×297mm)**: 省级/小区域地图,竖版为主

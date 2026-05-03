@@ -241,6 +241,12 @@ def _build_runner_script() -> str:
         code = payload["code"]
         workspace = payload.get("workspace")
         require_arcpy = payload.get("require_arcpy", True)
+        python_paths = payload.get("python_paths", [])
+
+        # Add extra Python paths for importing helper modules
+        for p in python_paths:
+            if p not in sys.path:
+                sys.path.insert(0, p)
 
         # Prepare execution namespace
         stdout_buffer = io.StringIO()
@@ -387,10 +393,13 @@ def run_arcpy_code(
         runner_path = temp_path / "runner.py"
         
         # 写入 payload
+        arcpy_bridge_dir = Path(__file__).parent.resolve()
+        src_dir = arcpy_bridge_dir.parent  # src/gis_cli/ 的父级 → src/
         payload = {
             "code": code,
             "workspace": workspace,
             "require_arcpy": require_arcpy,
+            "python_paths": [str(src_dir)],
         }
         payload_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -715,6 +724,232 @@ def project_layer(
         print(f"Projected to {{desc.spatialReference.name}}: {{count}} features")
     ''')
     return run_arcpy_code(code, timeout_seconds=300)
+
+
+def build_graduated_colors_code(
+    input_path: str,
+    field_name: str,
+    output_path: str,
+    page_width: int = 297,
+    page_height: int = 420,
+    title: str = "",
+    color_ramp_name: str = "",
+    legend_style: str = "",
+    scale_bar_style: str = "",
+    north_arrow_style: str = "",
+    **kwargs,
+) -> str:
+    """生成分级设色+布局+导出的 ArcPy 代码字符串（可在 execute_code 中直接运行）
+
+    Args:
+        input_path: 输入要素类路径
+        field_name: 分级字段名
+        output_path: 输出 JPG 路径
+        page_width: 页面宽度 mm（A3=297, A4竖版=210）
+        page_height: 页面高度 mm（A3=420, A4竖版=297）
+        title: 地图标题（空字符串时自动根据 field_name 生成）
+        color_ramp_name: 色带名称（如 YlOrRd），空字符串时使用默认
+        legend_style: 图例样式关键词（如"Legend 1"），空=默认
+        scale_bar_style: 比例尺样式关键词（如"Scale Bar 1"），空=默认
+        north_arrow_style: 指北针样式关键词（如"North Arrow 1"），空=默认
+    Returns:
+        可直接在 ArcPro Python 中执行的代码字符串
+    """
+    _title = (title or "").strip()
+    if not _title:
+        _title = f"{{field_name}} 分级图"
+    code = f'''
+from arcpy import mp, cim
+import arcpy
+import os
+
+# 数据范围 → 自动选择纸张
+_desc = arcpy.Describe(r"{input_path}")
+_ext = _desc.extent
+_asp = _ext.width / _ext.height
+if _asp > 1.2:
+    PAGE_W, PAGE_H = 420, 297  # A3 横版
+elif _asp < 0.8:
+    PAGE_W, PAGE_H = 210, 297  # A4 竖版
+else:
+    PAGE_W, PAGE_H = 297, 420  # A3 横版
+
+# 要素数量 → 自适应图例大小
+_fc = int(arcpy.management.GetCount(r"{input_path}").getOutput(0))
+_mar = int(PAGE_W * 0.04)              # 图廓边距 4%
+_lg_h = 35 if _fc > 50 else 45         # 要素多→图例小
+_lg_w = 90 if _fc > 50 else 110        # 要素多→图例窄
+_sb_h = 20
+_sb_w = 100
+_title_h = 14                           # 图名高度
+_gap = 5                                # 元素间距
+
+# 各元素位置（全在图廓内，百分比计算）
+NL_L, NL_B = _mar, _mar
+NL_R, NL_T = PAGE_W - _mar, PAGE_H - _mar
+
+MF_L = NL_L + _gap
+MF_R = NL_R - _gap
+MF_B = NL_B + _lg_h + _gap * 3          # 底部留图例空间
+MF_T = NL_T - _title_h - _gap * 4       # 顶部留图名空间
+
+NA_X = MF_R - 15
+NA_Y = MF_T - 15
+
+LG_L = NL_L + _gap
+LG_B = NL_B + _gap
+LG_R = LG_L + _lg_w
+LG_T = LG_B + _lg_h
+
+SB_R = NL_R - _gap
+SB_B = NL_B + _gap
+SB_L = SB_R - _sb_w
+SB_T = SB_B + _sb_h
+
+# 自动查找 aprx（从数据文件所在目录向上搜索）
+import glob
+_input_dir = os.path.dirname(r"{input_path}")
+_search_roots = [_input_dir]
+_p = _input_dir
+for _ in range(5):  # 向上搜5层
+    _p = os.path.dirname(_p)
+    _search_roots.append(_p)
+_aprx_files = []
+for _r in _search_roots:
+    _aprx_files.extend(glob.glob(os.path.join(_r, "**", "*.aprx"), recursive=True))
+prj = _aprx_files[0] if _aprx_files else None
+if prj is None or not os.path.exists(prj):
+    raise RuntimeError("未找到 .aprx 项目文件")
+aprx = mp.ArcGISProject(prj)
+m = aprx.listMaps()[0]
+
+# 添加数据 + 分级设色
+layer = m.addDataFromPath(r"{input_path}")
+sym = layer.symbology
+sym.updateRenderer("GraduatedColorsRenderer")
+sym.renderer.classificationField = "{field_name}"
+sym.renderer.breakCount = 5
+sym.renderer.classificationMethod = "NaturalBreaks"
+# 注意：ArcGIS Pro 3.6 的 GraduatedColorsRenderer 在设置 classificationField/
+# breakCount/classificationMethod 后自动计算断点，无需调用 classify()
+ramps = aprx.listColorRamps()
+if ramps:
+    _target_ramp = "{color_ramp_name}"
+    _chosen = None
+    if _target_ramp:
+        for _r in ramps:
+            if _target_ramp.lower() in _r.name.lower():
+                _chosen = _r
+                break
+    sym.renderer.colorRamp = _chosen or ramps[0]
+layer.symbology = sym
+
+# 选择样式（按关键词匹配，回退默认）
+all_legends = aprx.listStyleItems("ArcGIS 2D", "LEGEND")
+all_sbs = aprx.listStyleItems("ArcGIS 2D", "SCALE_BAR")
+all_nas = aprx.listStyleItems("ArcGIS 2D", "NORTH_ARROW")
+
+def _pick_style(items, keyword, fallback_idx=0):
+    if keyword and items:
+        for _i, _item in enumerate(items):
+            if keyword.lower() in _item.name.lower():
+                return _item
+    return items[fallback_idx] if items else None
+
+legend_style_item = _pick_style(all_legends, "{legend_style}")
+sb_style_item = _pick_style(all_sbs, "{scale_bar_style}")
+na_style_item = _pick_style(all_nas, "{north_arrow_style}")
+
+# 创建布局
+layout = aprx.createLayout(PAGE_W, PAGE_H, "MILLIMETER")
+mf_geom = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(MF_L, MF_B), arcpy.Point(MF_R, MF_B),
+    arcpy.Point(MF_R, MF_T), arcpy.Point(MF_L, MF_T),
+    arcpy.Point(MF_L, MF_B),
+]))
+mf = layout.createMapFrame(mf_geom, m, "Main Map")
+mf.camera.setExtent(mf.getLayerExtent(layer))  # 缩放到数据范围
+
+# 添加图廓线（CIM 方式）
+_nl_d = layout.getDefinition("V3")
+_nl_line = cim.CIMLineGraphic()
+_nl_line.symbol = cim.CIMLineSymbol()
+_nl_stroke = cim.CIMSolidStroke()
+_nl_stroke.color = cim.CIMRGBColor()
+_nl_stroke.color.red = 0; _nl_stroke.color.green = 0; _nl_stroke.color.blue = 0
+_nl_stroke.width = 0.5
+_nl_line.symbol.symbolLayers = [_nl_stroke]
+_nl_line.shape = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(NL_L, NL_B), arcpy.Point(NL_R, NL_B),
+    arcpy.Point(NL_R, NL_T), arcpy.Point(NL_L, NL_T),
+    arcpy.Point(NL_L, NL_B),
+]))
+_nl_d.elements.append(_nl_line)
+
+# 添加图名（CIM, 在图廓内顶部）
+_title_tg = cim.CIMTextGraphic()
+_title_tg.text = "{_title}"
+_title_sym = cim.CIMTextSymbol()
+_title_sym.fontFamilyName = "微软雅黑"
+_title_sym.fontSize = 20
+_title_sym.bold = True
+_title_sym.horizontalAlignment = "Center"
+_title_tg.symbol = _title_sym
+_title_cy = (NL_T + MF_T) / 2  # 图廓顶部与地图框顶部之间居中
+_title_tg.shape = arcpy.Polygon(arcpy.Array([
+    arcpy.Point(NL_L + _gap, _title_cy - _title_h // 2),
+    arcpy.Point(NL_R - _gap, _title_cy - _title_h // 2),
+    arcpy.Point(NL_R - _gap, _title_cy + _title_h // 2),
+    arcpy.Point(NL_L + _gap, _title_cy + _title_h // 2),
+    arcpy.Point(NL_L + _gap, _title_cy - _title_h // 2),
+]))
+_nl_d.elements.append(_title_tg)
+layout.setDefinition(_nl_d)
+
+# 添加图例/指北针/比例尺（全在图廓内）
+layout.createMapSurroundElement(arcpy.Point(NA_X, NA_Y), "NORTH_ARROW", mf, na_style_item)
+layout.createMapSurroundElement(arcpy.Polygon(arcpy.Array([
+    arcpy.Point(LG_L, LG_B), arcpy.Point(LG_R, LG_B),
+    arcpy.Point(LG_R, LG_T), arcpy.Point(LG_L, LG_T),
+    arcpy.Point(LG_L, LG_B),
+])), "LEGEND", mf, legend_style_item)
+layout.createMapSurroundElement(arcpy.Polygon(arcpy.Array([
+    arcpy.Point(SB_L, SB_B), arcpy.Point(SB_R, SB_B),
+    arcpy.Point(SB_R, SB_T), arcpy.Point(SB_L, SB_T),
+    arcpy.Point(SB_L, SB_B),
+])), "SCALE_BAR", mf, sb_style_item)
+
+# 导出（自动处理后缀）
+import os.path as _osp
+_out = r"{output_path}"
+# 确保输出路径以 .jpg 结尾（arcpy 可能追加 .jpg）
+_out_base, _out_ext = _osp.splitext(_out)
+if _out_ext.lower() not in (".jpg", ".jpeg"):
+    _out = _out_base + ".jpg"
+layout.exportToJPEG(_out, resolution=200)
+# arcpy exportToJPEG 有时会追加 .jpg
+_out_candidates = [_out, _out + ".jpg", _out + ".jpeg"]
+_found = [p for p in _out_candidates if _osp.exists(p)]
+if _found:
+    _actual = _found[0]
+    sz = _osp.getsize(_actual)
+    print(f"JPG导出成功: {{_actual}} ({{sz}} bytes)")
+    # 如果用户要求的是 PDF，额外导出 PDF
+    if _out_ext.lower() == ".pdf":
+        _pdf = r"{output_path}"
+        layout.exportToPDF(_pdf, resolution=200)
+        if _osp.exists(_pdf):
+            sz2 = _osp.getsize(_pdf)
+            print(f"PDF导出成功: {{_pdf}} ({{sz2}} bytes)")
+            set_result({{"output": _pdf, "size": sz2, "success": True, "jpg_also": _actual}})
+        else:
+            set_result({{"output": _actual, "size": sz, "success": True, "note": "PDF导出失败，返回JPG"}})
+    else:
+        set_result({{"output": _actual, "size": sz, "success": True}})
+else:
+    raise RuntimeError(f"JPG 文件未生成，尝试路径: {{_out_candidates}}")
+'''
+    return code.strip()
 
 
 # === Test Function ===

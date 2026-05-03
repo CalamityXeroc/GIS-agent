@@ -864,10 +864,10 @@ class GISAgent:
         question_markers = ["为什么", "为何", "怎么回事", "没看到", "看不到", "是不是", "bug", "问题", "?", "？"]
         task_markers = [
             "执行", "继续", "重试", "再试", "换个方法", "换个方式", "扫描", "扫", "制图", "出图", "地图",
-            "图层", "投影", "合并", "导出", "任务", "arcpy", "input", "之前",
+            "图层", "投影", "合并", "导出", "任务", "arcpy", "input", "之前", "字段", "查看",
         ]
         starts_with_command = message_lower.strip().startswith((
-            "请", "帮我", "我要", "开始", "执行", "确认", "扫描", "合并", "制作", "导出", "投影", "检查"
+            "请", "帮我", "我要", "开始", "执行", "确认", "扫描", "合并", "制作", "导出", "投影", "检查", "查看"
         ))
         has_task_marker = any(m in message_lower for m in task_markers)
         if any(m in message_lower for m in question_markers) and not starts_with_command and not has_task_marker:
@@ -883,10 +883,11 @@ class GISAgent:
         
         # Task execution keywords
         if any(kw in message_lower for kw in [
-            "制作", "创建", "生成", "导出", "整合", "合并", 
+            "制作", "创建", "生成", "导出", "整合", "合并",
             "投影", "变换", "转换", "转化", "坐标系", "检查", "扫描", "分析",
             "制图", "绘制", "出图", "地图", "行政区划", "图例", "比例尺", "指北针", "扫", "扫一下",
             "继续", "重试", "再试", "换个方法", "换个方式", "继续之前", "之前任务",
+            "字段", "查看", "查看字段", "属性", "数值类型",
             "create", "make", "export", "merge", "project", "check", "scan"
         ]):
             return "execute_task"
