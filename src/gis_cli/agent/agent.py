@@ -288,7 +288,153 @@ class GISAgent:
         self.memory.add_user_message(message)
         self._update_context_from_message(message)
         self._extract_structured_memory_from_message(message)
-        
+
+        # /command handling: session management and utilities
+        stripped_msg = message.strip()
+        if stripped_msg.startswith("/"):
+            cmd = stripped_msg[1:].lower().split()[0] if len(stripped_msg) > 1 else ""
+
+            # /new : save current session and start a new one
+            if cmd in ("new", "新对话"):
+                self.save_session()
+                new_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                self.config.session_id = new_id
+                self.memory.session_id = new_id
+                self.memory.clear()
+                self.current_plan = None
+                self.last_result = None
+                self.last_failed_plan = None
+                self._pending_task = None
+                self._pending_confirmation_mode = None
+                self._persist_runtime_state()
+                self._update_workflow_state(
+                    session_id=new_id,
+                    status="new_session",
+                    event="session_created",
+                    event_payload={"session_id": new_id},
+                )
+                return AgentResponse(
+                    content=f"已开启新对话。新会话 ID：{new_id}",
+                    action_taken="new_session",
+                )
+
+            # /list : list all saved sessions
+            elif cmd in ("list", "列表"):
+                if not self.memory.store:
+                    return AgentResponse(
+                        content="未配置持久化存储，无法列出对话。",
+                        action_taken="list_sessions",
+                    )
+                sessions = self.memory.store.list_sessions()
+                if not sessions:
+                    return AgentResponse(
+                        content="暂无保存的对话。使用 /new 开启新对话。",
+                        action_taken="list_sessions",
+                    )
+                lines = []
+                for sid in sorted(sessions):
+                    data = self.memory.store.load_conversation(sid)
+                    turns = data.get("turns", [])
+                    turn_count = len(turns)
+                    last_time = ""
+                    if turns:
+                        try:
+                            ts = turns[-1].timestamp
+                            last_time = ts.strftime("%m-%d %H:%M")
+                        except Exception:
+                            last_time = "N/A"
+                    preview = ""
+                    for t in turns:
+                        if t.role == Role.USER:
+                            preview = (t.content or "")[:40]
+                            break
+                    marker = " ← 当前" if sid == self.config.session_id else ""
+                    preview_str = f" — {preview}" if preview else ""
+                    lines.append(f"• {sid}{marker} ({turn_count}条, {last_time}){preview_str}")
+                return AgentResponse(
+                    content="已保存的对话：\n" + "\n".join(lines),
+                    action_taken="list_sessions",
+                )
+
+            # /load <session_id> : switch to another session
+            elif cmd in ("load", "切换"):
+                parts = stripped_msg.split(None, 1)
+                if len(parts) < 2:
+                    return AgentResponse(
+                        content="请指定要加载的会话 ID，例如：/load session_20260506_143021\n使用 /list 查看所有会话。",
+                        action_taken="load_session",
+                    )
+                target_id = parts[1].strip()
+                if self.memory.store and not (self.memory.store.path / f"{target_id}.json").exists():
+                    return AgentResponse(
+                        content=f"会话 {target_id} 不存在。使用 /list 查看所有会话。",
+                        action_taken="load_session",
+                    )
+                self.load_session(target_id)
+                return AgentResponse(
+                    content=f"已切换到会话：{target_id}",
+                    action_taken="load_session",
+                )
+
+            # /delete <session_id> : delete a session
+            elif cmd in ("delete", "删除"):
+                parts = stripped_msg.split(None, 1)
+                if len(parts) < 2:
+                    return AgentResponse(
+                        content="请指定要删除的会话 ID，例如：/delete session_xxx\n使用 /list 查看所有会话。",
+                        action_taken="delete_session",
+                    )
+                target_id = parts[1].strip()
+                if target_id == self.config.session_id:
+                    return AgentResponse(
+                        content="不能删除当前会话。请先切换到其他会话再删除。",
+                        action_taken="delete_session",
+                    )
+                if self.memory.store and self.memory.store.delete_session(target_id):
+                    # Clean up state manager entry
+                    if self.state_manager:
+                        target_thread = f"thread_{target_id}"
+                        self.state_manager._states.pop(target_thread, None)
+                        self.state_manager._save()
+                    return AgentResponse(
+                        content=f"已删除会话：{target_id}",
+                        action_taken="delete_session",
+                    )
+                return AgentResponse(
+                    content=f"会话 {target_id} 不存在。",
+                    action_taken="delete_session",
+                )
+
+            # /clear : reset current session memory
+            elif cmd in ("clear", "reset", "重置", "清除"):
+                self.memory.clear()
+                self.current_plan = None
+                self.last_failed_plan = None
+                self.last_result = None
+                self._pending_task = None
+                self._pending_confirmation_mode = None
+                self._persist_runtime_state()
+                self.memory.save()
+                return AgentResponse(
+                    content="记忆已清除，可以开始新任务了。",
+                    action_taken="clear",
+                )
+
+            # /help : show available commands
+            elif cmd in ("help", "h", "帮助"):
+                return AgentResponse(
+                    content=(
+                        "可用命令：\n"
+                        "- /new 或 /新对话：保存当前对话并开启新对话\n"
+                        "- /list 或 /列表：列出所有已保存的对话\n"
+                        "- /load <id> 或 /切换 <id>：切换到指定对话\n"
+                        "- /delete <id> 或 /删除 <id>：删除指定对话\n"
+                        "- /clear 或 /重置：清除当前对话的记忆和状态\n"
+                        "- /help 或 /帮助：显示此帮助信息"
+                    ),
+                    action_taken="help",
+                )
+
         # Analyze intent
         intent = self._analyze_intent(message)
         
@@ -582,8 +728,10 @@ class GISAgent:
             "document_constraints": self.memory.get_context("document_constraints", []),
             "document_summary": self.memory.get_context("document_summary", ""),
             "arcpy_available": self.context.arcpy_available,
-            "structured_memories": [m.to_dict() for m in self.memory.search_structured_memories(task_description, top_k=8)],
-            "reflection_hints": self.memory.get_reflection_hints(task_description, top_k=4),
+            # NOTE: structured_memories and reflection_hints intentionally excluded.
+            # They contain stale task context that biases the LLM toward old tasks
+            # when the user gives a new instruction (e.g., "扫" → keeps planning
+            # the previous task instead of scanning).
         }
 
         snapshot = self.context_hub.discover()
@@ -1297,6 +1445,40 @@ class GISAgent:
                 return True
         return False
 
+    def _find_last_user_task(self) -> str | None:
+        """Find the last user message that looks like a task request.
+
+        Used when the user sends a confirmation word but there's no pending plan.
+        Uses broad heuristics to recover the original task context — anything
+        that is NOT a pure confirmation, greeting, or meta-question about the
+        agent is treated as a potential task.
+        """
+        # Messages that are clearly NOT tasks
+        _meta_markers = ["你是什么", "你是谁", "你是啥", "你能做什么", "你能干什么",
+                         "你可以做什么", "你可以干什么", "你叫什么"]
+        _greeting_markers = ["你好", "您好", "hello", "hi"]
+
+        for turn in reversed(self.memory.turns[:-1]):  # Exclude current turn
+            if turn.role != Role.USER:
+                continue
+            prev_msg = (turn.content or "").strip()
+            if not prev_msg:
+                continue
+            # Skip affirmations ("ok", "好", "可以执行", etc.)
+            if self._looks_like_affirmative(prev_msg):
+                continue
+            # Skip meta-questions about the agent itself
+            if any(m in prev_msg for m in _meta_markers):
+                continue
+            # Skip greetings
+            if prev_msg.lower() in _greeting_markers:
+                continue
+            # Any remaining meaningful message is a potential task
+            if len(prev_msg) > 2:
+                return prev_msg
+            break  # Only check the most recent meaningful user message
+        return None
+
     def _extract_docx_path_from_message(self, message: str) -> str | None:
         """Extract the first .docx path from user message."""
         matched = self._extract_document_path_from_message(message)
@@ -1361,6 +1543,9 @@ class GISAgent:
 2. 将模糊描述转换为明确的 GIS 操作
 3. 识别需要的工具和操作顺序
 4. 用清晰简洁的语言描述任务
+
+**关键指令：忽略之前的对话历史，只关注用户当前最新的一条消息。**
+如果当前消息很短（如"扫""做""继续"），根据其本意扩展，不要参考历史对话中的旧任务。
 
 输出要求:
 - 只返回 refined 任务描述
@@ -1573,6 +1758,15 @@ class GISAgent:
                 suggestions=self._get_recovery_suggestions(result) if not result.success else []
             )
         else:
+            # No pending plan. Check if user is confirming based on
+            # prior conversation context. This covers the case where the
+            # LLM responded with chat text instead of creating a Plan,
+            # leaving current_plan=None when the user says "ok"/"好"/etc.
+            if self._looks_like_affirmative(message):
+                last_task = self._find_last_user_task()
+                if last_task:
+                    return self._handle_task_execution(last_task)
+
             if self._message_implies_document_usage(message) or (
                 self._looks_like_affirmative(message) and self._has_recent_document_hint()
             ):
@@ -1580,6 +1774,15 @@ class GISAgent:
                 if not self._message_implies_document_usage(doc_task):
                     doc_task = "根据文档需求规划 GIS 任务并执行"
                 return self._handle_task_execution(doc_task)
+
+            # Last resort: even if the message doesn't look like an
+            # affirmative, try to recover the last task from history.
+            # This handles cases like "你倒是确认啊" where the intent
+            # analysis returned confirm_action but _looks_like_affirmative
+            # returned False.
+            last_task = self._find_last_user_task()
+            if last_task:
+                return self._handle_task_execution(last_task)
 
             return AgentResponse(
                 content=(
@@ -2662,7 +2865,14 @@ class GISAgent:
 
         restored_plan = self._deserialize_plan_state(payload.get("current_plan"))
         if restored_plan is not None:
-            self.current_plan = restored_plan
+            # If the restored plan has already failed, archive it immediately.
+            # This prevents a persistent failed plan from triggering the error loop
+            # across agent restarts (the root cause of the "报错死循环" bug).
+            if restored_plan.has_failed:
+                self.last_failed_plan = restored_plan
+                self.current_plan = None
+            else:
+                self.current_plan = restored_plan
 
         restored_result = self._deserialize_execution_result_state(payload.get("last_result"), self.current_plan)
         if restored_result is not None:
@@ -2893,6 +3103,7 @@ class GISAgent:
         self.memory.clear()
         self.current_plan = None
         self.last_result = None
+        self.last_failed_plan = None
         self._persist_runtime_state()
         self._update_workflow_state(
             status="reset",
@@ -2912,6 +3123,7 @@ class GISAgent:
     
     def load_session(self, session_id: str) -> None:
         """Load a previous session."""
+        self.save_session()  # Save current session before switching
         self.config.session_id = session_id
         self.memory.session_id = session_id
         self.memory.load()
