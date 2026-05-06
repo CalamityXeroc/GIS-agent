@@ -531,9 +531,14 @@ def scan_workspace_layers(workspace: str) -> ArcPyExecutionResult:
                     except Exception:
                         pass
                 fields.append(info)
+            _shape_type = desc.shapeType if hasattr(desc, "shapeType") else None
+            try:
+                _cnt = int(arcpy.management.GetCount(path).getOutput(0))
+            except Exception:
+                _cnt = None
             return {{
                 "name": name,
-                "type": desc.shapeType,
+                "type": _shape_type,
                 "path": path,
                 "feature_type": "FeatureClass",
                 "spatial_reference": sr.name if sr else None,
@@ -541,7 +546,7 @@ def scan_workspace_layers(workspace: str) -> ArcPyExecutionResult:
                 "has_z": desc.hasZ,
                 "has_m": desc.hasM,
                 "fields": fields,
-                "feature_count": arcpy.management.GetCount(path).getOutput(0),
+                "feature_count": _cnt,
             }}
 
         # 扫描要素类

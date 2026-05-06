@@ -165,6 +165,7 @@ class GISAgent:
         # Current state
         self.current_plan: Plan | None = None
         self.last_result: ExecutionResult | None = None
+        self.last_failed_plan: Plan | None = None  # Archived after failure, for retry
         self._pending_task: str | None = None  # For suggestion-triggered tasks
         self._pending_confirmation_mode: ExecutionMode | None = None
         self._restore_runtime_state()
@@ -680,17 +681,18 @@ class GISAgent:
         if self._looks_like_affirmative(message_lower) and self._has_recent_document_hint():
             return "execute_task"
 
-        # If a plan is pending, continuation/retry phrases should resume execution
-        # instead of being interpreted as status queries by the LLM.
+        # SYSTEMATIC FIX: Failed plans are archived immediately after execution,
+        # so current_plan is ONLY set when a plan is newly created (pending, not yet executed).
+        # This prevents the error loop: if current_plan is None, we never reach resume_markers.
         if self.current_plan and not self.current_plan.is_complete:
             stripped_pending = message_lower.strip()
             resume_markers = [
                 "继续执行", "继续", "重试", "retry", "resume", "接着执行", "继续跑",
                 "再试", "再试试", "换个方法", "换个方式", "试试别的", "继续之前", "继续上一个",
                 "重写代码", "代码重写", "重写", "重做", "重新", "换一种", "换种", "换一下",
-                # Confirmation markers when plan is pending
+                # Confirmation markers (minimum 2 chars to avoid false matches)
                 "执行", "执行吧", "确认执行", "可以执行", "开始执行", "开始吧",
-                "可以的", "好的", "好", "行", "是", "嗯", "ok", "yes",
+                "可以的", "好的",
             ]
             if any(marker in stripped_pending for marker in resume_markers):
                 return "confirm_action"
@@ -1520,6 +1522,8 @@ class GISAgent:
                 retry_prompt = self._build_retry_replan_prompt(
                     self.current_plan, self.last_result, user_feedback
                 )
+                # Archive failed plan before creating retry
+                self._archive_current_plan()
                 return self._handle_task_execution(retry_prompt)
 
             # Execute the pending plan
@@ -1531,11 +1535,18 @@ class GISAgent:
                 updated = self._apply_overwrite_retry_policy(self.current_plan)
                 if updated > 0:
                     overwrite_notes.append(f"已启用覆盖策略并更新 {updated} 个步骤。")
-                elif self.current_plan.has_failed:
-                    overwrite_notes.append("已收到覆盖指令，但未识别到可重试的输出冲突步骤。")
 
-            result, recovery_notes = self._execute_with_recovery(self.current_plan, mode)
-            self._record_execution_reflection(self.current_plan, result, recovery_notes)
+            plan_to_execute = self.current_plan
+            result, recovery_notes = self._execute_with_recovery(plan_to_execute, mode)
+            self._record_execution_reflection(plan_to_execute, result, recovery_notes)
+
+            # SYSTEMATIC FIX: Archive plan immediately after execution.
+            # This prevents the error loop where a failed current_plan causes
+            # ANY subsequent user message to trigger re-execution.
+            if plan_to_execute.has_failed:
+                self._archive_failed_plan(plan_to_execute)
+            else:
+                self.current_plan = None
             
             if result.success:
                 delivered_outputs = self._collect_output_candidates(result)
@@ -2107,6 +2118,19 @@ class GISAgent:
             or "已存在" in lowered
             or "dataset" in lowered and "exists" in lowered
         )
+
+    # ── Plan archiving (systematic error-loop prevention) ──
+
+    def _archive_current_plan(self) -> None:
+        """Archive the current plan and clear it to prevent error loops."""
+        if self.current_plan and self.current_plan.has_failed:
+            self.last_failed_plan = self.current_plan
+        self.current_plan = None
+
+    def _archive_failed_plan(self, plan: Plan) -> None:
+        """Archive a failed plan and clear current_plan."""
+        self.last_failed_plan = plan
+        self.current_plan = None
 
     def _apply_overwrite_retry_policy(self, plan: Plan) -> int:
         """Inject overwrite flags and requeue failed output-conflict steps."""
