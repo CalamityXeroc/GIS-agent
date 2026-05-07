@@ -22,6 +22,7 @@ src/gis_cli/agent/context_hub.py
 src/gis_cli/agent/evaluation.py
 src/gis_cli/agent/execution_adapter.py
 src/gis_cli/agent/executor.py
+src/gis_cli/agent/gis_domain_prompts.py
 src/gis_cli/agent/llm.py
 src/gis_cli/agent/memory.py
 src/gis_cli/agent/model_adaptation.py
@@ -50,6 +51,7 @@ src/gis_cli/tools/quality_check.py
 src/gis_cli/tools/read_pdf.py
 src/gis_cli/tools/read_word.py
 src/gis_cli/tools/scan_layers.py
+src/gis_cli/tools/web_search.py
 src/gis_cli/web/__init__.py
 src/gis_cli/web/api.py
 src/gis_cli/web/streamlit_app.py
