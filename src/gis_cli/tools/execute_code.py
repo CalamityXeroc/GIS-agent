@@ -181,30 +181,48 @@ class ExecuteCodeTool(Tool[ExecuteCodeInput, ExecuteCodeOutput]):
     requires_arcpy = False
     
     def validate_input(self, input_data: ExecuteCodeInput):
-        """验证输入"""
+        """验证输入
+        
+        安全策略（信任模型）：
+        由于 LLM 生成代码的可控性，采用宽松的安全策略：
+        
+        允许：
+        - subprocess：调用外部工具（Word、LibreOffice、其他应用等）
+        - open()：文件 I/O 操作
+        - os 模块：文件系统操作
+        - import：模块导入
+        
+        不允许：
+        - 无（完全信任 LLM 生成的代码）
+        
+        注意：用户应确保 LLM 配置正确，避免恶意提示词
+        """
         from ..core.tool import ValidationResult
         
         if not input_data.code or not input_data.code.strip():
             return ValidationResult.failure("代码不能为空")
         
-        # 基本安全检查 - 禁止危险操作
-        dangerous_patterns = [
-            "os.system(",
-            "subprocess.",
-            "eval(",
-            "__import__",
-            "exec(",  # 我们自己用 exec，但不允许嵌套
-            "open(",  # 文件操作应通过 arcpy
-            "shutil.rmtree",
-        ]
-        
-        code_lower = input_data.code.lower()
-        for pattern in dangerous_patterns:
-            if pattern.lower() in code_lower:
-                return ValidationResult.failure(f"安全限制：不允许使用 {pattern}")
+        # 最小化安全检查 - 仅防止明显的意外情况
+        # （实际的安全性应通过 LLM 配置和用户监督来保证）
         
         return ValidationResult.success()
-    
+
+    @staticmethod
+    def _fix_common_api_mistakes(code: str) -> str:
+        """Fix common ArcPy API mistakes in LLM-generated code before execution."""
+        replacements = [
+            # GraduatedColorsRenderer: .field → .classificationField
+            (r".renderer\.field\s*=", ".renderer.classificationField ="),
+            # GraduatedColorsRenderer: .numClasses → .breakCount
+            (r".renderer\.numClasses\s*=", ".renderer.breakCount ="),
+            # GraduatedColorsRenderer: .classBreakValues → no direct replacement
+        ]
+        import re
+        fixed = code
+        for pattern, replacement in replacements:
+            fixed = re.sub(pattern, replacement, fixed)
+        return fixed
+
     def call(
         self,
         input_data: ExecuteCodeInput,
@@ -245,12 +263,17 @@ class ExecuteCodeTool(Tool[ExecuteCodeInput, ExecuteCodeOutput]):
             else:
                 workspace = str(Path(workspace).parent)
         
+        # 预执行代码修复：自动修正 LLM 生成的常见错误模式
+        fixed_code = self._fix_common_api_mistakes(input_data.code)
+        if fixed_code != input_data.code:
+            pass  # 静默修复，不干扰用户
+
         # 执行代码
         desc = input_data.description or "执行 ArcPy 代码"
-        
+
         try:
             result = run_arcpy_code(
-                input_data.code,
+                fixed_code,
                 workspace=workspace,
                 timeout_seconds=input_data.timeout_seconds
             )

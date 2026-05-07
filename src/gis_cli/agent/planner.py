@@ -1394,6 +1394,16 @@ set_result({{"output": output_path, "feature_count": count, "merged_layers": len
         )
 
     def _is_critical_step(self, step: PlanStep) -> bool:
-        """Whether a failed step is critical and must not be auto-skipped."""
+        """Whether a failed step is critical and must not be auto-skipped.
+
+        API-level errors (AttributeError, NameError) in execute_code steps
+        are NOT considered critical — they can be fixed by generating
+        different code, not by user intervention.
+        """
+        if step.tool == "execute_code" and step.error:
+            err_lower = step.error.lower()
+            api_level_errors = {"attributeerror", "attribute error", "nameerror", "name error"}
+            if any(e in err_lower for e in api_level_errors):
+                return False
         critical_tools = {"scan_layers", "merge_layers", "project_layers", "execute_code", "export_map"}
         return step.id == "step_1" or step.tool in critical_tools

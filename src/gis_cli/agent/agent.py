@@ -2258,15 +2258,42 @@ class GISAgent:
         user_feedback: str = "",
     ) -> str:
         failed_steps = plan.get_failed_steps()
-        failed_lines: list[str] = []
-        for step in failed_steps[:3]:
-            err = (step.error or "未知错误").strip()
-            failed_lines.append(f"- 步骤 {step.id}（{step.tool}）：{err[:220]}")
+        error_sections: list[str] = []
 
-        if not failed_lines and result and result.error:
-            failed_lines.append(f"- 上次错误：{str(result.error)[:220]}")
+        # Build error context from trace (has full error details + code)
+        trace_steps = {s.step_id: s for s in (result.trace.steps if result and result.trace else [])}
 
-        failure_text = "\n".join(failed_lines) if failed_lines else "- 上次执行失败，但未记录到明确失败步骤"
+        for step in failed_steps[:2]:
+            ts = trace_steps.get(step.id)
+            err_text = ts.error if ts and ts.error else (step.error or "未知错误")
+            code_text = ""
+            if step.tool == "execute_code":
+                code = (step.input or {}).get("code", "") or (ts.input or {}).get("code", "") if ts else ""
+                if code:
+                    code_text = f"\n失败代码：\n```python\n{code.strip()[-800:]}\n```"
+
+            # Classify error type and add fix hint
+            err_lower = err_text.lower()
+            hint = ""
+            if "attribute" in err_lower and "not supported" in err_lower:
+                hint = "【修复提示】使用了错误的属性名（如 .field），请检查 ArcGIS Pro 3.6 API 的正确名称。"
+            elif "classificationfield" in err_lower:
+                hint = "【修复提示】分类字段不存在，请先用 scan_layers 确认数据中的实际字段名。"
+            elif "nameerror" in err_lower or "name" in err_lower and "not defined" in err_lower:
+                hint = "【修复提示】变量未定义，请检查代码中的变量名拼写。"
+            elif "runtimeerror" in err_lower or "runtime error" in err_lower:
+                hint = "【修复提示】ArcPy 运行时错误，请检查输入数据是否存在、字段名是否正确。"
+
+            error_sections.append(
+                f"步骤 {step.id}（{step.tool}）错误：\n{err_text}"
+                f"{code_text}"
+                f"{hint}"
+            )
+
+        if not error_sections and result and result.error:
+            error_sections.append(f"上次错误：{str(result.error)}")
+
+        failure_text = "\n---\n".join(error_sections) if error_sections else "- 上次执行失败，但未记录到明确失败步骤"
 
         feedback_section = ""
         if user_feedback:
@@ -2278,7 +2305,7 @@ class GISAgent:
         return (
             "请重新规划并执行同一任务，避免重复之前失败路径。\n"
             f"任务目标：{plan.goal}\n"
-            "上次失败摘要：\n"
+            "上次失败详情：\n"
             f"{failure_text}\n"
             f"{feedback_section}"
             "要求：\n"

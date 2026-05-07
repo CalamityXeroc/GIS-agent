@@ -491,13 +491,36 @@ except Exception as e:
 - 成功时：`set_result({{"success": True, "output": "输出文件路径", "message": "描述"}})`
 - 失败时：`set_result({{"success": False, "error": "错误信息"}})`
 
-### 规则 7：分级设色 + 导出必须使用预置代码生成器（禁止手写布局代码）
-- **必须使用** `build_graduated_colors_code(input_path, field_name, output_path)` 生成代码后用 `exec()` 执行
-- **禁止自己编写布局代码**（所有 createTextElement/createLegendElement 等方法在 ArcGIS Pro 3.6 中均不存在，自己写必然报错）
-- **禁止使用**：`createTextElement()`、`createLegendElement()`、`createNorthArrowElement()`、`createScaleBarElement()`、`addText()`
-- 如需调整布局元素位置或样式，修改 `build_graduated_colors_code` 中的坐标常量即可
-- 样式可选参数: `legend_style`/`scale_bar_style`/`north_arrow_style` 支持关键词匹配（如 `legend_style="Legend 1"`）
-- 色带可选参数: `color_ramp_name` 支持关键词匹配（如 `color_ramp_name="YlOrRd"`）
+### 规则 7：分级设色手写代码注意事项
+
+如果手写分级设色代码，必须使用以下**正确的 ArcGIS Pro 3.6 API**：
+
+```python
+layer = m.addDataFromPath(r"输入路径")
+sym = layer.symbology
+sym.updateRenderer("GraduatedColorsRenderer")
+sym.renderer.classificationField = "字段名"    # ← 正确！不是 .field！
+sym.renderer.breakCount = 5
+sym.renderer.classificationMethod = "NaturalBreaks"
+# 注意：Pro 3.6 中设置以上三个属性后自动计算断点，无需调用 classify()
+ramps = aprx.listColorRamps()
+sym.renderer.colorRamp = ramps[0]
+layer.symbology = sym
+```
+
+**常见错误（禁止出现）**：
+- ❌ `sym.renderer.field = "xxx"` → 错误！Pro 3.6 中 `GraduatedColorsRenderer` 没有 `field` 属性
+- ✅ 正确属性名：`sym.renderer.classificationField = "字段名"`
+
+### 常见 ArcPy API 错误表（手写代码时对照检查）
+
+| 错误写法 | 正确写法 | 说明 |
+|---------|---------|------|
+| `sym.renderer.field = "x"` | `sym.renderer.classificationField = "x"` | GraduatedColorsRenderer 的属性名是 classificationField |
+| `sym.renderer.numClasses = 5` | `sym.renderer.breakCount = 5` | Pro 3.6 中断点数的属性是 breakCount |
+| `check_types=["attribute"]` | `check_types=["attributes"]` | quality_check 参数名是复数形式 |
+| `arcpy.mp.MapDocument("CURRENT")` | 改用 aprx 对象 | Pro 3.6 中没有 MapDocument，直接用 ArcGISProject |
+| `createTextElement()` / `createLegendElement()` | 使用布局的 createMapSurroundElement | Pro 3.6 中这些方法不存在 |
 
 ## 规划示例
 
