@@ -1422,7 +1422,8 @@ class GISAgent:
         """Check whether message is a short confirmation phrase."""
         stripped = message.strip().lower()
         if stripped in {
-            "好", "好的", "可以", "是", "行", "嗯", "读吧", "继续", "继续吧",
+            "好", "好的", "可以", "是", "行", "嗯", "嗯嗯", "嗯嗯嗯",
+            "读吧", "继续", "继续吧",
             "ok", "yes", "confirm", "execute",
         }:
             return True
@@ -1476,7 +1477,8 @@ class GISAgent:
             # Any remaining meaningful message is a potential task
             if len(prev_msg) > 2:
                 return prev_msg
-            break  # Only check the most recent meaningful user message
+            # Short non-affirmative message (e.g. "嗯嗯", "扫") → skip and keep looking back
+            continue
         return None
 
     def _extract_docx_path_from_message(self, message: str) -> str | None:
