@@ -476,7 +476,19 @@ class Executor:
 
         if tool_name in {"project_layers", "quality_check"}:
             current_input = payload.get("input_path")
-            if not isinstance(current_input, str) or not current_input.strip():
+            input_missing = not isinstance(current_input, str) or not current_input.strip()
+            input_not_exists = False
+            if isinstance(current_input, str) and current_input.strip():
+                current_text = current_input.strip()
+                current_path = Path(current_text)
+                exists_direct = current_path.exists()
+                exists_cwd_relative = False
+                if not current_path.is_absolute():
+                    exists_cwd_relative = (Path.cwd() / current_path).exists()
+                is_gdb_fc = ".gdb\\" in current_text.lower() or ".gdb/" in current_text.lower()
+                input_not_exists = not (exists_direct or exists_cwd_relative or is_gdb_fc)
+
+            if input_missing or input_not_exists:
                 inferred = self._infer_input_path(step, plan)
                 if inferred:
                     payload["input_path"] = inferred

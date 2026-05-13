@@ -59,21 +59,21 @@ class GISDomainPrompts:
 - **实现方式**: execute_code + arcpy.analysis.Intersect() / arcpy.analysis.Union()
 
 ### 空间连接 (Spatial Join)
-- **适用场景**: "统计每个省/区的数量"、"计算各区域内的点数"、"按区域汇总"
-- **示例需求**: "统计各省保护区数量"、"计算每个行政区内的POI数量"
+- **适用场景**: "统计每个区域的数量"、"计算各区域内的点数"、"按区域汇总"
+- **示例需求**: "统计指定区域内的某项指标"、"计算每个行政区内的POI数量"
 - **实现方式**: execute_code + arcpy.analysis.SpatialJoin()
 - **关键参数**: join_type="JOIN_ONE_TO_ONE", match_option="INTERSECT"或"WITHIN"
 - **代码模板**:
   ```python
-  # 统计每个省份内的保护区数量
+  # 统计每个区域内的数据指标
   import arcpy
-  provinces = r"{省界图层路径}"
-  protected_areas = r"{保护区图层路径}"
-  output = r"{output_path}/province_stats.shp"
-  # 先做空间连接,统计每个省内的保护区
+  boundary_layer = r"{区域边界图层路径}"
+  data_layer = r"{待统计图层路径}"
+  output = r"{output_path}/region_stats.shp"
+  # 先做空间连接,统计每个区域内的数据
   arcpy.analysis.SpatialJoin(
-      target_features=provinces,
-      join_features=protected_areas,
+      target_features=boundary_layer,
+      join_features=data_layer,
       out_feature_class=output,
       join_type="JOIN_ONE_TO_ONE",
       match_option="INTERSECT"
@@ -81,8 +81,8 @@ class GISDomainPrompts:
   # 使用频数统计或汇总统计数据
   arcpy.analysis.Frequency(
       in_table=output,
-      out_table=r"{output_path}/province_counts.dbf",
-      frequency_fields=["Province_Name"],  # 省名称字段
+      out_table=r"{output_path}/region_counts.dbf",
+      frequency_fields=["Region_Name"],  # 区域名称字段
       summary_fields=["Join_Count"]  # 计数会自动汇总
   )
   ```
@@ -111,7 +111,7 @@ class GISDomainPrompts:
   - 人口/数量: YlOrRd（黄-橙-红）, OrRd（橙-红）, Purples（紫）
   - 百分比/比例: Blues（蓝）, GnBu（绿-蓝）, YlGn（黄-绿）
   - 高程/地形: 地形专用色带（绿-棕-白）
-- **示例**: "各省保护区数量" → YlOrRd 或 OrRd 顺序色系,数值越大颜色越深
+- **示例**: "统计各区域的某项数值指标" → YlOrRd 或 OrRd 顺序色系,数值越大颜色越深
 
 #### 2. 发散色系 (Diverging) — 适用于有中点的数据
 - **适用场景**: 增长率(正/负)、变化量、偏差、差值

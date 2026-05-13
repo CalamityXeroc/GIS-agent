@@ -702,6 +702,15 @@ print(f"Created FileGDB: {{target}}")
         # Determine workflow based on keywords
         # 专题图 / 制图 / 导出
         if any(kw in task_lower for kw in ["专题图", "制图", "地图", "导出", "map", "export"]):
+            thematic_plan = self._create_explicit_thematic_map_plan(
+                task_description=task_description,
+                context=context,
+                input_folder=input_folder,
+                output_folder=output_folder,
+            )
+            if thematic_plan is not None:
+                return thematic_plan
+
             add_step("scan_layers", "扫描输入数据", {"path": input_folder, "include_subdirs": True})
             add_step("merge_layers", "合并图层数据", {
                 "input_layers": [input_folder],
@@ -856,6 +865,334 @@ set_result({{"status": "需要LLM生成代码", "task": "{task_description[:50]}
             steps=steps,
             expected_outputs=["output.shp", "execution_log.txt"]
         )
+
+    def _create_explicit_thematic_map_plan(
+        self,
+        task_description: str,
+        context: dict[str, Any] | None,
+        input_folder: str,
+        output_folder: str,
+    ) -> Plan | None:
+        """Create a deterministic thematic-map plan when explicit layer path is provided.
+
+        This avoids brittle generic merge→project→export pipelines for requests like:
+        "使用 workspace/output/xxx.shp ... 导出 xxx.jpg"。
+        """
+        input_layer = self._extract_explicit_dataset_path(task_description, context)
+        if not input_layer:
+            return None
+
+        output_image = self._extract_explicit_image_output_path(task_description, context, output_folder)
+        requested_field = self._extract_requested_field_name(task_description)
+        title = self._extract_map_title(task_description, requested_field)
+        color_ramp = self._extract_color_ramp_name(task_description)
+
+        scan_root = str(Path(input_layer).parent) if Path(input_layer).suffix else input_folder
+
+        code = f'''
+import arcpy
+from gis_cli.arcpy_bridge import build_graduated_colors_code
+
+input_fc = r"{input_layer}"
+requested_field = r"{requested_field}"
+output_path = r"{output_image}"
+
+if not arcpy.Exists(input_fc):
+    raise RuntimeError(f"输入图层不存在: {{input_fc}}")
+
+fields = arcpy.ListFields(input_fc)
+field_names = [f.name for f in fields]
+numeric_fields = [f.name for f in fields if f.type in ("SmallInteger", "Integer", "Single", "Double", "Float")]
+
+def _pick_field(req: str) -> str:
+    req = (req or "").strip()
+    if req:
+        for name in field_names:
+            if name.lower() == req.lower():
+                return name
+        req_norm = req.lower().replace("_", "")
+        for name in field_names:
+            if name.lower().replace("_", "") == req_norm:
+                return name
+
+    prefer_tokens = [
+        "forest", "cov", "cover", "veget", "veg", "rate", "ratio", "pct", "percent",
+        "pop", "population", "density", "road", "network", "traffic", "gdp", "income",
+        "count", "num", "area", "index", "value",
+        "比例", "覆盖", "植被", "人口", "密度", "路网", "交通", "数量", "面积", "指数", "值",
+    ]
+    for name in numeric_fields:
+        n = name.lower()
+        if any(token in n for token in prefer_tokens):
+            return name
+
+    if numeric_fields:
+        return numeric_fields[0]
+
+    raise RuntimeError(f"未找到可用于分级设色的数值字段，可用字段: {{field_names}}")
+
+field_name = _pick_field(requested_field)
+print(f"使用分级字段: {{field_name}}")
+
+code = build_graduated_colors_code(
+    input_path=input_fc,
+    field_name=field_name,
+    output_path=output_path,
+    title=r"{title}",
+    color_ramp_name=r"{color_ramp}",
+    legend_style="Legend 1",
+    scale_bar_style="Scale Bar 1",
+    north_arrow_style="North Arrow 1",
+)
+exec(compile(code, "graded_map", "exec"))
+'''
+
+        steps = [
+            PlanStep(
+                id="step_1",
+                tool="scan_layers",
+                description="扫描专题图输入图层所在目录",
+                input={"path": scan_root, "include_subdirs": True},
+                depends_on=[],
+            ),
+            PlanStep(
+                id="step_2",
+                tool="execute_code",
+                description="基于指定图层生成分级设色专题图并导出 JPG",
+                input={
+                    "code": code.strip(),
+                    "workspace": output_folder,
+                    "description": "专题图制图（分级设色 + 图名/图例/比例尺/指北针 + JPG导出）",
+                },
+                depends_on=["step_1"],
+            ),
+        ]
+
+        return Plan(
+            id=f"plan_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            goal=task_description,
+            steps=steps,
+            expected_outputs=[output_image],
+            metadata={"deterministic_thematic_plan": True, "input_layer": input_layer},
+        )
+
+    def _extract_explicit_dataset_path(self, task_description: str, context: dict[str, Any] | None) -> str | None:
+        """Extract explicit dataset path (.shp/.geojson/.gpkg), resolve relative to workspace."""
+        patterns = [
+            r'([A-Za-z]:[\\/][^"\n\r\t,，]+?\.(?:shp|geojson|gpkg))',
+            r'((?:\.{0,2}[\\/])?workspace[\\/][^"\n\r\t,，]+?\.(?:shp|geojson|gpkg))',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, task_description, flags=re.IGNORECASE)
+            if not match:
+                continue
+            raw = match.group(1).strip()
+            resolved = self._resolve_task_path(raw, context)
+            if resolved:
+                return resolved
+
+        # Path-like references without extension, e.g. "workspace/output/province_forest_coverage 这个图层"
+        no_ext_patterns = [
+            r'((?:\.{0,2}[\\/])?workspace[\\/][^"\n\r\t,，]+?)\s*(?:这个)?图层',
+            r'([A-Za-z]:[\\/][^"\n\r\t,，]+?)\s*(?:这个)?图层',
+        ]
+        for pattern in no_ext_patterns:
+            for match in re.finditer(pattern, task_description, flags=re.IGNORECASE):
+                raw = match.group(1).strip().rstrip(".")
+                resolved = self._resolve_dataset_candidate(raw, context)
+                if resolved:
+                    return resolved
+
+        # Bare layer-name references, e.g. "province_forest_coverage 这个图层"
+        name_matches = re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:这个)?图层', task_description, flags=re.IGNORECASE)
+        for m in name_matches:
+            layer_name = m.group(1).strip()
+            resolved = self._resolve_dataset_candidate(layer_name, context)
+            if resolved:
+                return resolved
+        return None
+
+    def _extract_explicit_image_output_path(
+        self,
+        task_description: str,
+        context: dict[str, Any] | None,
+        output_folder: str,
+    ) -> str:
+        """Extract explicit map export path; fallback to output/thematic_map.jpg."""
+        patterns = [
+            r'([A-Za-z]:[\\/][^"\n\r\t,，]+?\.(?:jpg|jpeg|png|pdf|tif|tiff))',
+            r'((?:\.{0,2}[\\/])?workspace[\\/][^"\n\r\t,，]+?\.(?:jpg|jpeg|png|pdf|tif|tiff))',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, task_description, flags=re.IGNORECASE)
+            if not match:
+                continue
+            raw = match.group(1).strip()
+            resolved = self._resolve_task_path(raw, context)
+            if resolved:
+                lower = resolved.lower()
+                if not lower.endswith((".jpg", ".jpeg")):
+                    base, _ = os.path.splitext(resolved)
+                    return base + ".jpg"
+                return resolved
+
+        return str(Path(output_folder) / "thematic_map.jpg")
+
+    def _extract_requested_field_name(self, task_description: str) -> str:
+        """Extract requested field name from natural language; fallback placeholder."""
+        patterns = [
+            r'字段(?:名)?(?:用|为|是|选|选择)?\s*[:：=]?\s*["\'`]?([A-Za-z_][A-Za-z0-9_]*)',
+            r'field(?:_name)?\s*[:=]?\s*["\'`]?([A-Za-z_][A-Za-z0-9_]*)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, task_description, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _extract_color_ramp_name(self, task_description: str) -> str:
+        """Extract preferred color ramp from user text with robust fallbacks."""
+        lowered = task_description.lower()
+
+        known_ramps = [
+            "Greens", "YlGn", "YlGnBu", "Blues", "BuGn", "GnBu", "PuBu", "BuPu",
+            "Reds", "OrRd", "YlOrRd", "Oranges", "YlOrBr", "BrBG",
+            "Purples", "PuRd", "RdPu", "RdBu", "RdGy", "RdYlGn", "RdYlBu",
+            "PiYG", "PRGn", "PuOr", "Spectral", "Greys",
+        ]
+        # Match longer ramp names first (e.g. YlOrRd before OrRd).
+        for ramp in sorted(known_ramps, key=len, reverse=True):
+            if ramp.lower() in lowered:
+                return ramp
+
+        # Combined schemes first
+        if any(k in lowered for k in ["红蓝", "红-蓝", "red-blue", "red blue"]):
+            return "RdBu"
+        if any(k in lowered for k in ["红黄绿", "红-黄-绿", "red-yellow-green", "red yellow green"]):
+            return "RdYlGn"
+        if any(k in lowered for k in ["蓝绿", "蓝-绿", "blue-green", "blue green", "青绿"]):
+            return "YlGnBu"
+
+        # Single-hue preferences
+        if any(k in lowered for k in ["绿色", "绿", "green"]):
+            return "Greens"
+        if any(k in lowered for k in ["蓝色", "蓝", "blue"]):
+            return "Blues"
+        if any(k in lowered for k in ["红色", "红", "red"]):
+            return "Reds"
+        if any(k in lowered for k in ["橙色", "橙", "orange"]):
+            return "Oranges"
+        if any(k in lowered for k in ["紫色", "紫", "purple"]):
+            return "Purples"
+        if any(k in lowered for k in ["棕色", "棕", "brown"]):
+            return "YlOrBr"
+        if any(k in lowered for k in ["灰色", "灰", "gray", "grey"]):
+            return "Greys"
+        if any(k in lowered for k in ["黄色", "黄", "yellow"]):
+            return "YlOrRd"
+
+        # Generic thematic default
+        return "YlGnBu"
+
+    def _extract_map_title(self, task_description: str, requested_field: str) -> str:
+        """Infer map title from task text."""
+        if "植被" in task_description and ("覆盖率" in task_description or "覆盖" in task_description):
+            return "中国各省植被覆盖率面积分布图"
+        if "森林" in task_description and ("覆盖率" in task_description or "覆盖" in task_description):
+            return "中国各省森林覆盖率分布图"
+
+        match = re.search(r"做一张(.{2,40}?)图", task_description)
+        if match:
+            title = match.group(1).strip()
+            if title:
+                return f"{title}图"
+
+        if requested_field:
+            return f"{requested_field} 分级图"
+        return "专题图"
+
+    def _resolve_task_path(self, raw_path: str, context: dict[str, Any] | None) -> str | None:
+        """Resolve raw task path against workspace/cwd while keeping absolute paths."""
+        candidate = Path(raw_path.replace("/", os.sep).replace("\\", os.sep))
+        if candidate.is_absolute():
+            return str(candidate)
+
+        bases: list[Path] = []
+        workspace_raw = ""
+        if isinstance(context, dict):
+            workspace_raw = str(context.get("workspace", "") or "").strip()
+        if workspace_raw:
+            bases.append(Path(workspace_raw))
+        bases.append(Path.cwd())
+
+        for base in bases:
+            resolved = (base / candidate).resolve(strict=False)
+            if resolved.exists():
+                return str(resolved)
+
+        # Return best-effort resolved path under first base.
+        if bases:
+            return str((bases[0] / candidate).resolve(strict=False))
+        return str(candidate)
+
+    def _resolve_dataset_candidate(self, raw: str, context: dict[str, Any] | None) -> str | None:
+        """Resolve dataset by explicit path or by matching layer name in discovered datasets."""
+        if not raw:
+            return None
+
+        normalized = raw.strip().strip("\"'`")
+        path_like = any(sep in normalized for sep in ("\\", "/"))
+        has_ext = bool(Path(normalized).suffix)
+
+        if path_like:
+            if has_ext:
+                resolved = self._resolve_task_path(normalized, context)
+                if resolved:
+                    return resolved
+            else:
+                for ext in (".shp", ".gpkg", ".geojson"):
+                    resolved = self._resolve_task_path(normalized + ext, context)
+                    if resolved and Path(resolved).exists():
+                        return resolved
+
+        candidates = self._collect_context_dataset_candidates(context)
+        target = Path(normalized).stem.lower()
+        for candidate in candidates:
+            p = Path(candidate)
+            if p.stem.lower() == target:
+                return str(p)
+
+        return None
+
+    def _collect_context_dataset_candidates(self, context: dict[str, Any] | None) -> list[str]:
+        """Collect dataset paths discovered in planner context."""
+        if not isinstance(context, dict):
+            return []
+
+        collected: list[str] = []
+        seen: set[str] = set()
+
+        def _append(path: Any) -> None:
+            if isinstance(path, str) and path.strip() and path not in seen:
+                seen.add(path)
+                collected.append(path)
+
+        snapshot = context.get("context_snapshot")
+        if isinstance(snapshot, dict):
+            for key in ("output_data", "shapefiles", "geodatabases"):
+                values = snapshot.get(key)
+                if isinstance(values, list):
+                    for value in values:
+                        _append(value)
+
+        for key in ("input_files",):
+            values = context.get(key)
+            if isinstance(values, list):
+                for item in values:
+                    if isinstance(item, dict):
+                        _append(item.get("path"))
+
+        return collected
     
     def _try_match_custom_skill(
         self,
@@ -1380,6 +1717,24 @@ set_result({{"output": output_path, "feature_count": count, "merged_layers": len
                 goal=f"Recovery: execute_code fallback for {failed_step.id}",
                 steps=[fallback_step],
                 metadata={"recovery_strategy": "execute_code_fallback", "failed_step": failed_step.id}
+            )
+
+        # 策略3: 字段不存在错误 -> 先扫描获取实际字段名
+        if any(k in failed_error for k in ["classificationfield", "classification_field", "invalid field"]):
+            scan_step = PlanStep(
+                id="recovery_scan_fields_1",
+                tool="scan_layers",
+                description="恢复：扫描数据获取实际可用字段名",
+                input={"path": "./workspace/input", "include_subdirs": True},
+                depends_on=[]
+            )
+            for s in remaining_steps:
+                s.depends_on = ["recovery_scan_fields_1"] + [d for d in s.depends_on if d != "recovery_scan_fields_1"]
+            return Plan(
+                id=f"recovery_{plan.id}",
+                goal=f"Recovery: scan fields then retry {failed_step.id}",
+                steps=[scan_step, *remaining_steps],
+                metadata={"recovery_strategy": "scan_fields_then_retry", "failed_step": failed_step.id}
             )
 
         # 默认策略：跳过失败步骤继续（仅限非关键步骤）

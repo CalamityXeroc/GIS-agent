@@ -827,27 +827,153 @@ if prj is None or not os.path.exists(prj):
     raise RuntimeError("未找到 .aprx 项目文件")
 aprx = mp.ArcGISProject(prj)
 m = aprx.listMaps()[0]
+# 清除地图中已有图层（避免旧数据干扰）
+for _old_lyr in list(m.listLayers()):
+    m.removeLayer(_old_lyr)
 
 # 添加数据 + 分级设色
 layer = m.addDataFromPath(r"{input_path}")
 sym = layer.symbology
 sym.updateRenderer("GraduatedColorsRenderer")
-sym.renderer.classificationField = "{field_name}"
+# 字段名容错：大小写/下划线差异时自动匹配真实字段
+_field_name = "{field_name}".strip()
+_all_fields = [f.name for f in arcpy.ListFields(r"{input_path}")]
+if _field_name:
+    _field_norm = _field_name.lower().replace("_", "")
+    for _f in _all_fields:
+        if _f.lower() == _field_name.lower() or _f.lower().replace("_", "") == _field_norm:
+            _field_name = _f
+            break
+sym.renderer.classificationField = _field_name
 sym.renderer.breakCount = 5
 sym.renderer.classificationMethod = "NaturalBreaks"
 # 注意：ArcGIS Pro 3.6 的 GraduatedColorsRenderer 在设置 classificationField/
 # breakCount/classificationMethod 后自动计算断点，无需调用 classify()
 ramps = aprx.listColorRamps()
-if ramps:
-    _target_ramp = "{color_ramp_name}"
-    _chosen = None
-    if _target_ramp:
-        for _r in ramps:
-            if _target_ramp.lower() in _r.name.lower():
-                _chosen = _r
-                break
-    sym.renderer.colorRamp = _chosen or ramps[0]
+_target_ramp = "{color_ramp_name}".strip()
+_chosen = None
+def _infer_hue(_text: str) -> str:
+    _t = (_text or "").lower().replace(" ", "").replace("-", "").replace("_", "")
+    if any(_k in _t for _k in ("rdylgn", "redyellowgreen", "红黄绿")):
+        return "redyellowgreen"
+    if any(_k in _t for _k in ("rdbu", "redblue", "红蓝")):
+        return "redblue"
+    if any(_k in _t for _k in ("green", "ylgn", "绿")):
+        return "green"
+    if any(_k in _t for _k in ("blue", "blues", "gnbu", "pubu", "bupu", "ylgnbu", "蓝")):
+        return "blue"
+    if any(_k in _t for _k in ("red", "reds", "orrd", "ylorrd", "红")):
+        return "red"
+    if any(_k in _t for _k in ("orange", "oranges", "ylorbr", "橙")):
+        return "orange"
+    if any(_k in _t for _k in ("purple", "purples", "purd", "rdpu", "紫")):
+        return "purple"
+    if any(_k in _t for _k in ("brown", "brbg", "棕")):
+        return "brown"
+    if any(_k in _t for _k in ("grey", "gray", "greys", "灰")):
+        return "gray"
+    return ""
+
+_target_hue = _infer_hue(_target_ramp)
+if _target_ramp and ramps:
+    for _r in ramps:
+        if _target_ramp.lower() in _r.name.lower():
+            _chosen = _r
+            break
+if _chosen is None and _target_hue and ramps:
+    for _r in ramps:
+        if _infer_hue(_r.name) == _target_hue:
+            _chosen = _r
+            break
+if _chosen is None and ramps:
+    _chosen = ramps[0]
+if _chosen is not None:
+    sym.renderer.colorRamp = _chosen
+
+# 强制色相回退：当指定色相与实际匹配色带不一致时，直接写入对应分级色
+_chosen_hue = _infer_hue(_chosen.name) if _chosen is not None else ""
+_force_hue = bool(_target_hue) and (_chosen_hue != _target_hue)
+if _force_hue:
+    _palettes = {{
+        "green": [
+            {{"RGB": [232, 246, 225, 100]}},
+            {{"RGB": [189, 228, 176, 100]}},
+            {{"RGB": [142, 209, 128, 100]}},
+            {{"RGB": [86, 173, 80, 100]}},
+            {{"RGB": [35, 125, 50, 100]}},
+        ],
+        "blue": [
+            {{"RGB": [222, 235, 247, 100]}},
+            {{"RGB": [158, 202, 225, 100]}},
+            {{"RGB": [107, 174, 214, 100]}},
+            {{"RGB": [49, 130, 189, 100]}},
+            {{"RGB": [8, 81, 156, 100]}},
+        ],
+        "red": [
+            {{"RGB": [254, 224, 210, 100]}},
+            {{"RGB": [252, 146, 114, 100]}},
+            {{"RGB": [251, 106, 74, 100]}},
+            {{"RGB": [222, 45, 38, 100]}},
+            {{"RGB": [165, 15, 21, 100]}},
+        ],
+        "orange": [
+            {{"RGB": [254, 237, 222, 100]}},
+            {{"RGB": [253, 190, 133, 100]}},
+            {{"RGB": [253, 141, 60, 100]}},
+            {{"RGB": [230, 85, 13, 100]}},
+            {{"RGB": [166, 54, 3, 100]}},
+        ],
+        "purple": [
+            {{"RGB": [239, 237, 245, 100]}},
+            {{"RGB": [188, 189, 220, 100]}},
+            {{"RGB": [158, 154, 200, 100]}},
+            {{"RGB": [117, 107, 177, 100]}},
+            {{"RGB": [84, 39, 143, 100]}},
+        ],
+        "brown": [
+            {{"RGB": [245, 245, 245, 100]}},
+            {{"RGB": [216, 179, 101, 100]}},
+            {{"RGB": [191, 129, 45, 100]}},
+            {{"RGB": [140, 81, 10, 100]}},
+            {{"RGB": [84, 48, 5, 100]}},
+        ],
+        "gray": [
+            {{"RGB": [240, 240, 240, 100]}},
+            {{"RGB": [189, 189, 189, 100]}},
+            {{"RGB": [150, 150, 150, 100]}},
+            {{"RGB": [99, 99, 99, 100]}},
+            {{"RGB": [37, 37, 37, 100]}},
+        ],
+        "redblue": [
+            {{"RGB": [178, 24, 43, 100]}},
+            {{"RGB": [239, 138, 98, 100]}},
+            {{"RGB": [247, 247, 247, 100]}},
+            {{"RGB": [103, 169, 207, 100]}},
+            {{"RGB": [33, 102, 172, 100]}},
+        ],
+        "redyellowgreen": [
+            {{"RGB": [165, 0, 38, 100]}},
+            {{"RGB": [244, 109, 67, 100]}},
+            {{"RGB": [255, 255, 191, 100]}},
+            {{"RGB": [166, 217, 106, 100]}},
+            {{"RGB": [26, 150, 65, 100]}},
+        ],
+    }}
+    _palette = _palettes.get(_target_hue)
+    if _palette and hasattr(sym.renderer, "classBreaks") and sym.renderer.classBreaks:
+        for _idx, _cb in enumerate(sym.renderer.classBreaks):
+            _cb.symbol.color = _palette[min(_idx, len(_palette) - 1)]
 layer.symbology = sym
+# 启用标注
+try:
+    _lc_list = layer.listLabelClasses()
+    if _lc_list:
+        for _lc in _lc_list:
+            _lc.expression = "name"
+            _lc.visible = True
+            layer.showLabels = True
+except Exception:
+    pass
 
 # 选择样式（按关键词匹配，回退默认）
 all_legends = aprx.listStyleItems("ArcGIS 2D", "LEGEND")
@@ -872,8 +998,7 @@ mf_geom = arcpy.Polygon(arcpy.Array([
     arcpy.Point(MF_R, MF_T), arcpy.Point(MF_L, MF_T),
     arcpy.Point(MF_L, MF_B),
 ]))
-mf = layout.createMapFrame(mf_geom, m, "Main Map")
-mf.camera.setExtent(mf.getLayerExtent(layer))  # 缩放到数据范围
+# MapFrame will be created after setDefinition
 
 # 添加图廓线（CIM 方式）
 _nl_d = layout.getDefinition("V3")
@@ -889,27 +1014,38 @@ _nl_line.shape = arcpy.Polygon(arcpy.Array([
     arcpy.Point(NL_R, NL_T), arcpy.Point(NL_L, NL_T),
     arcpy.Point(NL_L, NL_B),
 ]))
-_nl_d.elements.append(_nl_line)
+_nl_el = cim.CIMGraphicElement()
+_nl_el.name = "Neatline"
+_nl_el.graphic = _nl_line
+_nl_d.elements.append(_nl_el)
 
-# 添加图名（CIM, 在图廓内顶部）
-_title_tg = cim.CIMTextGraphic()
-_title_tg.text = "{_title}"
+# 添加图名（CIMGraphicElement 包裹文本图形，确保可渲染）
+_title_pg = cim.CIMParagraphTextGraphic()
+_title_pg.text = "{_title}"
 _title_sym = cim.CIMTextSymbol()
 _title_sym.fontFamilyName = "微软雅黑"
 _title_sym.fontSize = 20
 _title_sym.bold = True
 _title_sym.horizontalAlignment = "Center"
-_title_tg.symbol = _title_sym
+_title_sym.color = cim.CIMRGBColor()
+_title_sym.color.red = 0; _title_sym.color.green = 0; _title_sym.color.blue = 0
+_title_pg.symbol = _title_sym
 _title_cy = (NL_T + MF_T) / 2  # 图廓顶部与地图框顶部之间居中
-_title_tg.shape = arcpy.Polygon(arcpy.Array([
+_title_pg.shape = arcpy.Polygon(arcpy.Array([
     arcpy.Point(NL_L + _gap, _title_cy - _title_h // 2),
     arcpy.Point(NL_R - _gap, _title_cy - _title_h // 2),
     arcpy.Point(NL_R - _gap, _title_cy + _title_h // 2),
     arcpy.Point(NL_L + _gap, _title_cy + _title_h // 2),
     arcpy.Point(NL_L + _gap, _title_cy - _title_h // 2),
 ]))
-_nl_d.elements.append(_title_tg)
+_title_el = cim.CIMGraphicElement()
+_title_el.name = "Map Title"
+_title_el.graphic = _title_pg
+_nl_d.elements.append(_title_el)
 layout.setDefinition(_nl_d)
+# 在 CIM 元素之后创建 MapFrame（避免 setDefinition 重置）
+mf = layout.createMapFrame(mf_geom, m, "Main Map")
+mf.camera.setExtent(mf.getLayerExtent(layer))
 
 # 添加图例/指北针/比例尺（全在图廓内）
 layout.createMapSurroundElement(arcpy.Point(NA_X, NA_Y), "NORTH_ARROW", mf, na_style_item)
@@ -931,7 +1067,7 @@ _out = r"{output_path}"
 _out_base, _out_ext = _osp.splitext(_out)
 if _out_ext.lower() not in (".jpg", ".jpeg"):
     _out = _out_base + ".jpg"
-layout.exportToJPEG(_out, resolution=200)
+layout.exportToJPEG(_out, resolution=250)
 # arcpy exportToJPEG 有时会追加 .jpg
 _out_candidates = [_out, _out + ".jpg", _out + ".jpeg"]
 _found = [p for p in _out_candidates if _osp.exists(p)]

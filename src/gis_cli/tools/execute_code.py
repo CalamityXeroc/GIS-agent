@@ -210,18 +210,174 @@ class ExecuteCodeTool(Tool[ExecuteCodeInput, ExecuteCodeOutput]):
     @staticmethod
     def _fix_common_api_mistakes(code: str) -> str:
         """Fix common ArcPy API mistakes in LLM-generated code before execution."""
+        import re
+
         replacements = [
             # GraduatedColorsRenderer: .field → .classificationField
             (r".renderer\.field\s*=", ".renderer.classificationField ="),
             # GraduatedColorsRenderer: .numClasses → .breakCount
             (r".renderer\.numClasses\s*=", ".renderer.breakCount ="),
-            # GraduatedColorsRenderer: .classBreakValues → no direct replacement
+            # ArcGISProject.maps → .listMaps()  (Pro 3.6 没有 .maps 属性)
+            (r"(\w+)\.maps(?=\s*\[)", r"\1.listMaps()"),
+            # Camera.setToExtent → .setExtent  (Pro 3.6 API 名称不同)
+            (r"\.setToExtent\s*\(", ".setExtent("),
+            # DescribeData.featureCount → arcpy.management.GetCount
+            (r"(\w+)\.featureCount\b", r"int(arcpy.management.GetCount(\1).getOutput(0))"),
         ]
-        import re
         fixed = code
         for pattern, replacement in replacements:
             fixed = re.sub(pattern, replacement, fixed)
+
+        # Fix doubled workspace segments in paths (e.g. "workspace\\workspace\\output")
+        fixed = re.sub(r'(workspace)[\\/]\1', r'\1', fixed, flags=re.IGNORECASE)
+
+        # Auto-fix common layout/map-frame mistakes that lead to blank maps
+        # or ArcGIS Pro API AttributeError:
+        # - Map.camera (should use MapFrame.camera)
+        # - layout.mapFrame.elementExtent (use layout.listElements("MAPFRAME_ELEMENT"))
+        map_vars = set(
+            re.findall(
+                r"^\s*([A-Za-z_]\w*)\s*=\s*.*?\.listMaps\(\)\s*\[\s*0\s*\]",
+                fixed,
+                flags=re.MULTILINE,
+            )
+        )
+        layout_vars = set(
+            re.findall(
+                r"^\s*([A-Za-z_]\w*)\s*=\s*.*?\.listLayouts\(\)\s*\[\s*0\s*\]",
+                fixed,
+                flags=re.MULTILINE,
+            )
+        )
+
+        # Replace "<camera_var> = <map_var>.camera" with MapFrame-based camera setup.
+        if map_vars and layout_vars:
+            layout_var = next(iter(layout_vars))
+            for map_var in map_vars:
+                pattern = re.compile(
+                    rf"^(?P<indent>\s*)(?P<lhs>[A-Za-z_]\w*)\s*=\s*{re.escape(map_var)}\.camera\s*$",
+                    flags=re.MULTILINE,
+                )
+
+                def _replace_map_camera(match: re.Match[str]) -> str:
+                    indent = match.group("indent")
+                    lhs = match.group("lhs")
+                    return (
+                        f'{indent}_mapframes = {layout_var}.listElements("MAPFRAME_ELEMENT")\n'
+                        f"{indent}if not _mapframes:\n"
+                        f'{indent}    raise RuntimeError("布局中未找到 MAPFRAME_ELEMENT，无法设置地图范围")\n'
+                        f"{indent}mf = _mapframes[0]\n"
+                        f"{indent}mf.map = {map_var}\n"
+                        f"{indent}{lhs} = mf.camera"
+                    )
+
+                fixed = pattern.sub(_replace_map_camera, fixed)
+
+        # Replace "camera.setExtent(layout.mapFrame.elementExtent)" pattern.
+        pattern_layout_mapframe = re.compile(
+            r"^(?P<indent>\s*)(?P<cam>[A-Za-z_]\w*)\.setExtent\(\s*(?P<layout>[A-Za-z_]\w*)\.mapFrame\.elementExtent\s*\)\s*$",
+            flags=re.MULTILINE,
+        )
+
+        def _replace_layout_mapframe_extent(match: re.Match[str]) -> str:
+            indent = match.group("indent")
+            cam = match.group("cam")
+            layout_var = match.group("layout")
+            map_var = next(iter(map_vars), "m")
+            return (
+                f'{indent}_mapframes = {layout_var}.listElements("MAPFRAME_ELEMENT")\n'
+                f"{indent}if not _mapframes:\n"
+                f'{indent}    raise RuntimeError("布局中未找到 MAPFRAME_ELEMENT，无法设置地图范围")\n'
+                f"{indent}mf = _mapframes[0]\n"
+                f"{indent}mf.map = {map_var}\n"
+                f"{indent}_target_layer = layer if 'layer' in locals() else ({map_var}.listLayers()[0] if {map_var}.listLayers() else None)\n"
+                f"{indent}if _target_layer:\n"
+                f"{indent}    {cam}.setExtent(mf.getLayerExtent(_target_layer, False, True))"
+            )
+
+        fixed = pattern_layout_mapframe.sub(_replace_layout_mapframe_extent, fixed)
+
+        # If code exports a layout but never binds map frame to the active map,
+        # inject a safe binding snippet after layout acquisition.
+        has_layout_export = bool(
+            re.search(r"\b[A-Za-z_]\w*\.exportTo(?:JPEG|PNG|PDF|TIFF)\s*\(", fixed)
+        )
+        has_create_mapframe = "createMapFrame(" in fixed
+        if has_layout_export and map_vars and layout_vars and not has_create_mapframe:
+            map_var = next(iter(map_vars))
+            layout_var = next(iter(layout_vars))
+            if not re.search(rf"\.\s*map\s*=\s*{re.escape(map_var)}\b", fixed):
+                layout_line = re.compile(
+                    rf"^(?P<indent>\s*){re.escape(layout_var)}\s*=\s*.*?\.listLayouts\(\)\s*\[\s*0\s*\]\s*$",
+                    flags=re.MULTILINE,
+                )
+
+                def _inject_binding(match: re.Match[str]) -> str:
+                    line = match.group(0)
+                    indent = match.group("indent")
+                    injection = (
+                        f'\n{indent}_mapframes = {layout_var}.listElements("MAPFRAME_ELEMENT")\n'
+                        f"{indent}if _mapframes:\n"
+                        f"{indent}    mf = _mapframes[0]\n"
+                        f"{indent}    mf.map = {map_var}\n"
+                        f"{indent}    _target_layer = layer if 'layer' in locals() else ({map_var}.listLayers()[0] if {map_var}.listLayers() else None)\n"
+                        f"{indent}    if _target_layer:\n"
+                        f"{indent}        mf.camera.setExtent(mf.getLayerExtent(_target_layer, False, True))"
+                    )
+                    return line + injection
+
+                fixed = layout_line.sub(_inject_binding, fixed, count=1)
+
         return fixed
+
+    @staticmethod
+    def _check_known_bad_patterns(code: str) -> list[str]:
+        """Check code for known ArcPy API errors before execution.
+
+        Returns a list of human-readable error descriptions.
+        Empty list = no known issues found.
+        """
+        import re
+        errors: list[str] = []
+
+        # Map.camera — Map has no .camera in Pro 3.6, use MapFrame
+        map_vars = set(
+            re.findall(
+                r"^\s*([A-Za-z_]\w*)\s*=\s*.*?\.listMaps\(\)\s*\[\s*0\s*\]",
+                code,
+                flags=re.MULTILINE,
+            )
+        )
+        for map_var in map_vars:
+            if re.search(rf"\b{re.escape(map_var)}\.camera\b", code):
+                errors.append(
+                    "Map 对象没有 .camera 属性。请通过 MapFrame 的 camera 设置范围，"
+                    "例如 mf = layout.listElements('MAPFRAME_ELEMENT')[0]；mf.map = m；mf.camera.setExtent(...)"
+                )
+                break
+
+        # layout.mapFrame does not exist in ArcGIS Pro 3.6 API
+        if re.search(r"\b[A-Za-z_]\w*\.mapFrame\b", code):
+            errors.append(
+                "布局对象没有 mapFrame 属性。请改用 layout.listElements('MAPFRAME_ELEMENT') 获取地图框。"
+            )
+
+        # arcpy.mp.MapDocument — doesn't exist in Pro 3.6
+        if 'MapDocument' in code:
+            errors.append("arcpy.mp.MapDocument 在 ArcGIS Pro 3.6 中不存在。请使用 arcpy.mp.ArcGISProject")
+
+        # DescribeData.featureCount — doesn't exist on DescribeData
+        if re.search(r'\.featureCount\b', code):
+            errors.append("DescribeData 没有 featureCount 属性，请改用 arcpy.management.GetCount(path).getOutput(0) 获取要素数量")
+
+        # classificationField = "占位符文本" — LLM 写了占位符而非实际字段名
+        placeholder_match = re.search(r'classificationField\s*=\s*"([^"]*)"', code)
+        if placeholder_match:
+            field_val = placeholder_match.group(1)
+            if '字段名' in field_val:
+                errors.append(f'分类字段名 "{field_val}" 是占位符文本，不是数据中的实际字段名。请先用 scan_layers 扫描数据确认可用字段。')
+
+        return errors
 
     def call(
         self,
@@ -263,10 +419,18 @@ class ExecuteCodeTool(Tool[ExecuteCodeInput, ExecuteCodeOutput]):
             else:
                 workspace = str(Path(workspace).parent)
         
-        # 预执行代码修复：自动修正 LLM 生成的常见错误模式
+        # 预执行代码修复+检测
         fixed_code = self._fix_common_api_mistakes(input_data.code)
-        if fixed_code != input_data.code:
-            pass  # 静默修复，不干扰用户
+
+        # 预执行代码检测：在运行前发现已知错误模式
+        check_errors = self._check_known_bad_patterns(fixed_code)
+        if check_errors:
+            return ToolResult.fail(
+                f"代码预检测发现以下已知错误，已拦截执行：\n"
+                + "\n".join(f"- {e}" for e in check_errors)
+                + "\n\n请修改代码后重试，或使用 build_graduated_colors_code() 生成正确代码。",
+                "code_precheck_failed"
+            )
 
         # 执行代码
         desc = input_data.description or "执行 ArcPy 代码"

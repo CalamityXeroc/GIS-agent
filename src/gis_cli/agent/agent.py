@@ -287,7 +287,10 @@ class GISAgent:
         # Add to memory
         self.memory.add_user_message(message)
         self._update_context_from_message(message)
-        self._extract_structured_memory_from_message(message)
+        # NOTE: structured memory extraction removed.
+        # It caused cross-session contamination: old task requirements leaked
+        # into new sessions, biasing the LLM toward outdated tasks.
+        # Conversation turns in self.memory.turns are sufficient context.
 
         # /command handling: session management and utilities
         stripped_msg = message.strip()
@@ -728,16 +731,35 @@ class GISAgent:
             "document_constraints": self.memory.get_context("document_constraints", []),
             "document_summary": self.memory.get_context("document_summary", ""),
             "arcpy_available": self.context.arcpy_available,
-            # NOTE: structured_memories and reflection_hints intentionally excluded.
-            # They contain stale task context that biases the LLM toward old tasks
-            # when the user gives a new instruction (e.g., "扫" → keeps planning
-            # the previous task instead of scanning).
+            # Only include data-related structured memories (schema, paths, constraints).
+            # Task-context memories (task_requirement, workflow_outcome, error_pattern)
+            # are excluded to prevent stale task bias.
+            "structured_memories": [
+                m.to_dict() for m in self.memory.structured_memories
+                if m.memory_type in ("projection_constraint", "data_path",
+                                     "document_requirement", "field_schema")
+            ][-10:],
         }
 
         snapshot = self.context_hub.discover()
         context.update(self.context_hub.build_planner_payload(snapshot))
         
         plan = self.planner.plan(task_description, context, expert_mode=self.config.expert_mode)
+        thematic_builder = getattr(self.planner, "_create_explicit_thematic_map_plan", None)
+        if callable(thematic_builder):
+            try:
+                forced_plan = thematic_builder(
+                    task_description=task_description,
+                    context=context,
+                    input_folder=input_folder,
+                    output_folder=str(workspace / "output"),
+                )
+                if forced_plan is not None:
+                    plan = forced_plan
+                    plan.metadata["plan_source"] = "deterministic_thematic_override"
+            except Exception:
+                pass
+
         if plan is None:
             plan = Plan(
                 id=f"plan_fallback_{int(time.time())}",
@@ -834,6 +856,11 @@ class GISAgent:
         # This prevents the error loop: if current_plan is None, we never reach resume_markers.
         if self.current_plan and not self.current_plan.is_complete:
             stripped_pending = message_lower.strip()
+            # Pending-plan guardrail:
+            # If user provides an explicit new task (path/field/output constraints),
+            # treat it as a new execution request instead of auto-confirming old plan.
+            if self._looks_like_explicit_new_task(stripped_pending):
+                return "execute_task"
             resume_markers = [
                 "继续执行", "继续", "重试", "retry", "resume", "接着执行", "继续跑",
                 "再试", "再试试", "换个方法", "换个方式", "试试别的", "继续之前", "继续上一个",
@@ -849,7 +876,10 @@ class GISAgent:
 
             # If user is urging action while plan is pending, treat as execute confirmation.
             # Example: "扫啊" / "你倒是扫啊" / "赶紧执行".
-            pending_status_markers = ["好了吗", "完成了吗", "进度", "状态", "结果", "了吗", "?", "？"]
+            # Note: if plan has already failed, pending_status markers like "?" are
+            # too broad — the user is reacting to the error, not asking for status.
+            pending_status_markers = [] if self.current_plan.has_failed else [
+                "好了吗", "完成了吗", "进度", "状态", "结果", "了吗", "?", "？"]
             action_push_markers = [
                 "扫", "扫描", "执行", "开始", "跑", "run", "做", "制图", "出图", "导出", "继续",
             ]
@@ -1024,11 +1054,12 @@ class GISAgent:
             return "general"
 
         # Greeting/introduction (should go to general, not tool_help)
-        if any(kw in message_lower for kw in [
-            "你好", "您好", "hi", "hello",
+        # Use regex word boundaries to avoid matching substrings (e.g. "hi" in "china")
+        import re
+        greeting_patterns = ["你好", "您好", r"\bhi\b", r"\bhello\b",
             "能做什么", "可以做什么", "能干什么", "可以干什么",
-            "功能", "介绍一下"
-        ]):
+            "功能", "介绍一下"]
+        if any(re.search(p, message_lower) for p in greeting_patterns):
             return "general"
         
         # Task execution keywords
@@ -1136,9 +1167,28 @@ class GISAgent:
     
     def _handle_task_execution(self, message: str) -> AgentResponse:
         """Handle task execution request.
-        
+
         Uses LLM to understand natural language and create appropriate plan.
         """
+        # If user asks to continue a previous task but has no conversation
+        # context, check if there are saved sessions to load.
+        user_turns = sum(1 for t in self.memory.turns if t.role == Role.USER)
+        is_continue_request = any(kw in message for kw in ["继续之前", "继续上一个", "恢复之前", "之前的任务"])
+        if is_continue_request and user_turns <= 1 and self.memory.store:
+            sessions = self.memory.store.list_sessions()
+            active_sessions = [s for s in sessions if s != self.config.session_id]
+            if active_sessions:
+                recent = sorted(active_sessions, reverse=True)[:3]
+                lines = [f"  /load {s}" for s in recent]
+                return AgentResponse(
+                    content=(
+                        "当前会话没有历史记录，但发现以下已保存的对话：\n"
+                        + "\n".join(lines)
+                        + "\n\n使用 /load <id> 加载对应的对话继续之前的任务。"
+                    ),
+                    action_taken="chat"
+                )
+
         planning_message, used_followup_context = self._prepare_task_for_planning(message)
 
         # GIS-first policy: always attempt GIS planning for actionable requests.
@@ -1170,7 +1220,14 @@ class GISAgent:
                 self.config.default_mode
             )
             self._record_execution_reflection(plan, result, recovery_notes)
-            
+
+            # Archive plan immediately after execution so current_plan
+            # doesn't linger and trap subsequent messages in marker checks.
+            if plan.has_failed:
+                self._archive_failed_plan(plan)
+            else:
+                self.current_plan = None
+
             if result.success:
                 delivered_outputs = self._collect_output_candidates(result)
                 if delivered_outputs:
@@ -1450,35 +1507,35 @@ class GISAgent:
         """Find the last user message that looks like a task request.
 
         Used when the user sends a confirmation word but there's no pending plan.
-        Uses broad heuristics to recover the original task context — anything
-        that is NOT a pure confirmation, greeting, or meta-question about the
-        agent is treated as a potential task.
+        Scans ALL previous user turns (newest first), skips obvious non-task
+        messages (confirmations, greetings, meta-questions), and returns the
+        first remaining message regardless of length.
+
+        No break / no len guard — adding keywords indefinitely is not a
+        solution. Any message that isn't explicitly filtered is treated as
+        a potential task; the LLM will interpret it in conversation context.
         """
-        # Messages that are clearly NOT tasks
         _meta_markers = ["你是什么", "你是谁", "你是啥", "你能做什么", "你能干什么",
-                         "你可以做什么", "你可以干什么", "你叫什么"]
+                         "你可以做什么", "你可以干什么", "你叫什么", "你叫啥"]
         _greeting_markers = ["你好", "您好", "hello", "hi"]
 
-        for turn in reversed(self.memory.turns[:-1]):  # Exclude current turn
+        for turn in reversed(self.memory.turns[:-1]):
             if turn.role != Role.USER:
                 continue
-            prev_msg = (turn.content or "").strip()
-            if not prev_msg:
+            msg = (turn.content or "").strip()
+            if not msg:
                 continue
-            # Skip affirmations ("ok", "好", "可以执行", etc.)
-            if self._looks_like_affirmative(prev_msg):
+            # Skip affirmations ("ok", "好", "可以执行", "嗯嗯", etc.)
+            if self._looks_like_affirmative(msg):
                 continue
             # Skip meta-questions about the agent itself
-            if any(m in prev_msg for m in _meta_markers):
+            if any(m in msg for m in _meta_markers):
                 continue
             # Skip greetings
-            if prev_msg.lower() in _greeting_markers:
+            if msg.lower() in _greeting_markers:
                 continue
-            # Any remaining meaningful message is a potential task
-            if len(prev_msg) > 2:
-                return prev_msg
-            # Short non-affirmative message (e.g. "嗯嗯", "扫") → skip and keep looking back
-            continue
+            # Any remaining message is a potential task — no length check, no break
+            return msg
         return None
 
     def _extract_docx_path_from_message(self, message: str) -> str | None:
@@ -1546,8 +1603,8 @@ class GISAgent:
 3. 识别需要的工具和操作顺序
 4. 用清晰简洁的语言描述任务
 
-**关键指令：忽略之前的对话历史，只关注用户当前最新的一条消息。**
-如果当前消息很短（如"扫""做""继续"），根据其本意扩展，不要参考历史对话中的旧任务。
+**重要：只根据当前用户消息生成任务描述，不要引用本轮对话中之前的历史消息。**
+如果当前消息很短（如"扫""做""继续"），根据其字面意思扩展为明确的 GIS 操作。
 
 输出要求:
 - 只返回 refined 任务描述
@@ -1704,6 +1761,12 @@ class GISAgent:
     def _handle_confirmation(self, message: str) -> AgentResponse:
         """Handle confirmation response."""
         if self.current_plan and not self.current_plan.is_complete:
+            # User may type "继续..." but actually provide a brand-new explicit task.
+            # In that case, abandon pending plan and execute the new requirement.
+            if self._looks_like_explicit_new_task(message):
+                self._archive_current_plan()
+                return self._handle_task_execution(message)
+
             if self.current_plan.has_failed and self._contains_retry_intent(message):
                 user_feedback = self._extract_user_feedback(message)
                 retry_prompt = self._build_retry_replan_prompt(
@@ -2129,47 +2192,53 @@ class GISAgent:
         merged: list[str] = []
         seen: set[str] = set()
 
-        for item in result.outputs or []:
-            if isinstance(item, str) and item.strip() and item not in seen:
-                seen.add(item)
-                merged.append(item)
-
-        if not result.trace or not result.trace.steps:
-            return merged
-
         def _append_path(path_value: Any) -> None:
             if isinstance(path_value, str) and path_value.strip() and path_value not in seen:
                 seen.add(path_value)
                 merged.append(path_value)
 
-        for step in result.trace.steps:
-            payload = step.output
-            if payload is None:
-                continue
+        if result.trace and result.trace.steps:
+            for step in result.trace.steps:
+                # scan_layers 返回的是“发现的数据”，不是“本次交付产物”
+                if getattr(step, "tool", "") == "scan_layers":
+                    continue
 
-            if isinstance(payload, dict):
-                for key in ("output_path", "output", "path", "report_path", "file_path"):
-                    _append_path(payload.get(key))
+                payload = step.output
+                if payload is None:
+                    continue
+
+                if isinstance(payload, dict):
+                    for key in ("output_path", "output", "path", "report_path", "file_path"):
+                        _append_path(payload.get(key))
+                    # 深入 execute_code 的 result 字段（set_result() 返回的数据）
+                    result_data = payload.get("result")
+                    if isinstance(result_data, dict):
+                        for val in result_data.values():
+                            if isinstance(val, str) and val.strip():
+                                _append_path(val)
+                    elif isinstance(result_data, str) and result_data.strip():
+                        _append_path(result_data)
+                    continue
+
+                for attr in ("output_path", "path", "report_path", "file_path"):
+                    _append_path(getattr(payload, attr, None))
                 # 深入 execute_code 的 result 字段（set_result() 返回的数据）
-                result_data = payload.get("result")
+                result_data = getattr(payload, "result", None)
                 if isinstance(result_data, dict):
                     for val in result_data.values():
                         if isinstance(val, str) and val.strip():
                             _append_path(val)
                 elif isinstance(result_data, str) and result_data.strip():
                     _append_path(result_data)
-                continue
 
-            for attr in ("output_path", "path", "report_path", "file_path"):
-                _append_path(getattr(payload, attr, None))
-            # 深入 execute_code 的 result 字段（set_result() 返回的数据）
-            result_data = getattr(payload, "result", None)
-            if isinstance(result_data, dict):
-                for val in result_data.values():
-                    if isinstance(val, str) and val.strip():
-                        _append_path(val)
-            elif isinstance(result_data, str) and result_data.strip():
-                _append_path(result_data)
+            # 已从非扫描步骤提取到产物时，优先返回，避免混入 scan_layers 输出
+            if merged:
+                return merged
+
+        for item in result.outputs or []:
+            if isinstance(item, str) and item.strip() and item not in seen:
+                seen.add(item)
+                merged.append(item)
 
         return merged
 
@@ -2241,6 +2310,32 @@ class GISAgent:
             "overwrite", "force overwrite"
         ]
         return any(m in lowered for m in markers)
+
+    def _looks_like_explicit_new_task(self, message: str) -> bool:
+        """Detect explicit new-task instructions that should override pending-plan confirm."""
+        import re
+
+        lowered = (message or "").lower().strip()
+        if not lowered:
+            return False
+
+        has_path = bool(
+            re.search(r"[a-z]:[\\/]", lowered)
+            or re.search(r"(?:^|\s)(?:\.{0,2}[\\/])?workspace[\\/]", lowered)
+            or ".shp" in lowered
+            or ".gpkg" in lowered
+            or ".geojson" in lowered
+        )
+
+        has_explicit_action = any(
+            token in lowered for token in [
+                "根据", "使用", "只用", "仅用", "字段", "图层",
+                "制作", "制图", "出图", "导出", "输出到", "output",
+                "覆盖率", "植被", "森林",
+            ]
+        )
+
+        return has_path and has_explicit_action
 
     def _contains_retry_intent(self, message: str) -> bool:
         lowered = message.lower().strip()
@@ -2399,11 +2494,19 @@ class GISAgent:
         for i in range(0, len(content), chunk_size):
             yield content[i:i+chunk_size]
 
+    def _rebuild_plan_steps(self, plan: Plan) -> list:
+        """Get mutable step list from plan (handles both list and tuple storage)."""
+        steps = plan.steps
+        if isinstance(steps, tuple):
+            steps = list(steps)
+        return steps
+
     def _preflight_plan(self, plan: Plan, task_description: str) -> None:
         """System-level plan governance before execution."""
         self._apply_scan_path_policy(plan)
         self._apply_target_srs_policy(plan, task_description)
         self._hydrate_plan_inputs_from_memory(plan)
+        self._apply_classification_field_policy(plan)
 
     def _apply_scan_path_policy(self, plan: Plan) -> None:
         """Normalize all scan step paths to the best available existing directory."""
@@ -2463,6 +2566,92 @@ class GISAgent:
             if step.tool == "project_layers":
                 step.input["target_srs"] = target_srs
 
+    def _apply_classification_field_policy(self, plan: Plan) -> None:
+        """Auto-fix placeholder classificationField values before execution.
+
+        LLM frequently writes classificationField = "覆盖率字段名" (placeholder)
+        instead of actual field names. This policy:
+        1. Checks for placeholder field names in execute_code steps
+        2. If found, tries to get real field names from existing scan results
+        3. If no scan results exist, calls scan_layers directly (transparent to user)
+        4. Replaces the placeholder with a real field name
+
+        The scan is automatic - no extra plan step or user confirmation needed.
+        """
+        import re
+        steps = list(plan.steps)
+        modified = False
+
+        for step in steps:
+            if step.tool != "execute_code":
+                continue
+            code = (step.input or {}).get("code", "")
+            if not code:
+                continue
+            # Check for classificationField with placeholder value
+            match = re.search(r'classificationField\s*=\s*"([^"]*字段名[^"]*)"', code)
+            if not match:
+                continue
+
+            # Try to get field names from existing scan results
+            input_files = self._collect_recent_input_files()
+            real_fields = []
+            for f in input_files:
+                if isinstance(f, dict):
+                    fields = f.get("fields", [])
+                    if isinstance(fields, list):
+                        real_fields.extend(fields)
+
+            # If no scan results yet, run scan_layers transparently
+            if not real_fields:
+                input_folder = (
+                    self.memory.get_context("input_folder")
+                    or (str(self.context.workspace / "input") if self.context.workspace else "./workspace/input")
+                )
+                try:
+                    result = self.call_tool("scan_layers", {"path": input_folder, "include_subdirs": True}, dry_run=False)
+                    if result and result.success and hasattr(result, "data") and result.data:
+                        layers = result.data.get("layers") if isinstance(result.data, dict) else getattr(result.data, "layers", [])
+                        for layer in layers:
+                            layer_fields = layer.get("fields", []) if isinstance(layer, dict) else getattr(layer, "fields", [])
+                            for f in layer_fields:
+                                fn = f.get("name", "") if isinstance(f, dict) else getattr(f, "name", "")
+                                if fn:
+                                    real_fields.append(fn)
+                except Exception:
+                    pass
+
+            if real_fields:
+                # Pick the best field: prefer numeric-looking fields
+                skip = {"fid", "shape", "objectid", "object_id", "id", "shape_length", "shape_area"}
+                chosen = None
+                for fn in real_fields:
+                    fn_lower = fn.lower().strip()
+                    if fn_lower in skip:
+                        continue
+                    # Prefer fields that match common thematic mapping indicators
+                    if any(t in fn_lower for t in ["cov", "覆盖率", "forest", "植被",
+                                                     "pct", "per", "rate", "count",
+                                                     "面积", "area", "pop", "num",
+                                                     "值", "val", "data", "index",
+                                                     "比例", "占比", "率"]):
+                        chosen = fn
+                        break
+                if not chosen:
+                    # Fallback: first non-skip field
+                    for fn in real_fields:
+                        if fn.lower().strip() not in skip:
+                            chosen = fn
+                            break
+                if chosen:
+                    old_val = match.group(1)
+                    new_code = code.replace(f'"{old_val}"', f'"{chosen}"')
+                    step.input["code"] = new_code
+                    modified = True
+
+        if modified:
+            plan.steps = steps
+
     def _extract_target_srs_from_text(self, text: str) -> str | None:
         lowered = text.lower()
         if (
@@ -2480,8 +2669,8 @@ class GISAgent:
         return None
 
     def _collect_recent_input_files(self) -> list[dict[str, str]]:
-        """Collect recent layer paths from tool history for follow-up tasks."""
-        collected: list[dict[str, str]] = []
+        """Collect recent layer paths and field info from tool history."""
+        collected: list[dict[str, str | list]] = []
 
         for item in reversed(self.memory.get_tool_results("scan_layers")):
             output = item.get("output")
@@ -2493,11 +2682,17 @@ class GISAgent:
                     if isinstance(layer, dict):
                         path = layer.get("path")
                         layer_type = layer.get("type", "Unknown")
+                        fields = layer.get("fields", [])
                     else:
                         path = getattr(layer, "path", None)
                         layer_type = getattr(layer, "type", "Unknown")
+                        fields = getattr(layer, "fields", [])
                     if isinstance(path, str) and path.strip():
-                        collected.append({"path": path, "type": str(layer_type or "Unknown")})
+                        field_names = [f.get("name", "") for f in (fields or []) if isinstance(f, dict)]
+                        entry: dict = {"path": path, "type": str(layer_type or "Unknown")}
+                        if field_names:
+                            entry["fields"] = field_names[:30]
+                        collected.append(entry)
                 if collected:
                     return collected
 
@@ -2517,6 +2712,11 @@ class GISAgent:
         current = message.strip()
         if not current:
             return message, False
+
+        # Explicit new-task inputs (path/field/output constraints) should not be
+        # merged into historical follow-up context, even if user says “继续”.
+        if self._looks_like_explicit_new_task(current):
+            return current, False
 
         if not self._is_followup_request(current):
             return current, False
@@ -2539,10 +2739,17 @@ class GISAgent:
         return merged, True
 
     def _is_followup_request(self, message: str) -> bool:
-        lowered = message.lower()
+        """Check if message is a follow-up to a previous task.
+
+        Only triggers on explicit continuation intent, not on
+        generic mentions of "继续" in other contexts.
+        """
+        lowered = message.lower().strip()
         markers = [
-            "继续", "接着", "后续", "在此基础", "根据之前", "基于之前", "按之前",
-            "继续操作", "继续处理", "继续执行", "上一步", "前面的", "follow up", "follow-up",
+            "继续之前", "继续上一个", "继续前面的", "继续这个",
+            "接着之前", "接着上一个", "接着前面的",
+            "根据之前", "基于之前", "按之前",
+            "上一步", "follow up", "follow-up",
         ]
         return any(marker in lowered for marker in markers)
 
@@ -2602,7 +2809,8 @@ class GISAgent:
         lowered = text.lower()
         markers = [
             "不要", "请勿", "不需要", "避免", "必须", "需要", "优先", "保持", "沿用", "仅", "只",
-            "不要裁剪", "不要重置", "continue with", "keep", "avoid",
+            "不要裁剪", "不要重置", "统一", "符号化", "标注", "处理",
+            "continue with", "keep", "avoid",
         ]
         return any(marker in lowered for marker in markers)
 
