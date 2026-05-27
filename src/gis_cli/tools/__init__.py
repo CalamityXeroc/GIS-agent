@@ -10,6 +10,7 @@ from .execute_code import ExecuteCodeTool
 from .read_word import ReadWordTool
 from .read_pdf import ReadPdfTool
 from .web_search import WebSearchTool
+from .thematic_map import ThematicMapTool
 
 __all__ = [
     "ScanLayersTool",
@@ -21,6 +22,7 @@ __all__ = [
     "ReadWordTool",
     "ReadPdfTool",
     "WebSearchTool",
+    "ThematicMapTool",
 ]
 
 
@@ -38,6 +40,7 @@ def register_all_tools() -> None:
         ReadWordTool(),
         ReadPdfTool(),
         WebSearchTool(),
+        ThematicMapTool(),
     ]
     
     for tool in tools:

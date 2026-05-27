@@ -160,11 +160,19 @@ SYSTEM_PROMPT_CN = """你是一个专业的 GIS（地理信息系统）智能助
 
 
 
-6. **execute_code** - 执行任意 ArcPy 代码【核心扩展工具】
+6. **thematic_map** - 创建分级设色专题图【推荐用于制图】
 
-   - 用途：执行任何 ArcPy 能做的事情，不受预定义工具限制
+   - 用途：直接生成带图名、图例、指北针、比例尺的完整专题图
+   - 优势：内部使用已验证的代码，比手写 ArcPy 更可靠，避免 API 错误
+   - 参数：input_path, field_name, output_path, title(可选), color_ramp(可选)
+   - 示例："制作植被覆盖率专题图，使用 forest_cov 字段，绿色色带"
 
-   - 能力：缓冲区分析、叠加分析、裁剪、网络分析、栅格处理、地统计、符号化等
+7. **execute_code** - 执行任意 ArcPy 代码【核心扩展工具】
+
+   - 用途：处理 thematic_map 无法覆盖的自定义 GIS 操作
+   - ⚠️ 制图任务请优先使用 thematic_map
+
+   - 能力：缓冲区分析、叠加分析、裁剪、网络分析、栅格处理、地统计等
 
    - 筛选合并：当需要按名称筛选图层并合并时，使用此工具生成代码
 
@@ -574,9 +582,11 @@ SYSTEM_PROMPT_EXPERT_CN = """你是一个专业的 GIS（地理信息系统）�
 
 
 
-4. **可用工具**: 与标准模式相同（scan_layers, merge_layers, project_layers, export_map, quality_check, execute_code, web_search）
+4. **可用工具**: scan_layers, merge_layers, project_layers, export_map, quality_check, **thematic_map**（专题图）, execute_code, web_search
 
-   - execute_code 是实现复杂 GIS 逻辑的核心工具
+   - **thematic_map 是制图首选工具**：制作分级设色专题图时优先使用，它封装了已验证的 ArcPy 代码，比 execute_code 更可靠
+
+   - execute_code 用于 thematic_map 无法覆盖的自定义操作
 
    - 对于需要自定义 ArcPy 代码的操作，使用 execute_code
 
@@ -902,7 +912,8 @@ PLANNING_PROMPT_EXPERT = """你需要为以下 GIS 任务制定完整的执行�
 
 3. **空间连接**：对于"统计某区域内的数量"类需求，使用 SpatialJoin 实现。
 
-4. **优先使用 execute_code**：对于需要自定义 ArcPy 代码的操作，使用 execute_code 工具。
+4. **制图优先 thematic_map**：制作专题图时必须使用 thematic_map 工具（封装了已验证 ArcPy 代码，比 execute_code 可靠）。
+5. **execute_code 用于特殊需求**：仅当 thematic_map 不适用时才使用 execute_code。
 
 5. **地图导出**：最终使用 export_map 或 execute_code+ArcPy 导出完成的地图。
 

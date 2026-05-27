@@ -696,6 +696,17 @@ class GISAgent:
                     result_data = getattr(payload, "result", None)
                 if result_data:  # set_result() 返回了非空数据
                     return False
+        # 检查输出文件大小：JPG/PNG 小于 50KB 很可能是空白图
+        for out_path in delivered_outputs:
+            try:
+                _p = Path(out_path)
+                if _p.suffix.lower() in ('.jpg', '.jpeg', '.png') and _p.exists():
+                    _sz = _p.stat().st_size
+                    if _sz < 50000:
+                        return True  # 太小，很可能是空白图
+            except Exception:
+                pass
+
         # If workflow includes deliverable tools but outputs are empty, treat as false success.
         deliverable_tools = {"merge_layers", "project_layers", "export_map", "execute_code"}
         return any(t in deliverable_tools for t in executed_tools)
@@ -2364,10 +2375,18 @@ class GISAgent:
             ts = trace_steps.get(step.id)
             err_text = ts.error if ts and ts.error else (step.error or "未知错误")
             code_text = ""
-            if step.tool == "execute_code":
+            stdout_text = ""
+            if step.tool in ("execute_code", "thematic_map"):
                 code = (step.input or {}).get("code", "") or (ts.input or {}).get("code", "") if ts else ""
                 if code:
-                    code_text = f"\n失败代码：\n```python\n{code.strip()[-800:]}\n```"
+                    code_text = f"\n失败代码（完整）：\n```python\n{code.strip()}\n```"
+                # Include execution stdout for diagnostics
+                if ts and ts.output:
+                    out_str = str(ts.output)
+                    if hasattr(ts.output, 'stdout'):
+                        out_str = ts.output.stdout or ""
+                    if out_str.strip():
+                        stdout_text = f"\n执行输出（stdout）：\n{out_str.strip()[-1000:]}"
 
             # Classify error type and add fix hint
             err_lower = err_text.lower()
@@ -2383,6 +2402,7 @@ class GISAgent:
 
             error_sections.append(
                 f"步骤 {step.id}（{step.tool}）错误：\n{err_text}"
+                f"{stdout_text}"
                 f"{code_text}"
                 f"{hint}"
             )
