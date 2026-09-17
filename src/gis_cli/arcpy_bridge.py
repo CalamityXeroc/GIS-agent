@@ -811,21 +811,54 @@ SB_B = NL_B + _gap
 SB_L = SB_R - _sb_w
 SB_T = SB_B + _sb_h
 
-# 自动查找 aprx（从数据文件所在目录向上搜索）
+# 自动查找 aprx（从数据文件所在目录向上浅层搜索，避免误拿无关/陈旧工程）
 import glob
+import shutil as _shutil
 _input_dir = os.path.dirname(r"{input_path}")
-_search_roots = [_input_dir]
+_search_roots = []
 _p = _input_dir
-for _ in range(5):  # 向上搜5层
-    _p = os.path.dirname(_p)
+for _ in range(4):  # 向上搜 4 层
     _search_roots.append(_p)
+    _p = os.path.dirname(_p)
 _aprx_files = []
 for _r in _search_roots:
-    _aprx_files.extend(glob.glob(os.path.join(_r, "**", "*.aprx"), recursive=True))
+    _aprx_files.extend(glob.glob(os.path.join(_r, "*.aprx")))
+    _aprx_files.extend(glob.glob(os.path.join(_r, "*", "*.aprx")))
+_aprx_files = [p for p in _aprx_files if os.path.exists(p)]
+
+aprx = None
 prj = _aprx_files[0] if _aprx_files else None
-if prj is None or not os.path.exists(prj):
-    raise RuntimeError("未找到 .aprx 项目文件")
-aprx = mp.ArcGISProject(prj)
+if prj is not None:
+    try:
+        aprx = mp.ArcGISProject(prj)
+    except Exception as _exc:
+        print(f"现有工程无法打开({{_exc}})，改用空白模板")
+        aprx = None
+
+if aprx is None:
+    # 没有可用工程：复制 ArcGIS 自带空白模板，从零建工程
+    _install = ""
+    try:
+        _install = arcpy.GetInstallInfo().get("InstallDir", "") or ""
+    except Exception:
+        _install = ""
+    _tmpl = None
+    if _install:
+        _cand = os.path.join(_install, "Resources", "ArcToolBox", "Services",
+                            "routingservices", "data", "Blank.aprx")
+        if os.path.exists(_cand):
+            _tmpl = _cand
+        else:
+            _found = glob.glob(os.path.join(_install, "Resources", "**", "Blank.aprx"), recursive=True)
+            _tmpl = _found[0] if _found else None
+    if _tmpl is None:
+        raise RuntimeError("未找到 .aprx 项目文件，且未找到 ArcGIS 空白模板 Blank.aprx")
+    _out_dir = os.path.dirname(r"{output_path}") or "."
+    os.makedirs(_out_dir, exist_ok=True)
+    prj = os.path.join(_out_dir, "map_project.aprx")
+    _shutil.copy2(_tmpl, prj)
+    print(f"使用空白模板创建工程: {{prj}}")
+    aprx = mp.ArcGISProject(prj)
 m = aprx.listMaps()[0]
 # 清除地图中已有图层（避免旧数据干扰）
 for _old_lyr in list(m.listLayers()):
