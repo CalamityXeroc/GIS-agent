@@ -1,0 +1,201 @@
+id: census_city_indicators
+name: 普查指标汇总到地市（占比按人口加权）
+description: 把 population_census 的三项指标（老年人占比、育龄女性占比、男女性别比）按区县人口加权计算人数，汇总到地级市后还原为市级指标，输出含 OLD_PCT/FERT_PCT/SEX_RATIO 的地市面。
+domain: spatial_statistics
+triggers: [性别比, 育龄, 老年人占比, 普查, census, 指标汇总, 人口加权, 市尺度指标]
+preconditions:
+  - county 面已挂接逐年人口（含 Y2020）
+  - 普查 CSV 含 code（区县代码）与三项指标列
+  - city 面已投影且与 county 坐标系一致
+params:
+  county_path:
+    type: string
+    required: true
+    description: 已挂接人口与区县代码的 county 面（投影坐标系）
+  census_csv:
+    type: string
+    required: true
+    description: population_census.csv 路径
+  city_path:
+    type: string
+    required: true
+    description: 地市面（分区，投影坐标系）
+  output_path:
+    type: string
+    required: true
+    description: 输出地市面（含 OLD_PCT/FERT_PCT/SEX_RATIO/SUM_Y2020）
+  pop_field:
+    type: string
+    default: "Y2020"
+    description: 区县人口字段（用于加权）
+  age_field:
+    type: string
+    default: "F65岁及以上人口比重_百分比_"
+    description: 老年人占比列（百分比）
+  fert_field:
+    type: string
+    default: "F15_49岁育龄妇女比重_百分比_"
+    description: 育龄女性占比列（百分比）
+  sexratio_field:
+    type: string
+    default: "男女性别比"
+    description: 男女性别比列
+steps:
+  - CSV 转 GDB 表，按 code 建立查表字典
+  - 区县层面计算三项“人数”（占比/100 × 人口；性别比 × 人口）
+  - 按中心点把区县归属到地市并 SUM 汇总
+  - 市级层面还原占比（SUM_人数 / SUM_人口 × 100）与性别比
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  county_path = {{county_path}}
+  census_csv = {{census_csv}}
+  city_path = {{city_path}}
+  output_path = {{output_path}}
+  pop_field = {{pop_field}}
+  age_field = {{age_field}}
+  fert_field = {{fert_field}}
+  sexratio_field = {{sexratio_field}}
+
+  for p in (county_path, census_csv, city_path):
+      if not arcpy.Exists(p):
+          raise ValueError(f"输入不存在: {p}")
+  gdb = os.path.dirname(output_path)
+  if not gdb.lower().endswith(".gdb"):
+      raise ValueError(f"output_path 必须放在文件地理数据库中: {output_path}")
+  gdb_folder = os.path.dirname(gdb)
+  if gdb_folder and not os.path.isdir(gdb_folder):
+      os.makedirs(gdb_folder, exist_ok=True)
+  if not arcpy.Exists(gdb):
+      arcpy.management.CreateFileGDB(gdb_folder, os.path.basename(gdb)[:-4])
+
+  # 1) CSV -> GDB 表，建立 code -> (age, fert, sexr) 字典
+  census_tbl = os.path.join(gdb, "census_tbl_tmp")
+  if arcpy.Exists(census_tbl):
+      arcpy.management.Delete(census_tbl)
+  arcpy.conversion.TableToTable(census_csv, gdb, "census_tbl_tmp")
+  cfields = {f.name for f in arcpy.ListFields(census_tbl)}
+  for need in (age_field, fert_field, sexratio_field):
+      if need not in cfields:
+          raise ValueError(f"普查表缺少字段 {need}；实际字段: {sorted(cfields)}")
+  census = {}
+  with arcpy.da.SearchCursor(census_tbl, ["code", age_field, fert_field, sexratio_field]) as cur:
+      for code, age, fert, sexr in cur:
+          if code is None:
+              continue
+          try:
+              key = str(int(float(code)))
+          except (TypeError, ValueError):
+              key = str(code).strip()
+          census[key] = (age, fert, sexr)
+
+  # 2) 区县层面：计算三项人数
+  tmp_county = "in_memory/_ci_county"
+  if arcpy.Exists(tmp_county):
+      arcpy.management.Delete(tmp_county)
+  arcpy.management.CopyFeatures(county_path, tmp_county)
+  if pop_field not in {f.name for f in arcpy.ListFields(tmp_county)}:
+      raise ValueError(f"county 缺少人口字段 {pop_field}")
+  for fname in ("OLD_N", "FERT_N", "SEXR_N"):
+      if fname not in {f.name for f in arcpy.ListFields(tmp_county)}:
+          arcpy.management.AddField(tmp_county, fname, "DOUBLE")
+  matched = 0
+  with arcpy.da.UpdateCursor(tmp_county, ["code", pop_field, "OLD_N", "FERT_N", "SEXR_N"]) as cur:
+      for row in cur:
+          code = row[0]
+          pop = row[1]
+          try:
+              key = str(int(float(code)))
+          except (TypeError, ValueError):
+              key = str(code).strip() if code is not None else ""
+          item = census.get(key)
+          if item and pop:
+              age, fert, sexr = item
+              row[2] = float(pop) * (float(age) if age is not None else 0.0) / 100.0
+              row[3] = float(pop) * (float(fert) if fert is not None else 0.0) / 100.0
+              row[4] = float(pop) * (float(sexr) if sexr is not None else 0.0)
+              matched += 1
+          cur.updateRow(row)
+  if matched == 0:
+      raise ValueError("没有任何区县匹配上普查表 code，请检查 code 类型/编码")
+
+  # 3) 按中心点归属到地市并汇总
+  tmp_zone = "in_memory/_ci_zone"
+  tmp_src = "in_memory/_ci_src"
+  tmp_stats = "in_memory/_ci_stats"
+  for p in (tmp_zone, tmp_src, tmp_stats):
+      if arcpy.Exists(p):
+          arcpy.management.Delete(p)
+  arcpy.management.CopyFeatures(city_path, tmp_zone)
+  arcpy.management.AddField(tmp_zone, "ZONE_KEY", "TEXT", field_length=255)
+  arcpy.management.CalculateField(tmp_zone, "ZONE_KEY", "!name!", "PYTHON3")
+  arcpy.analysis.SpatialJoin(
+      target_features=tmp_county,
+      join_features=tmp_zone,
+      out_feature_class=tmp_src,
+      join_operation="JOIN_ONE_TO_ONE",
+      join_type="KEEP_ALL",
+      match_option="HAVE_THEIR_CENTER_IN",
+  )
+  sums = [pop_field, "OLD_N", "FERT_N", "SEXR_N"]
+  arcpy.analysis.Statistics(tmp_src, tmp_stats, [[f, "SUM"] for f in sums] + [[pop_field, "COUNT"]], "ZONE_KEY")
+
+  # 4) 回写地市并还原市级指标
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.management.CopyFeatures(city_path, output_path)
+  join_fields = [f"SUM_{f}" for f in sums] + [f"COUNT_{pop_field}"]
+  arcpy.management.JoinField(output_path, "name", tmp_stats, "ZONE_KEY", join_fields)
+
+  add_map = {
+      "SRC_COUNT": f"!COUNT_{pop_field}!",
+      "OLD_PCT": f"!SUM_OLD_N! / !SUM_{pop_field}! * 100",
+      "FERT_PCT": f"!SUM_FERT_N! / !SUM_{pop_field}! * 100",
+      "SEX_RATIO": f"!SUM_SEXR_N! / !SUM_{pop_field}!",
+  }
+  existing = {f.name for f in arcpy.ListFields(output_path)}
+  for fname, expr in add_map.items():
+      if fname in existing:
+          arcpy.management.DeleteField(output_path, fname)
+      arcpy.management.AddField(output_path, fname, "DOUBLE")
+      arcpy.management.CalculateField(output_path, fname, expr, "PYTHON3")
+  if f"COUNT_{pop_field}" in {f.name for f in arcpy.ListFields(output_path)}:
+      arcpy.management.DeleteField(output_path, f"COUNT_{pop_field}")
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  sample = []
+  with arcpy.da.SearchCursor(output_path, ["name", "OLD_PCT", "FERT_PCT", "SEX_RATIO", "SUM_" + pop_field]) as cur:
+      for i, row in enumerate(cur):
+          if i >= 5:
+              break
+          sample.append({"name": row[0], "OLD_PCT": row[1], "FERT_PCT": row[2], "SEX_RATIO": row[3], "POP": row[4]})
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "matched_counties": matched,
+      "fields_added": ["OLD_PCT", "FERT_PCT", "SEX_RATIO", "SRC_COUNT"],
+      "sample_cities": sample,
+  })
+  print(f"Census city indicators done: {count} cities, matched={matched}; sample={sample[:2]}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["OLD_PCT", "FERT_PCT", "SEX_RATIO"]
+  - type: field_sum_gt
+    path: "{{output_path}}"
+    field: "SRC_COUNT"
+    value: 0
+pitfalls:
+  - 普查表 code 与 county 的 code 类型可能不同（整数/文本），必须先统一为字符串再匹配。
+  - 占比列是百分数（如 10.1 表示 10.1%），计算人数要先除以 100；最后市级还原占比要乘回 100。
+  - 地市归属必须用 HAVE_THEIR_CENTER_IN（区县边界与地市边界不一致）。
+  - 汇总后立刻删除中间字段避免列名冲突。
+examples:
+  - "把普查表的老年占比、育龄女性占比、性别比汇总到地市尺度"
+  - "计算每个市的 2020 年人口普查三项指标"

@@ -1,0 +1,131 @@
+id: attribute_join_table
+name: 属性表挂接（JoinField）
+description: 把外部表（CSV/DBF/GDB表）按关键字段挂接到要素类上，使表字段成为要素属性的一部分。支持先导入 CSV 再挂接。
+domain: data_management
+triggers: [挂接, 关联, join, joinfield, 属性连接, 连接表, 把表挂到, 人口数据挂接]
+preconditions:
+  - 两侧关键字段类型一致（文本对文本、数值对数值）
+  - 已通过 catalog_query 确认两侧字段名
+params:
+  target_path:
+    type: string
+    required: true
+    description: 被挂接的要素类（如 county）
+  target_key:
+    type: string
+    required: true
+    description: 要素类上的关键字段（如 code）
+  join_table:
+    type: string
+    required: true
+    description: 外部表路径（CSV 需先导入 GDB，见 temp_table 参数）
+  join_key:
+    type: string
+    required: true
+    description: 表上的关键字段
+  join_fields:
+    type: string
+    default: ""
+    description: 要挂接的字段列表，逗号分隔；空则挂接全部（OID/几何除外）
+  output_path:
+    type: string
+    required: true
+    description: 挂接结果输出路径（workspace/output 下）
+  csv_import_name:
+    type: string
+    default: ""
+    description: 若 join_table 是 CSV，导入 GDB 后的表名（如 population）
+  workspace_gdb:
+    type: string
+    default: ""
+    description: CSV 导入目标 GDB（csv_import_name 非空时必填）
+steps:
+  - 若为 CSV：TableToTable 导入 GDB 得到表
+  - 校验关键字段两侧都存在
+  - CopyFeatures 复制目标要素（保留属性）
+  - JoinField 挂接
+  - 返回结果要素数与新增字段
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  target_path = {{target_path}}
+  target_key = {{target_key}}
+  join_table = {{join_table}}
+  join_key = {{join_key}}
+  join_fields = {{join_fields}}
+  output_path = {{output_path}}
+  csv_import_name = {{csv_import_name}}
+  workspace_gdb = {{workspace_gdb}}
+
+  if not arcpy.Exists(target_path):
+      raise ValueError(f"目标要素不存在: {target_path}")
+
+  # CSV 需先导入 GDB（CSV 无法直接作为 JoinField 输入）
+  if str(csv_import_name).strip():
+      if not str(workspace_gdb).strip():
+          raise ValueError("csv_import_name 需要同时提供 workspace_gdb")
+      if not arcpy.Exists(workspace_gdb):
+          arcpy.management.CreateFileGDB(os.path.dirname(workspace_gdb), os.path.basename(workspace_gdb)[:-4])
+      imported = os.path.join(workspace_gdb, csv_import_name)
+      if not arcpy.Exists(imported):
+          arcpy.conversion.TableToTable(join_table, workspace_gdb, csv_import_name)
+      join_table = imported
+
+  if not arcpy.Exists(join_table):
+      raise ValueError(f"挂接表不存在: {join_table}")
+
+  def _has_field(container, name):
+      return name in [f.name for f in arcpy.ListFields(container)]
+
+  if not _has_field(target_path, target_key):
+      raise ValueError(f"目标要素缺少关键字段 {target_key}；现有: {[f.name for f in arcpy.ListFields(target_path)]}")
+  if not _has_field(join_table, join_key):
+      raise ValueError(f"挂接表缺少关键字段 {join_key}；现有: {[f.name for f in arcpy.ListFields(join_table)]}")
+
+  out_parent = os.path.dirname(output_path)
+  # 注意：不要用 makedirs 造出假 .gdb 目录，必须用 CreateFileGDB
+  if str(out_parent).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_parent):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_parent), os.path.basename(out_parent)[:-4])
+  elif out_parent and not os.path.isdir(out_parent):
+      os.makedirs(out_parent, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.management.CopyFeatures(target_path, output_path)
+
+  before = {f.name for f in arcpy.ListFields(output_path)}
+  arcpy.management.JoinField(
+      in_data=output_path,
+      in_field=target_key,
+      join_table=join_table,
+      join_field=join_key,
+      fields=[f.strip() for f in str(join_fields).split(",") if f.strip()] or None,
+  )
+  added = [f.name for f in arcpy.ListFields(output_path) if f.name not in before]
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  matched = 0
+  with arcpy.da.SearchCursor(output_path, [target_key]) as cur:
+      for row in cur:
+          if row[0] is not None:
+              matched += 1
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "added_fields": added,
+      "key_match_count": matched,
+  })
+  print(f"JoinField done: {count} features, added fields: {added}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - CSV 直接 JoinField 会失败，必须先 TableToTable 导入 GDB。
+  - 关键字段类型不一致（文本/数值）会静默匹配 0 行；先检查类型并统一。
+  - 表里有多个匹配行时 JoinField 只取第一条；需先汇总。
+examples:
+  - "把 population.csv 按 code 挂接到 county"

@@ -1,0 +1,155 @@
+id: aggregate_to_zones
+name: 聚合到分区（空间归属+汇总+字段回写）
+description: 把源要素（区县面/点）按空间位置归属到分区面（如地级市），对指定数值字段做 SUM/MEAN 汇总并回写到分区面属性表中。用于“把区县人口汇总到地市，并添加至 city 面要素”。
+domain: spatial_analysis
+triggers: [汇总到市, 聚合到, 汇总统计, 地级市总人口, 分区汇总, 归属到, 统计得到每个]
+preconditions:
+  - 源要素与分区面坐标系一致（否则先投影）
+  - 汇总字段为数值型
+params:
+  zones_path:
+    type: string
+    required: true
+    description: 分区面要素（如 city，需投影坐标系）
+  source_path:
+    type: string
+    required: true
+    description: 源要素（如 county_pop 区县面）
+  output_path:
+    type: string
+    required: true
+    description: 输出分区面要素类（含 SUM_字段 与 SRC_COUNT）
+  stat_fields:
+    type: string
+    required: true
+    description: 逗号分隔的数值字段列表，如 "Y2011,Y2012,Y2020"
+  stat_type:
+    type: string
+    default: "SUM"
+    description: 统计类型，SUM/MEAN/MAX/MIN 等
+  match_option:
+    type: string
+    default: "HAVE_THEIR_CENTER_IN"
+    description: 空间关系，默认按源要素中心点归属（区县与地市边界不一致时必须用这个）
+steps:
+  - 校验存在/坐标系/字段
+  - 在分区副本上生成唯一标识 ZONE_KEY
+  - 源要素空间连接分区得到归属
+  - Statistics 按分区汇总
+  - JoinField 回写汇总字段到分区面 + 计算 SRC_COUNT
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  zones_path = {{zones_path}}
+  source_path = {{source_path}}
+  output_path = {{output_path}}
+  stat_fields = {{stat_fields}}
+  stat_type = {{stat_type}}
+  match_option = {{match_option}}
+
+  if not arcpy.Exists(zones_path):
+      raise ValueError(f"分区数据不存在: {zones_path}")
+  if not arcpy.Exists(source_path):
+      raise ValueError(f"源数据不存在: {source_path}")
+  zsr = arcpy.Describe(zones_path).spatialReference.name
+  ssr = arcpy.Describe(source_path).spatialReference.name
+  if zsr != ssr:
+      raise ValueError(f"坐标系不一致（{zsr} vs {ssr}），请先统一投影到投影坐标系")
+
+  stat_list = [f.strip() for f in str(stat_fields).split(",") if f.strip()]
+  if not stat_list:
+      raise ValueError("stat_fields 不能为空")
+  src_fields = {f.name for f in arcpy.ListFields(source_path)}
+  missing = [f for f in stat_list if f not in src_fields]
+  if missing:
+      raise ValueError(f"源数据缺少字段: {missing}；可用: {sorted(src_fields)}")
+
+  zones_fields = list(arcpy.ListFields(zones_path))
+  zone_key = None
+  for f in zones_fields:
+      if f.type == "String" and f.name.lower() == "name":
+          zone_key = f.name
+          break
+  if zone_key is None:
+      for f in zones_fields:
+          if f.type == "String":
+              zone_key = f.name
+              break
+  if zone_key is None:
+      raise ValueError("分区数据缺少字符串标识字段（如 name）")
+
+  tmp_zone = "in_memory/_az_zone"
+  tmp_src = "in_memory/_az_src"
+  tmp_stats = "in_memory/_az_stats"
+  for p in (tmp_zone, tmp_src, tmp_stats):
+      if arcpy.Exists(p):
+          arcpy.management.Delete(p)
+
+  arcpy.management.CopyFeatures(zones_path, tmp_zone)
+  arcpy.management.AddField(tmp_zone, "ZONE_KEY", "TEXT", field_length=255)
+  arcpy.management.CalculateField(tmp_zone, "ZONE_KEY", f"!{zone_key}!", "PYTHON3")
+
+  arcpy.analysis.SpatialJoin(
+      target_features=source_path,
+      join_features=tmp_zone,
+      out_feature_class=tmp_src,
+      join_operation="JOIN_ONE_TO_ONE",
+      join_type="KEEP_ALL",
+      match_option=match_option,
+  )
+
+  stat_spec = [[f, stat_type] for f in stat_list]
+  stat_spec.append([stat_list[0], "COUNT"])
+  arcpy.analysis.Statistics(tmp_src, tmp_stats, stat_spec, "ZONE_KEY")
+
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.management.CopyFeatures(zones_path, output_path)
+
+  join_fields = [f"{stat_type}_{f}" for f in stat_list]
+  count_field = f"COUNT_{stat_list[0]}"
+  arcpy.management.JoinField(output_path, zone_key, tmp_stats, "ZONE_KEY", join_fields + [count_field])
+
+  arcpy.management.AddField(output_path, "SRC_COUNT", "LONG")
+  arcpy.management.CalculateField(output_path, "SRC_COUNT", f"!{count_field}!", "PYTHON3")
+  if count_field in [f.name for f in arcpy.ListFields(output_path)]:
+      arcpy.management.DeleteField(output_path, count_field)
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  sample = []
+  with arcpy.da.SearchCursor(output_path, [zone_key] + join_fields + ["SRC_COUNT"]) as cur:
+      for i, row in enumerate(cur):
+          if i >= 5:
+              break
+          sample.append({str(zone_key): row[0], str(join_fields[0]): row[1], "SRC_COUNT": row[-1]})
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "zone_key": zone_key,
+      "stat_fields": {stat_type: join_fields},
+      "sample_zones": sample,
+  })
+  print(f"Aggregate done: {count} zones, fields={join_fields}, sample={sample[:2]}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["SRC_COUNT"]
+  - type: field_sum_gt
+    path: "{{output_path}}"
+    field: "SRC_COUNT"
+    value: 0
+pitfalls:
+  - 不要用 SpatialJoin 的 field_mapping 简写（如 "Y2011 SUM"）：字段会建出来但值全为 0，必须走 Statistics+JoinField。
+  - 区县边界与地市边界常不一致（源面伸出所属市面），match_option 必须用 HAVE_THEIR_CENTER_IN 按中心点归属；
+    用 INTERSECT 会把区县随机归给相邻地市（曾导致郑州 25 个区县这种错误）。
+  - 分区面与源面坐标系必须一致，否则先投影。
+  - 输出分区数与输入分区数一致；没有源要素落入的分区汇总值为空。
+examples:
+  - "把区县人口按地市汇总，得到每个地级市的历年总人口并添加到 city 面要素"
+  - "统计每个地市包含的区县数量"

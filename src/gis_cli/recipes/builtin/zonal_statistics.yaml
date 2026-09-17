@@ -1,0 +1,77 @@
+id: zonal_statistics
+name: 分区统计（栅格×区划）
+description: 用区划面统计栅格值（如人口栅格按行政区/社区汇总），输出统计表或连接回面要素。
+domain: spatial_analysis
+triggers: [分区统计, zonal, 栅格统计, 汇总人口, 栅格按面统计, 提取值]
+preconditions:
+  - 分区面与栅格坐标系一致（否则先投影）
+params:
+  zone_path:
+    type: string
+    required: true
+    description: 分区面要素路径
+  raster_path:
+    type: string
+    required: true
+    description: 数值栅格路径
+  output_table:
+    type: string
+    required: true
+    description: 输出表路径（.dbf 或 .gdb/表名）
+  zone_field:
+    type: string
+    default: ""
+    description: 分区字段，空则用 OBJECTID
+  statistics:
+    type: string
+    default: "SUM"
+    description: 统计类型，如 SUM/MEAN/MAXIMUM
+steps:
+  - 检查坐标系一致性
+  - ZonalStatisticsAsTable
+  - 返回统计记录数
+code_template: |
+  import arcpy
+  arcpy.env.overwriteOutput = True
+
+  zone_path = {{zone_path}}
+  raster_path = {{raster_path}}
+  output_table = {{output_table}}
+  zone_field = {{zone_field}}
+  statistics = {{statistics}}
+
+  if not arcpy.Exists(zone_path) or not arcpy.Exists(raster_path):
+      raise ValueError("分区或栅格数据不存在")
+
+  zone_sr = arcpy.Describe(zone_path).spatialReference
+  raster_sr = arcpy.Describe(raster_path).spatialReference
+  if zone_sr.name != raster_sr.name:
+      raise ValueError(f"坐标系不一致: zone={zone_sr.name}, raster={raster_sr.name}，请先投影")
+
+  if arcpy.Exists(output_table):
+      arcpy.management.Delete(output_table)
+
+  zone = zone_field if zone_field else "OBJECTID"
+  arcpy.sa.ZonalStatisticsAsTable(
+      in_zone_data=zone_path,
+      zone_field=zone,
+      in_value_raster=raster_path,
+      out_table=output_table,
+      statistics_type=statistics,
+  )
+
+  count = int(arcpy.management.GetCount(output_table)[0])
+  set_result({"output": output_table, "record_count": count, "statistics": statistics, "zone_field": zone})
+  print(f"Zonal statistics done: {count} records")
+validation:
+  - type: file_exists
+    path: "{{output_table}}"
+  - type: feature_count_gt
+    path: "{{output_table}}"
+    value: 0
+pitfalls:
+  - 分区字段建议用唯一 ID；用名称可能因重名合并。
+  - 栅格有 NoData 时统计结果会受影响。
+examples:
+  - "统计每个行政区的人口栅格总和"
+  - "按社区汇总建筑物尺度人口"

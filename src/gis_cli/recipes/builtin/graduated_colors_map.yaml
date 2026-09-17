@@ -1,0 +1,78 @@
+id: graduated_colors_map
+name: 分级设色专题图（含四要素）
+description: 使用已验证的布局代码生成分级设色专题图，自动包含图名、图例、比例尺、指北针，导出 JPG。
+domain: cartography
+triggers: [专题图, 制图, 分级设色, choropleth, 地图, 图例, 指北针, 比例尺]
+preconditions:
+  - 已通过 catalog_query 确认分级字段名存在且为数值型
+  - 输入为面要素
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入面要素路径
+  field_name:
+    type: string
+    required: true
+    description: 分级字段名（必须是数据中真实存在的数值字段）
+  output_path:
+    type: string
+    required: true
+    description: 输出 JPG 路径
+  title:
+    type: string
+    default: ""
+    description: 地图标题，空则自动生成
+  color_ramp_name:
+    type: string
+    default: ""
+    description: 色带名（如 Greens、YlOrRd、Reds），空则自动
+  page_width:
+    type: integer
+    default: 297
+    description: 页面宽 mm
+  page_height:
+    type: integer
+    default: 420
+    description: 页面高 mm
+steps:
+  - 调用 build_graduated_colors_code 生成完整布局代码
+  - 执行并导出 JPG
+  - 检查图片非空白
+code_template: |
+  import arcpy
+  from gis_cli.arcpy_bridge import build_graduated_colors_code
+
+  input_path = {{input_path}}
+  field_name = {{field_name}}
+  output_path = {{output_path}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+
+  fields = [f.name for f in arcpy.ListFields(input_path)]
+  if field_name not in fields:
+      raise ValueError(f"字段不存在: {field_name}；可用字段: {fields}")
+
+  code = build_graduated_colors_code(
+      input_path=input_path,
+      field_name=field_name,
+      output_path=output_path,
+      title={{title}},
+      color_ramp_name={{color_ramp_name}},
+      page_width={{page_width}},
+      page_height={{page_height}},
+  )
+  exec(compile(code, "<graduated_colors_map>", "exec"), globals(), globals())
+validation:
+  - type: file_exists
+    path: "{{output_path}}"
+  - type: image_not_blank
+    path: "{{output_path}}"
+pitfalls:
+  - 字段名必须是数据中的真实字段，不能写占位符。
+  - 地图框必须绑定数据图层，否则导出空白图。
+  - 导出前确认 aprx/布局存在；无工程时先创建。
+examples:
+  - "用 forest_cov 字段做绿色分级设色专题图"
+  - "制作老年人口占比专题图，标题为‘某市老年人口占比’"

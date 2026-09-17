@@ -1,0 +1,92 @@
+id: local_morans_i
+name: 局部莫兰指数（热点/冷点分析）
+description: 对要素的数值字段做 Anselin Local Moran's I，识别高-高、低-低、高-低、低-高聚集区。输出 LMiIndex/LMiZScore/LMiPValue/COType 字段。
+domain: spatial_statistics
+triggers: [莫兰, moran, 热点, 冷点, 聚集, 空间自相关, LISA, 高值聚集]
+preconditions:
+  - 输入必须已投影到投影坐标系（空间权重基于距离）
+  - 分析字段为数值型且无空值
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入要素路径（需已投影）
+  field_name:
+    type: string
+    required: true
+    description: 分析字段（数值）
+  output_path:
+    type: string
+    required: true
+    description: 输出要素类路径
+  conceptualization:
+    type: string
+    default: "CONTIGUITY_EDGES_CORNERS"
+    description: 空间关系概念化，默认邻接边角
+  row_standardization:
+    type: string
+    default: "ROW"
+    description: 行标准化，可选 ROW / NONE
+steps:
+  - 校验字段为数值型
+  - 执行 Cluster and Outlier Analysis (Anselin Local Moran's I)
+  - 统计 COType 分布并返回
+code_template: |
+  import arcpy
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  field_name = {{field_name}}
+  output_path = {{output_path}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  fields = {f.name: f.type for f in arcpy.ListFields(input_path)}
+  if field_name not in fields:
+      raise ValueError(f"字段不存在: {field_name}；可用字段: {list(fields)}")
+  if fields[field_name] not in ("Double", "Single", "Integer", "SmallInteger", "Long", "Float"):
+      raise ValueError(f"字段 {field_name} 不是数值型: {fields[field_name]}")
+
+  sr = arcpy.Describe(input_path).spatialReference
+  if sr is None or sr.type == "Geographic":
+      raise ValueError("局部莫兰指数需要投影坐标系，请先投影（如 4527 Albers）")
+
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.stats.ClustersOutliers(
+      Input_Feature_Class=input_path,
+      Input_Field=field_name,
+      Output_Feature_Class=output_path,
+      Conceptualization_of_Spatial_Relationships={{conceptualization}},
+      Standardization={{row_standardization}},
+  )
+
+  counts = {}
+  with arcpy.da.SearchCursor(output_path, ["COType"]) as cur:
+      for row in cur:
+          counts[row[0]] = counts.get(row[0], 0) + 1
+  count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "cluster_counts": counts,
+      "fields_added": ["LMiIndex", "LMiZScore", "LMiPValue", "COType"],
+  })
+  print(f"Local Moran's I done: {count} features, clusters={counts}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["LMiIndex", "LMiZScore", "LMiPValue", "COType"]
+pitfalls:
+  - 输入必须是投影坐标系，否则空间权重会失真。
+  - 字段含空值会导致结果缺失，需先清洗。
+  - COType 中文分类：HH 高-高、LL 低-低、HL 高-低、LH 低-高。
+examples:
+  - "对 2020 年人口做局部莫兰指数，找高值聚集区"
+  - "识别老年人口占比的热点区"

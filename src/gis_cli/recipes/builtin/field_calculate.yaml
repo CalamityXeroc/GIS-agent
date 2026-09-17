@@ -1,0 +1,65 @@
+id: field_calculate
+name: 字段添加与计算
+description: 给要素类添加数值/文本字段，并用 Python 表达式批量计算（支持已有字段运算）。
+domain: data_management
+triggers: [字段计算, calculate field, 新增字段, 计算占比, 面积计算, 属性计算]
+preconditions:
+  - 已确认字段名不存在（避免覆盖）
+params:
+  input_path:
+    type: string
+    required: true
+  field_name:
+    type: string
+    required: true
+    description: 新字段名
+  expression:
+    type: string
+    required: true
+    description: 计算表达式，如 "!POP! / !AREA!"
+  expression_type:
+    type: string
+    default: "PYTHON3"
+  field_type:
+    type: string
+    default: "DOUBLE"
+    description: DOUBLE/LONG/TEXT
+steps:
+  - AddField
+  - CalculateField
+  - 返回非空值数量
+code_template: |
+  import arcpy
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  field_name = {{field_name}}
+  expression = {{expression}}
+  field_type = {{field_type}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  existing = [f.name for f in arcpy.ListFields(input_path)]
+  if field_name in existing:
+      raise ValueError(f"字段已存在: {field_name}；请换名或先删除")
+
+  arcpy.management.AddField(input_path, field_name, field_type)
+  arcpy.management.CalculateField(input_path, field_name, expression, {{expression_type}})
+
+  filled = 0
+  with arcpy.da.SearchCursor(input_path, [field_name]) as cur:
+      for row in cur:
+          if row[0] is not None:
+              filled += 1
+  set_result({"output": input_path, "field": field_name, "filled": filled})
+  print(f"Calculated {field_name}: {filled} non-null")
+validation:
+  - type: fields_present
+    path: "{{input_path}}"
+    value: ["{{field_name}}"]
+pitfalls:
+  - 表达式里数值字段用 !字段名! 引用（PYTHON3）。
+  - 除零要处理：`!A! / !B! if !B! else 0`。
+examples:
+  - "计算人口密度 = 人口/面积"
+  - "计算老年人口占比字段"

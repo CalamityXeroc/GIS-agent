@@ -1,0 +1,136 @@
+id: polygon_neighbor_stats
+name: 邻接分析：邻域均值与比较标记
+description: 用自空间连接（INTERSECT）求面要素邻接关系，计算每个要素“自身+所有邻接要素”的某字段均值，并标记自身值高于邻域均值的要素。用于“找出高于周边均值/接壤均值”类需求。
+domain: spatial_analysis
+triggers: [邻接, 接壤, 邻域均值, 周边均值, 高于均值, 邻居, neighbor, 邻接分析]
+preconditions:
+  - 输入已投影到投影坐标系（邻接判定与面积才有意义）
+  - 数值字段存在（如挂接后的 Y2020 人口）
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入面要素路径（含数值字段）
+  output_path:
+    type: string
+    required: true
+    description: 输出要素类路径（workspace/output 下），属性完整保留
+  value_field:
+    type: string
+    required: true
+    description: 数值字段（如 Y2020）
+  mean_field:
+    type: string
+    default: "NB_MEAN"
+    description: 输出的“自身+邻接均值”字段名
+  flag_field:
+    type: string
+    default: "ABOVE_MEAN"
+    description: 输出的比较标记字段名（高于均值=1，否则=0）
+steps:
+  - CopyFeatures 复制（保留属性）
+  - 自空间连接（INTERSECT）建立邻接对（排除自身）
+  - 逐要素计算 自身+邻接 的均值
+  - AddField + UpdateCursor 写入均值与比较标记
+  - 返回标记为 1 的要素数量
+code_template: |
+  import arcpy, os
+  from collections import defaultdict
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  value_field = {{value_field}}
+  mean_field = {{mean_field}}
+  flag_field = {{flag_field}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  have = {f.name for f in arcpy.ListFields(input_path)}
+  if value_field not in have:
+      raise ValueError(f"数值字段不存在: {value_field}；现有: {sorted(have)}")
+
+  out_parent = os.path.dirname(output_path)
+  # 注意：不要用 makedirs 造出假 .gdb 目录，必须用 CreateFileGDB
+  if str(out_parent).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_parent):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_parent), os.path.basename(out_parent)[:-4])
+  elif out_parent and not os.path.isdir(out_parent):
+      os.makedirs(out_parent, exist_ok=True)
+
+  # 支持就地更新：输出路径与输入相同时，直接在原要素上加字段
+  same = os.path.normcase(os.path.abspath(input_path)) == os.path.normcase(os.path.abspath(output_path))
+  if not same:
+      if arcpy.Exists(output_path):
+          arcpy.management.Delete(output_path)
+      arcpy.management.CopyFeatures(input_path, output_path)
+
+  # 重复运行时先清掉旧字段
+  _existing = {f.name for f in arcpy.ListFields(output_path)}
+  for _f in (mean_field, flag_field):
+      if _f in _existing:
+          arcpy.management.DeleteField(output_path, _f)
+
+  # 1) 几何直接判定邻接（touches/overlaps/contains/within）
+  #    不用自空间连接：输入若自带 TARGET_FID/Join_Count 字段会发生命名冲突，
+  #    导致读错列、邻接对为空。
+  _rows = [(oid, shp) for oid, shp in arcpy.da.SearchCursor(output_path, ["OID@", "SHAPE@"])]
+  adj = defaultdict(set)
+  for _i in range(len(_rows)):
+      _gi = _rows[_i][1]
+      for _j in range(_i + 1, len(_rows)):
+          _gj = _rows[_j][1]
+          if _gi.touches(_gj) or _gi.overlaps(_gj) or _gi.contains(_gj) or _gi.within(_gj):
+              adj[_rows[_i][0]].add(_rows[_j][0])
+              adj[_rows[_j][0]].add(_rows[_i][0])
+
+  # 2) FID -> 数值
+  fid_value = {}
+  with arcpy.da.SearchCursor(output_path, ["OID@", value_field]) as cur:
+      for oid, val in cur:
+          fid_value[oid] = val
+
+  # 3) 写入均值与标记
+  arcpy.management.AddField(output_path, mean_field, "DOUBLE")
+  arcpy.management.AddField(output_path, flag_field, "LONG")
+  flagged = 0
+  with arcpy.da.UpdateCursor(output_path, ["OID@", value_field, mean_field, flag_field]) as cur:
+      for row in cur:
+          oid, own = row[0], row[1]
+          vals = [own] + [fid_value.get(n) for n in adj.get(oid, ())]
+          vals = [v for v in vals if v is not None]
+          m = (sum(vals) / len(vals)) if vals else None
+          above = 1 if (own is not None and m is not None and own > m) else 0
+          flagged += above
+          row[2] = m
+          row[3] = above
+          cur.updateRow(row)
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  fields = [f.name for f in arcpy.ListFields(output_path)]
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "flagged_count": flagged,
+      "mean_field": mean_field,
+      "flag_field": flag_field,
+      "neighbor_pairs": sum(len(v) for v in adj.values()) // 2,
+      "fields": fields,
+  })
+  print(f"Neighbor stats done: {count} features, flagged(above mean)={flagged}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["{{mean_field}}", "{{flag_field}}"]
+pitfalls:
+  - “接壤”用几何 touches/overlaps/contains/within 判定（共享边界也算邻接）。
+  - 均值包含目标自身（题目要求“包含目标区域”）。
+  - 不用自空间连接求邻接：输入若已含 TARGET_FID/Join_Count 字段会发生命名冲突（_1 后缀），读错列导致邻接对为空。
+  - 邻接均值需求不依赖 Advanced 许可的 PolygonNeighbors，本配方用几何两两判定实现。
+examples:
+  - "找出 2020 年人口高于接壤区县(含自身)均值的区县并用颜色突出展示"

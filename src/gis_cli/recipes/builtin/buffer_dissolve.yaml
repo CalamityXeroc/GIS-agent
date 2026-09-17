@@ -1,0 +1,70 @@
+id: buffer_dissolve
+name: 缓冲区分析并融合
+description: 对输入要素按距离生成缓冲区，并按指定字段融合（dissolve）得到连续范围。
+domain: spatial_analysis
+triggers: [缓冲区, buffer, 融合, dissolve, 服务半径, 影响范围]
+preconditions:
+  - 已投影到投影坐标系（距离单位与 CRS 单位一致）
+params:
+  input_path:
+    type: string
+    required: true
+  output_path:
+    type: string
+    required: true
+  distance:
+    type: string
+    required: true
+    description: 缓冲距离，含单位，如 "1000 Meters"
+  dissolve_field:
+    type: string
+    default: ""
+    description: 融合字段，空则全部融合为一条
+  dissolve_type:
+    type: string
+    default: "ALL"
+    description: ALL 或 LIST
+steps:
+  - 校验投影坐标系
+  - Buffer_analysis
+  - Dissolve_management
+  - 返回面积与要素数
+code_template: |
+  import arcpy
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  distance = {{distance}}
+  dissolve_field = {{dissolve_field}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  sr = arcpy.Describe(input_path).spatialReference
+  if sr is None or sr.type == "Geographic":
+      raise ValueError("缓冲区分析需要投影坐标系，请先投影")
+
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.analysis.Buffer(input_path, output_path, distance, dissolve_option="ALL")
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  area = 0.0
+  with arcpy.da.SearchCursor(output_path, ["SHAPE@AREA"]) as cur:
+      for row in cur:
+          area += row[0] or 0.0
+  set_result({"output": output_path, "feature_count": count, "total_area": area, "distance": distance})
+  print(f"Buffer done: {count} features, area={area:.2f}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 缓冲距离单位要写清楚（Meters/Kilometers）。
+  - 地理坐标系下 Buffer 会用度，结果错误。
+examples:
+  - "医院 1 公里缓冲区"
+  - "河流两侧 500 米缓冲并融合"

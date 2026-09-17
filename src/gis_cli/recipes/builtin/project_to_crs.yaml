@@ -1,0 +1,78 @@
+id: project_to_crs
+name: 投影/坐标系转换
+description: 将矢量要素投影到目标投影坐标系，支持 EPSG/WKID。距离/面积/密度分析前必须执行。
+domain: projection
+triggers: [投影, 坐标系, crs, epsg, wkid, 高斯, utm, albers, project]
+preconditions:
+  - 输入数据已存在
+  - 已通过 catalog_query 确认输入坐标系
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入要素类路径
+  output_path:
+    type: string
+    required: true
+    description: 输出要素类路径（建议 .shp 或 .gdb/名称）
+  target_srid:
+    type: integer
+    default: 4527
+    description: 目标 EPSG/WKID；全国分析默认 4527(Asia North Albers Equal Area Conic)
+  overwrite:
+    type: boolean
+    default: true
+steps:
+  - 检查输入存在与源坐标系
+  - 构造目标 SpatialReference
+  - 执行 Project
+  - 返回要素数与新坐标系
+code_template: |
+  import arcpy
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  target_srid = {{target_srid}}
+  overwrite = {{overwrite}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+
+  src_desc = arcpy.Describe(input_path)
+  src_sr = getattr(src_desc, "spatialReference", None)
+  if src_sr is None or not getattr(src_sr, "name", "") or src_sr.name == "Unknown":
+      raise ValueError(f"输入数据缺少坐标系，请先用 DefineProjection 明确源坐标系: {input_path}")
+
+  target_sr = arcpy.SpatialReference(int(target_srid))
+
+  if overwrite and arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.management.Project(input_path, output_path, target_sr)
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  out_sr = arcpy.Describe(output_path).spatialReference
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "source_crs": src_sr.name,
+      "target_crs": out_sr.name,
+      "target_wkid": out_sr.factoryCode,
+  })
+  print(f"Projected {count} features -> {out_sr.name}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: crs_wkid
+    path: "{{output_path}}"
+    value: "{{target_srid}}"
+pitfalls:
+  - 只做展示时不要用投影坐标系；面积/距离统计必须用等积/投影坐标系。
+  - 源坐标系为 Unknown 时要先确认源 CRS，不能直接 Project。
+examples:
+  - "把 city.shp 投影到 4527"
+  - "统一所有图层到 CGCS2000 高斯 3 度带"
