@@ -22,11 +22,49 @@ workspace/**
 .gis_agent_state/
 .gis_agent_memory/
 
+# Engine runtime state (data catalog / traces / kernels / backups)
+.gis_agent/
+**/.gis_agent/
+arcpy_engine/
+
+# GIS data & outputs (never publish user data)
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.gdb/
+*.gpkg
+*.mdb
+*.tif
+*.tiff
+*.img
+*.lyrx
+*.aprx
+*.jpg
+*.jpeg
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Benchmark runtime artifacts & third-party task extracts
+benchmark/runs/
+benchmark/specs/
+benchmark/reports/
+
 # Local planning/temp
 .planning/
 
 # Local config secrets
 config/llm_config.json
+config/*.secret.json
+.env
+.env.*
+!.env.example
 
 # OS/editor
 .DS_Store

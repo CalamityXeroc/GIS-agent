@@ -58,6 +58,18 @@ if errorlevel 1 (
     "%PYTHON_PATH%" -m pip install litellm --quiet
 )
 
+:: 检查 yaml/jupyter 包（配方解析与 ArcPy 持久内核）
+"%PYTHON_PATH%" -c "import yaml" >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] Installing PyYAML package...
+    "%PYTHON_PATH%" -m pip install PyYAML --quiet
+)
+"%PYTHON_PATH%" -c "import jupyter_client" >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] Installing jupyter-client package...
+    "%PYTHON_PATH%" -m pip install jupyter-client --quiet
+)
+
 :: 每次启动都同步本地源码，避免运行到旧版本已安装包
 echo [INFO] Syncing local gis_cli package (editable install)...
 "%PYTHON_PATH%" -m pip install -e . --quiet
@@ -82,7 +94,13 @@ echo   - Type 'exit' to quit
 echo ----------------------------------------
 echo.
 
-"%PYTHON_PATH%" -m gis_cli.agent.cli chat --workspace ".\workspace"
+if "%~1"=="loop" (
+    :: 引擎模式：一键启动.bat loop "任务描述"
+    shift
+    "%PYTHON_PATH%" -m gis_cli.agent.cli loop %* --workspace ".\workspace"
+) else (
+    "%PYTHON_PATH%" -m gis_cli.agent.cli chat --workspace ".\workspace"
+)
 
 if errorlevel 1 (
     echo.

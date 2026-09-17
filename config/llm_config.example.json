@@ -6,6 +6,7 @@
   "max_tokens": 2048,
   "timeout": 60,
   "provider": "siliconflow",
+  "fallback_models": ["deepseek-chat"],
   "enable_prompt_optimizer": true,
   "enable_baml_standardizer": true,
   "provider_models": {
@@ -13,9 +14,34 @@
     "openai": ["gpt-4o-mini"]
   },
   "routing_rules": {
+    "agent": ["deepseek-chat"],
+    "agent_strong": ["Pro/zai-org/GLM-5"],
+    "code": ["Pro/zai-org/GLM-5"],
+    "code_repair": ["Pro/zai-org/GLM-5"],
     "planning": ["Qwen/Qwen3.5-32B"],
     "intent": ["gpt-4o-mini"],
-    "task_refine": ["Qwen/Qwen3.5-32B"]
+    "task_refine": ["Qwen/Qwen3.5-32B"],
+    "requirements": ["Pro/zai-org/GLM-5"],
+    "verify": ["deepseek-chat"],
+    "compact": ["deepseek-chat"]
+  },
+  "engine": {
+    "max_turns": 60,
+    "max_repairs": 4,
+    "llm_max_concurrency": 1,
+    "request_retry": 6,
+    "request_backoff_seconds": 8.0,
+    "request_max_backoff_seconds": 90.0,
+    "request_total_timeout_seconds": 420.0,
+    "tool_protocol": "auto",
+    "context_soft_limit_tokens": 120000,
+    "kernel_idle_timeout_seconds": 1800,
+    "kernel_exec_timeout_seconds": 600,
+    "exploration_turn_budget": 3,
+    "escalate_after_failures": 2,
+    "auto_backup_destructive": true,
+    "backup_dir": "workspace/.gis_agent/backups",
+    "auto_extract_requirements": true
   },
   "baml_functions": {
     "planning": ["generate_gis_plan"],
@@ -28,7 +54,7 @@
   "baml_required_capabilities": ["intent", "task_refine", "planning", "recovery"],
   "enable_baml_builtin_fallback": true,
   
-  "_comment": "这是配置示例文件，请复制为 llm_config.json 并填入真实的 API Key",
+  "_comment": "这是配置示例文件，请复制为 llm_config.json 并填入真实的 API Key。engine 段用于新引擎（gis-agent loop）：max_turns/max_repairs 控制循环与自修复上限，kernel_* 控制 ArcPy 持久内核超时，backup_dir 为破坏性操作自动备份目录",
   
   "_examples": {
     "硅基流动 (SiliconFlow)": {

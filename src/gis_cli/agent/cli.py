@@ -892,6 +892,93 @@ def status(
     ))
 
 
+def _run_engine_task(
+    task: str,
+    workspace: Optional[Path],
+    config: Optional[Path],
+    refresh_catalog: bool = True,
+    max_turns: int = 0,
+) -> int:
+    """使用新引擎（观察-决策-执行循环 + 代码自修复）执行单个任务。"""
+    from ..engine.runner import build_engine
+
+    ws = workspace or Path.cwd()
+
+    def _on_event(name: str, payload: dict) -> None:
+        if name == "tool_call":
+            args = payload.get("args") or {}
+            desc = str(args.get("description") or "") if isinstance(args, dict) else ""
+            console.print(f"  [cyan]-> {payload.get('tool', '')}[/cyan] {desc[:80]}")
+        elif name == "tool_result":
+            mark = "[green]OK[/green]" if payload.get("ok") else "[red]X[/red]"
+            console.print(f"    {mark} {str(payload.get('summary', ''))[:160]}")
+        elif name == "repair_attempt":
+            console.print(f"    [yellow][repair] 自动修复第 {payload.get('attempt')} 次[/yellow]")
+        elif name == "verification":
+            mark = "[green]验收通过[/green]" if payload.get("pass") else "[red]验收未通过[/red]"
+            console.print(f"  {mark}: {str(payload.get('summary', ''))[:160]}")
+
+    with console.status("[cyan]启动引擎（加载数据目录/内核）..."):
+        try:
+            bundle = build_engine(
+                workspace=ws,
+                config_path=config,
+                refresh_catalog=refresh_catalog,
+                on_event=_on_event,
+            )
+        except Exception as exc:
+            console.print(Panel.fit(str(exc), title="引擎启动失败", border_style="red"))
+            return 1
+
+    if max_turns:
+        bundle.loop.config.max_turns = max_turns
+
+    console.print(Panel.fit(
+        f"[bold]任务:[/bold] {task}\n"
+        f"[bold]工作区:[/bold] {ws}\n"
+        f"[bold]模型:[/bold] {bundle.llm.config.model}\n"
+        f"[dim]数据目录: {bundle.catalog.counts() or '空'}[/dim]",
+        title="GIS Agent (engine loop)",
+    ))
+
+    try:
+        state = bundle.loop.run(task)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]已中断[/yellow]")
+        bundle.close()
+        return 130
+
+    console.print("\n[bold blue]任务清单:[/bold blue]")
+    console.print(state.tasklist_digest())
+    if state.artifacts:
+        console.print("\n[bold blue]产出:[/bold blue]")
+        for path in state.artifacts:
+            console.print(f"  - {path}")
+    if state.methodology:
+        console.print("\n[bold blue]方法论:[/bold blue]")
+        console.print(state.methodology)
+    console.print("\n[bold blue]结果:[/bold blue]")
+    console.print(state.final_summary or state.error or "（无说明）")
+    console.print(f"\n[dim]状态: {state.status} | 轮次: {state.turn} | 追踪: {bundle.loop.recorder.jsonl_path}[/dim]")
+
+    if state.status == "awaiting_user" and state.tasklist:
+        console.print("[yellow]引擎在等待你的回答，请重新运行并补充信息。[/yellow]")
+    bundle.close()
+    return 0 if state.status == "completed" else 1
+
+
+@app.command()
+def loop(
+    task: str = typer.Argument(..., help="任务描述（自然语言）"),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="工作空间目录"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="llm_config.json 路径"),
+    refresh_catalog: bool = typer.Option(True, "--refresh-catalog/--no-refresh-catalog", help="执行前增量刷新数据目录"),
+    max_turns: int = typer.Option(0, "--max-turns", help="最大轮次（0 表示用配置默认值）"),
+):
+    """使用新引擎（观察-决策-执行循环 + 代码自修复）执行 GIS 任务。"""
+    raise typer.Exit(code=_run_engine_task(task, workspace, config, refresh_catalog, max_turns))
+
+
 def main():
     """主入口。"""
     app()
