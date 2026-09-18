@@ -64,7 +64,7 @@ code_template: |
   set_result({"output": output_table, "record_count": count, "statistics": statistics, "zone_field": zone})
   print(f"Zonal statistics done: {count} records")
 validation:
-  - type: file_exists
+  - type: vector_exists
     path: "{{output_table}}"
   - type: feature_count_gt
     path: "{{output_table}}"
@@ -72,6 +72,7 @@ validation:
 pitfalls:
   - 分区字段建议用唯一 ID；用名称可能因重名合并。
   - 栅格有 NoData 时统计结果会受影响。
+  - 输出是库内表，不是文件系统路径：判定存在要用 arcpy.Exists（file_exists 断言会误判）。
 examples:
   - "统计每个行政区的人口栅格总和"
   - "按社区汇总建筑物尺度人口"
