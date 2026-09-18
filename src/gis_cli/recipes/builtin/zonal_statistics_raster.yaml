@@ -1,0 +1,85 @@
+id: zonal_statistics_raster
+name: 分区统计（输出栅格版）
+description: 用区划面统计栅格值并把统计结果写成**栅格**（每个区划内所有像元取同一个统计值）。是"像元权重 = 像元值 / 本区划总值"这类分摊计算的前置步骤。
+domain: raster
+category: raster
+triggers: [分区统计, zonal, 栅格分区统计, 区内总值, 栅格化统计, 权重分母]
+preconditions:
+  - 分区面与栅格坐标系一致
+params:
+  zone_path:
+    type: string
+    required: true
+    description: 分区面要素
+  zone_field:
+    type: string
+    default: ""
+    description: 分区字段（数值且唯一，如 area_code）；空则用 OBJECTID
+  raster_path:
+    type: string
+    required: true
+    description: 数值栅格
+  output_path:
+    type: string
+    required: true
+    description: 输出栅格
+  statistics:
+    type: string
+    default: "SUM"
+    description: 统计类型 SUM/MEAN/MAXIMUM/MINIMUM/COUNT
+steps:
+  - 校验坐标系一致
+  - ZonalStatistics（栅格输出）
+  - 返回统计值范围
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  zone_path = {{zone_path}}
+  zone_field = {{zone_field}}
+  raster_path = {{raster_path}}
+  output_path = {{output_path}}
+  statistics = {{statistics}}
+
+  for p in (zone_path, raster_path):
+      if not arcpy.Exists(p):
+          raise ValueError(f"输入不存在: {p}")
+  zsr = arcpy.Describe(zone_path).spatialReference.name
+  rsr = arcpy.Describe(raster_path).spatialReference.name
+  if zsr != rsr:
+      raise ValueError(f"坐标系不一致（zone={zsr}, raster={rsr}），请先用投影后的分区面")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  zone = zone_field if zone_field else "OBJECTID"
+  field_types = {f.name: f.type for f in arcpy.ListFields(zone_path)}
+  if zone_field and zone_field not in field_types:
+      raise ValueError(f"分区字段不存在: {zone_field}；可用: {sorted(field_types)}")
+  if zone_field and field_types[zone_field] in ("String", "Date"):
+      raise ValueError(f"分区字段应该是数值型（{zone_field} 是 {field_types[zone_field]}）；字符串字段请先转数值或改用 OBJECTID")
+
+  out_raster = arcpy.sa.ZonalStatistics(zone_path, zone, raster_path, statistics)
+  out_raster.save(output_path)
+
+  r = arcpy.Raster(output_path)
+  set_result({"output": output_path, "statistics": statistics, "zone_field": zone,
+              "min": r.minimum, "max": r.maximum, "cell_size": r.meanCellWidth})
+  print(f"ZonalStatistics(raster) done: {statistics}, range={r.minimum}~{r.maximum}")
+validation:
+  - type: raster_exists
+    path: "{{output_path}}"
+  - type: raster_not_constant
+    path: "{{output_path}}"
+pitfalls:
+  - 分区字段必须是数值型且唯一；字符串代码（如 "110102014000"）需先转数值，否则报错。
+  - 与表格版分区统计不同：本配方输出栅格（每区划内像元同值），用于做分母/掩膜运算。
+examples:
+  - "统计每个街区的人口密度总值（栅格输出），用于像元权重分摊"
+  - "把分区平均值栅格化后参与栅格计算"

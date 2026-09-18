@@ -1,0 +1,139 @@
+id: rank_top_bottom_flag
+name: 排名与前后 N 名标记
+description: 按字段排序，标记前 N 名与后 N 名（可分别处理空值分支），并导出榜单。用于"前 500 名标杆社区 / 后 500 名需整改社区"这类排名筛选。
+domain: analysis
+category: analysis
+triggers: [排名, 前N名, 后N名, 排序, top, bottom, 榜单, 标杆, 需整改]
+preconditions:
+  - 排序字段为数值型；空值的处理策略必须显式声明
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入图层
+  rank_field:
+    type: string
+    required: true
+    description: 排序字段
+  output_path:
+    type: string
+    required: true
+    description: 输出图层（含 TOP_FLAG / BOTTOM_FLAG / RANK 字段）
+  top_n:
+    type: integer
+    default: 500
+    description: 前 N 名数量
+  bottom_n:
+    type: integer
+    default: 500
+    description: 后 N 名数量
+  bottom_include_null:
+    type: boolean
+    default: true
+    description: 空值是否计入后 N 名候选（多数场景：无值=最差，应计入）
+  second_field:
+    type: string
+    default: ""
+    description: 可选第二个排序/筛选字段（后 N 名在空值内二次排序用）
+  selected_path:
+    type: string
+    default: ""
+    description: 可选：导出"同时满足前后条件"的要素（需要与另一标记字段配合时留空即可）
+steps:
+  - 校验字段
+  - 计算排名与 TOP/BOTTOM 标记（空值策略显式）
+  - 导出榜单与统计
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  rank_field = {{rank_field}}
+  output_path = {{output_path}}
+  top_n = int({{top_n}})
+  bottom_n = int({{bottom_n}})
+  bottom_include_null = bool({{bottom_include_null}})
+  second_field = str({{second_field}}).strip()
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  have = {f.name for f in arcpy.ListFields(input_path)}
+  if rank_field not in have:
+      raise ValueError(f"排序字段不存在: {rank_field}；可用: {sorted(have)}")
+  if second_field and second_field not in have:
+      raise ValueError(f"第二排序字段不存在: {second_field}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.management.CopyFeatures(input_path, output_path)
+
+  for fname, ftype in (("RANK", "LONG"), ("TOP_FLAG", "SHORT"), ("BOTTOM_FLAG", "SHORT")):
+      if fname in {f.name for f in arcpy.ListFields(output_path)}:
+          arcpy.management.DeleteField(output_path, fname)
+      arcpy.management.AddField(output_path, fname, ftype)
+
+  # 读取全部（含空值），排名只对有值要素
+  rows = []
+  with arcpy.da.SearchCursor(output_path, ["OID@", rank_field] + ([second_field] if second_field else [])) as cur:
+      for row in cur:
+          oid, val = row[0], row[1]
+          second = row[2] if second_field else None
+          rows.append((oid, val, second))
+
+  with_vals = [(oid, val, sec) for oid, val, sec in rows if val is not None]
+  nulls = [(oid, val, sec) for oid, val, sec in rows if val is None]
+  with_vals.sort(key=lambda r: r[1], reverse=True)
+
+  top_oids = {r[0] for r in with_vals[:top_n]}
+  # 后 N 名：有值按升序；空值是否并入选候选
+  if bottom_include_null:
+      candidates = sorted(with_vals, key=lambda r: r[1]) + sorted(
+          nulls, key=lambda r: (r[2] if r[2] is not None else 0), reverse=True)
+  else:
+      candidates = sorted(with_vals, key=lambda r: r[1])
+  bottom_oids = {r[0] for r in candidates[:bottom_n]}
+
+  rank_map = {oid: i + 1 for i, (oid, _, _) in enumerate(with_vals)}
+  with arcpy.da.UpdateCursor(output_path, ["OID@", "RANK", "TOP_FLAG", "BOTTOM_FLAG"]) as cur:
+      for oid, _, _, _ in cur:
+          cur.updateRow([oid, rank_map.get(oid), 1 if oid in top_oids else 0, 1 if oid in bottom_oids else 0])
+
+  n_all = len(rows)
+  set_result({
+      "output": output_path,
+      "feature_count": n_all,
+      "ranked_count": len(with_vals),
+      "null_count": len(nulls),
+      "top_n": top_n, "bottom_n": bottom_n,
+      "top_count": len(top_oids), "bottom_count": len(bottom_oids),
+      "bottom_include_null": bottom_include_null,
+      "overlap": len(top_oids & bottom_oids),
+  })
+  print(f"Rank done: ranked={len(with_vals)} null={len(nulls)} top={len(top_oids)} bottom={len(bottom_oids)}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["RANK", "TOP_FLAG", "BOTTOM_FLAG"]
+  - type: field_sum_gt
+    path: "{{output_path}}"
+    field: "TOP_FLAG"
+    value: 0
+  - type: field_sum_gt
+    path: "{{output_path}}"
+    field: "BOTTOM_FLAG"
+    value: 0
+pitfalls:
+  - 空值不参与排名，但在"最差 N 名"场景通常应计入后 N 名（无绿地=最需要整改），必须显式选择并在报告里说明。
+  - 含空值要素的 RANK 为 NULL——这是有意的，不要用 0 或平均值填充。
+  - 前后 N 名可能重叠（总数少于 2N 时），要在结果里给出 overlap。
+examples:
+  - "人均绿地指数前 500 名为标杆社区，后 500 名为需整改社区"
+  - "按服务价值指数排名并标记"

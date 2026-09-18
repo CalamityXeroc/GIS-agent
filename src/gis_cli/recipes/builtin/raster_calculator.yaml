@@ -1,0 +1,111 @@
+id: raster_calculator
+name: 栅格计算（地图代数，支持分摊与补缺）
+description: 用 arcpy.sa 地图代数对多个栅格做运算（四则、Con/IsNull/SetNull、掩膜），支持"像元值/区内总值×区域人数"这类分摊公式与缺失值补缺。
+domain: raster
+category: raster
+triggers: [栅格计算, 栅格计算器, map algebra, 分摊, 权重, 加权, 补缺, Con, IsNull, 栅格运算]
+preconditions:
+  - 参与运算的栅格像元大小/坐标系一致（不一致时用 cell_size 与 extent 统一）
+  - 输入栅格已存在，表达式里的名称与 inputs 绑定名一致
+params:
+  inputs:
+    type: string
+    required: true
+    description: 输入绑定，形如 "density=路径1,zone_sum=路径2,elder=路径3"
+  expression:
+    type: string
+    required: true
+    description: 地图代数表达式，如 "Con(IsNull(density), 0, density / zone_sum * elder)"
+  output_path:
+    type: string
+    required: true
+    description: 输出栅格
+  cell_size:
+    type: string
+    default: ""
+    description: 输出像元大小（数值或某个输入名）；空则用第一个输入栅格
+  extent_ref:
+    type: string
+    default: ""
+    description: 输出范围参考（输入绑定名或路径）；空则用第一个输入栅格
+steps:
+  - 绑定输入栅格为表达式变量
+  - 设置像元大小/范围/NoData 环境
+  - 求值并保存
+  - 返回统计量与空值数
+code_template: |
+  import arcpy, os, math
+  arcpy.env.overwriteOutput = True
+
+  inputs_spec = {{inputs}}
+  expression = {{expression}}
+  output_path = {{output_path}}
+  cell_size = str({{cell_size}}).strip()
+  extent_ref = str({{extent_ref}}).strip()
+
+  if not str(expression).strip():
+      raise ValueError("expression 不能为空")
+
+  # 绑定输入：name=path（逗号分隔）
+  bound = {}
+  paths = {}
+  for item in str(inputs_spec).split(","):
+      if not item.strip():
+          continue
+      if "=" not in item:
+          raise ValueError(f"inputs 格式应为 '名称=路径'，收到: {item}")
+      name, path = item.split("=", 1)
+      name, path = name.strip(), path.strip()
+      if not arcpy.Exists(path):
+          raise ValueError(f"输入栅格不存在: {path}")
+      bound[name] = arcpy.sa.Raster(path)
+      paths[name] = path
+  if not bound:
+      raise ValueError("inputs 至少需要一个 '名称=路径'")
+
+  first = next(iter(bound.values()))
+  if cell_size:
+      arcpy.env.cellSize = float(cell_size) if cell_size.replace(".", "", 1).isdigit() else bound.get(cell_size, first)
+  else:
+      arcpy.env.cellSize = first
+  if extent_ref:
+      ref = bound.get(extent_ref)
+      arcpy.env.extent = ref if ref is not None else extent_ref
+
+  # 可用函数：arcpy.sa 全部公开函数 + 绑定的栅格变量
+  # 注意：arcpy.sa 内部会用到 __import__，因此这里必须传完整 builtins（
+  # 本内核本就是模型可执行代码的环境，限制 builtins 没有安全收益，只会误伤）
+  allowed = {k: getattr(arcpy.sa, k) for k in dir(arcpy.sa) if not k.startswith("_")}
+  allowed.update(bound)
+  try:
+      result = eval(expression, {"__builtins__": __builtins__}, allowed)
+  except Exception as exc:
+      raise ValueError(f"表达式求值失败（{type(exc).__name__}: {exc}）；已绑定: {sorted(bound)}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  result.save(output_path)
+
+  r = arcpy.Raster(output_path)
+  set_result({"output": output_path, "expression": expression,
+              "min": r.minimum, "max": r.maximum, "mean": r.mean,
+              "cell_size": r.meanCellWidth, "size": [r.width, r.height]})
+  print(f"RasterCalculator done: range={r.minimum}~{r.maximum}, mean={r.mean}")
+validation:
+  - type: raster_exists
+    path: "{{output_path}}"
+pitfalls:
+  - 表达式里的名称必须与 inputs 绑定名完全一致（区分大小写）。
+  - 除法的分母若存在 0 或 NoData 会产生 NoData/Inf；分摊公式请用 Con(IsNull(...)) 或 SetNull 先处理。
+  - 像元大小不一致的栅格直接运算会触发重采样；先用 cell_size/extent_ref 统一到基准栅格。
+  - 补缺（缺失像元填 0）会改变总量，必须在报告里说明补了多少像元。
+examples:
+  - "老年人口分摊：Con(IsNull(density), 0, density / zone_sum * elder)"
+  - "把两期栅格相减求变化：r2 - r1"
+  - "按掩膜提取后置零：Con(IsNull(mask), 0, value)"

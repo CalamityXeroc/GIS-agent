@@ -1,0 +1,87 @@
+id: polygon_to_raster
+name: 面转栅格（Polygon to Raster）
+description: 把面要素按数值字段转换为指定像元大小的栅格（如"街区老年人口 → 5 米栅格"），是栅格分摊/叠加的第一步。
+domain: raster
+category: raster
+triggers: [面转栅格, 矢量转栅格, rasterize, polygon to raster, 转栅格]
+preconditions:
+  - 输入为面要素，且使用投影坐标系（像元大小单位为米）
+  - 转换字段为数值型（文本字段设置不当会报错）
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入面要素
+  value_field:
+    type: string
+    required: true
+    description: 取值字段（数值）
+  output_path:
+    type: string
+    required: true
+    description: 输出栅格路径（.tif 或 gdb 内栅格名）
+  cell_size:
+    type: number
+    default: 5
+    description: 像元大小（米）
+  cell_assignment:
+    type: string
+    default: "MAXIMUM_AREA"
+    description: 像元取值规则 MAXIMUM_AREA/MAXIMUM_COMBINED_AREA/CENTROID
+steps:
+  - 校验面要素、投影坐标系、数值字段
+  - PolygonToRaster
+  - 返回像元大小与范围
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  value_field = {{value_field}}
+  output_path = {{output_path}}
+  cell_size = float({{cell_size}})
+  cell_assignment = {{cell_assignment}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  d = arcpy.Describe(input_path)
+  if d.shapeType != "Polygon":
+      raise ValueError("面转栅格需要面要素")
+  if d.spatialReference.type == "Geographic":
+      raise ValueError("当前为地理坐标系，像元大小会按度解释；请先投影到投影坐标系")
+  flds = {f.name: f.type for f in arcpy.ListFields(input_path)}
+  if value_field not in flds:
+      raise ValueError(f"字段不存在: {value_field}；可用: {sorted(flds)}")
+  if flds[value_field] in ("String", "Date", "Guid", "Blob"):
+      raise ValueError(f"取值字段必须是数值型，{value_field} 是 {flds[value_field]}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.conversion.PolygonToRaster(input_path, value_field, output_path,
+                                   cell_assignment, "", cell_size, "DO_NOT_BUILD")
+  r = arcpy.Raster(output_path)
+  valid = int(r.width) * int(r.height)
+  set_result({"output": output_path, "value_field": value_field,
+              "cell_size": r.meanCellWidth, "size": [r.width, r.height],
+              "min": r.minimum, "max": r.maximum, "cell_count": valid})
+  print(f"PolygonToRaster done: {r.width}x{r.height}, cell={r.meanCellWidth:.3f}, range={r.minimum}~{r.maximum}")
+validation:
+  - type: raster_exists
+    path: "{{output_path}}"
+  - type: raster_not_constant
+    path: "{{output_path}}"
+pitfalls:
+  - 地理坐标系下像元大小是度（5 度≈550km），必须先投影。
+  - 文本字段不能直接转栅格，需要先解析为数值（如 "28.3%" → 28.3）。
+  - 输出像元大小要与后续栅格计算/分摊的基准栅格一致，否则重采样会引入误差。
+  - build_ratings 参数只接受 BUILD / DO_NOT_BUILD（写 NONE 会报 000622 参数无效）。
+examples:
+  - "把街区老年人口转为 5 米栅格，用于像元级分摊"
+  - "把绿地面积字段转成栅格"

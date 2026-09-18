@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -158,12 +159,15 @@ class RecipeLibrary:
     def _run_assertions(self, recipe: Recipe, params: dict[str, Any], result: Any) -> list[ValidationResult]:
         out: list[ValidationResult] = []
         for raw in recipe.validation:
+            # 解析断言里所有字符串槽位（path/target/value 以及 field/reference 等自定义键）
+            raw = {
+                k: (_resolve(v, params) if isinstance(v, str) else v)
+                for k, v in raw.items()
+            }
             kind = str(raw.get("type", "") or "")
-            target = _resolve(str(raw.get("path", "") or raw.get("target", "")), params)
+            target = str(raw.get("path", "") or raw.get("target", ""))
             expected = raw.get("value")
-            if isinstance(expected, str):
-                expected = _resolve(expected, params)
-            elif isinstance(expected, list):
+            if isinstance(expected, list):
                 expected = [_resolve(str(v), params) for v in expected]
             try:
                 out.append(self._check(kind, target, expected, raw, result))
@@ -193,12 +197,18 @@ class RecipeLibrary:
             ok = bool(needle) and needle in text
             return ValidationResult(kind, target, ok, f"contains({needle})={ok}")
         if kind in {"vector_exists", "raster_exists"}:
-            # GDB feature classes are not filesystem paths: fall back to arcpy.
+            # GDB 要素类/栅格不是文件系统路径：用 arcpy.Exists 判断。
+            # arcpy 对新写入的数据集有可见性缓存，刚 save 完可能瞬时为 False，
+            # 因此这里做一次短重试，避开“刚产出却判为不存在”的偶发误报。
             if path.exists():
                 return ValidationResult(kind, target, True, "")
             record = self._describe(target)
             ok = bool(record and record.get("exists"))
-            return ValidationResult(kind, target, ok, "" if ok else "要素类不存在（arcpy.Exists 也为 False）")
+            if not ok:
+                time.sleep(0.8)
+                record = self._describe(target)
+                ok = bool(record and record.get("exists"))
+            return ValidationResult(kind, target, ok, "" if ok else "要素类/栅格不存在（arcpy.Exists 也为 False）")
         if kind == "feature_count_gt":
             count = self._feature_count(target)
             ok = count is not None and count > int(expected or 0)
@@ -254,6 +264,37 @@ class RecipeLibrary:
             distinct = self._field_stat(target, field, "distinct")
             ok = distinct is not None and distinct > int(expected or 0)
             return ValidationResult(kind, target, ok, f"distinct({field})={distinct} expected>{expected}")
+        if kind == "field_stats_between":
+            field = str(raw.get("field", "") or "")
+            stat = str(raw.get("stat", "mean") or "mean").lower()
+            value = self._field_stat(target, field, stat)
+            try:
+                lo, hi = float(expected[0]), float(expected[1])
+            except Exception:
+                return ValidationResult(kind, target, False, f"非法区间: {expected}")
+            ok = value is not None and lo <= value <= hi
+            return ValidationResult(kind, target, ok, f"{stat}({field})={value} expected in [{lo},{hi}]")
+        if kind == "join_null_rate_below":
+            field = str(raw.get("field", "") or "")
+            rate = self._field_stat(target, field, "null_rate")
+            limit = float(expected if expected is not None else 0.05)
+            ok = rate is not None and rate <= limit
+            return ValidationResult(kind, target, ok, f"null_rate({field})={rate} expected<={limit}")
+        if kind == "raster_stat_between":
+            stat = str(raw.get("stat", "sum") or "sum").lower()
+            info = self._raster_stats(target)
+            try:
+                lo, hi = float(expected[0]), float(expected[1])
+            except Exception:
+                return ValidationResult(kind, target, False, f"非法区间: {expected}")
+            value = info.get(stat) if info else None
+            ok = value is not None and lo <= float(value) <= hi
+            detail = f"{stat}={value} expected in [{lo},{hi}]" + (f" stats={info}" if info and not ok else "")
+            return ValidationResult(kind, target, ok, detail)
+        if kind == "extent_within_reference":
+            reference = str(raw.get("reference", "") or "")
+            ok, detail = self._extent_within(target, reference)
+            return ValidationResult(kind, target, ok, detail)
         if kind == "raster_not_constant":
             info = self._raster_range(target)
             ok = info is not None and info[0] is not None and info[1] is not None and info[0] != info[1]
@@ -302,29 +343,81 @@ class RecipeLibrary:
         return self._field_stat(path, field, "sum")
 
     def _field_stat(self, path: str, field: str, kind: str) -> float | None:
-        """Compute sum/distinct of a field via the kernel."""
+        """Compute a statistic of a field via the kernel.
+
+        kind: sum | min | max | mean | count | distinct | null_rate
+        """
         if self.code_runner is None or not field:
             return None
         code = (
-            "import arcpy\n"
-            f"_p = {path!r}\n_f = {field!r}\n_kind = {kind!r}\n"
-            "_sum = 0.0\n_vals = set()\n"
+            "import arcpy, statistics as _st\n"
+            f"_p = {path!r}\n_f = {field!r}\n"
+            "_vals = []\n_n = 0\n_null = 0\n_distinct = set()\n"
             "with arcpy.da.SearchCursor(_p, [_f]) as cur:\n"
             "    for row in cur:\n"
-            "        if row[0] is None:\n"
+            "        _n += 1\n"
+            "        _v = row[0]\n"
+            "        if _v is None:\n"
+            "            _null += 1\n"
             "            continue\n"
-            "        _vals.add(str(row[0]))\n"
+            "        _distinct.add(str(_v))\n"
             "        try:\n"
-            "            _sum += float(row[0])\n"
+            "            _vals.append(float(_v))\n"
             "        except (TypeError, ValueError):\n"
             "            pass\n"
-            "set_result({'sum': _sum, 'distinct': len(_vals)})\n"
+            "set_result({'sum': sum(_vals), 'min': min(_vals) if _vals else None,\n"
+            "            'max': max(_vals) if _vals else None,\n"
+            "            'mean': (_st.fmean(_vals) if _vals else None),\n"
+            "            'count': _n, 'null': _null, 'distinct': len(_distinct),\n"
+            "            'null_rate': (_null / _n) if _n else None})\n"
         )
         outcome = self.code_runner.run(code, timeout=180)
         if outcome.ok and isinstance(outcome.result, dict):
             value = outcome.result.get(kind)
             return float(value) if value is not None else None
         return None
+
+    def _raster_stats(self, path: str) -> dict[str, float] | None:
+        """Exact raster statistics (NoData-aware) via the kernel."""
+        if self.code_runner is None:
+            return None
+        code = (
+            "import arcpy, numpy as np\n"
+            f"_r = arcpy.Raster({path!r})\n"
+            "_a = arcpy.RasterToNumPyArray(_r, nodata_to_value=np.nan).astype('float64')\n"
+            "_valid = int(np.count_nonzero(~np.isnan(_a)))\n"
+            "set_result({'sum': float(np.nansum(_a)),\n"
+            "            'min': float(np.nanmin(_a)) if _valid else None,\n"
+            "            'max': float(np.nanmax(_a)) if _valid else None,\n"
+            "            'mean': float(np.nanmean(_a)) if _valid else None,\n"
+            "            'count': _valid, 'nodata': int(_a.size - _valid)})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=300)
+        if outcome.ok and isinstance(outcome.result, dict):
+            return {k: v for k, v in outcome.result.items() if v is not None}
+        return None
+
+    def _extent_within(self, target: str, reference: str) -> tuple[bool, str]:
+        """True when target's extent is inside reference's extent (small tolerance)."""
+        if self.code_runner is None or not reference:
+            return False, "缺少 reference 参数"
+        code = (
+            "import arcpy\n"
+            f"_t = {target!r}\n_r = {reference!r}\n"
+            "if not arcpy.Exists(_t) or not arcpy.Exists(_r):\n"
+            "    raise ValueError('目标或参考数据不存在')\n"
+            "_te = arcpy.Describe(_t).extent\n_re = arcpy.Describe(_r).extent\n"
+            "_tol = max(_re.width, _re.height) * 1e-6\n"
+            "_ok = (_te.XMin >= _re.XMin - _tol and _te.YMin >= _re.YMin - _tol\n"
+            "       and _te.XMax <= _re.XMax + _tol and _te.YMax <= _re.YMax + _tol)\n"
+            "set_result({'ok': bool(_ok), 'target': [_te.XMin,_te.YMin,_te.XMax,_te.YMax],\n"
+            "            'reference': [_re.XMin,_re.YMin,_re.XMax,_re.YMax]})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=180)
+        if outcome.ok and isinstance(outcome.result, dict):
+            payload = outcome.result
+            return bool(payload.get("ok")), f"target={payload.get('target')} reference={payload.get('reference')}"
+        return False, f"范围比较失败: {(outcome.error or {}).get('message', '')[:80]}"
 
     def _overlap_pairs(self, path: str, max_allowed: int) -> tuple[int | None, bool]:
         """Count polygon pairs that overlap/duplicate (early-exit at max_allowed)."""

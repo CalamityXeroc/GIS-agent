@@ -1,0 +1,76 @@
+id: select_by_attribute
+name: 属性筛选导出
+description: 按 SQL/属性条件筛选要素并导出为新图层（如"老年人口大于 300""某字段为空"），是各类阈值筛选与排名的落地手段。
+domain: analysis
+category: analysis
+triggers: [筛选, 选择, 属性查询, where, 按条件导出, 阈值筛选, 为空]
+preconditions:
+  - 字段名已在数据中确认（禁止猜测）
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入图层
+  output_path:
+    type: string
+    required: true
+    description: 输出图层（筛选结果）
+  where_clause:
+    type: string
+    required: true
+    description: 属性条件，如 "老龄人 > 300" 或 "人均绿地 IS NULL"
+  expect_min:
+    type: integer
+    default: 0
+    description: 期望最少结果条数；为 0 表示不校验
+steps:
+  - 校验收字段与合法性
+  - Select 导出
+  - 返回筛选结果条数与占比
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  where_clause = {{where_clause}}
+  expect_min = int({{expect_min}})
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  if not str(where_clause).strip():
+      raise ValueError("where_clause 不能为空")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  try:
+      arcpy.analysis.Select(input_path, output_path, where_clause)
+  except Exception as exc:
+      fields = [f.name for f in arcpy.ListFields(input_path) if f.type not in ("Geometry", "OID")]
+      raise ValueError(f"筛选条件执行失败（{str(exc)[:80]}）；可用字段: {fields}")
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  in_count = int(arcpy.management.GetCount(input_path)[0])
+  if count == 0 and expect_min > 0:
+      raise ValueError(f"筛选结果为空但期望至少 {expect_min} 条；条件: {where_clause}")
+  set_result({"output": output_path, "feature_count": count, "input_count": in_count,
+              "where_clause": where_clause, "share": round(count / in_count, 4) if in_count else 0})
+  print(f"Select done: {count}/{in_count} features match [{where_clause}]")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+pitfalls:
+  - 字段名必须来自真实数据（先 ListFields/catalog 确认），猜字段是最常见失败原因。
+  - 空值判断用 IS NULL；用 = NULL 永远选不到。
+  - 文本字段取值要用单引号，如 "name = '郑州市'"。
+  - 结果条数等于输入条数时说明条件没起作用，要复查。
+examples:
+  - "选出老年人口大于 300 且邻近人口大于 2000 的社区"
+  - "筛选人均绿地为空的社区"

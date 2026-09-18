@@ -1,0 +1,59 @@
+id: polygonize_raster
+name: 栅格转面（Polygonize）
+description: 把栅格中相同值的连通像元转成面要素，用于把栅格分类/分区结果还原为矢量做叠加与制图。
+domain: raster
+category: raster
+triggers: [栅格转面, polygonize, raster to polygon, 矢量化]
+preconditions:
+  - 栅格为整数型类别值效果最好；连续值会产生大量碎面
+params:
+  raster_path:
+    type: string
+    required: true
+    description: 输入栅格
+  output_path:
+    type: string
+    required: true
+    description: 输出面要素
+  simplify:
+    type: string
+    default: "SIMPLIFY"
+    description: SIMPLIFY 用平滑边界 / NO_SIMPLIFY 保持像元边界
+steps:
+  - RasterToPolygon
+  - 返回面数
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  raster_path = {{raster_path}}
+  output_path = {{output_path}}
+  simplify = {{simplify}}
+
+  if not arcpy.Exists(raster_path):
+      raise ValueError(f"输入栅格不存在: {raster_path}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.conversion.RasterToPolygon(raster_path, output_path, simplify, "Value", "MULTIPLE_OUTER_PART")
+  count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({"output": output_path, "feature_count": count, "simplify": simplify})
+  print(f"RasterToPolygon done: {count} polygons")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 连续值栅格会产生成千上万碎面，先重分类为整数类别再转面。
+  - 结果面数通常远大于输入类别数（同类值可能不连通）。
+examples:
+  - "把适宜性分级栅格转为矢量面用于制图"

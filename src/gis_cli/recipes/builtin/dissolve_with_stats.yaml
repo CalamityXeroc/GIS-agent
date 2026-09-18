@@ -1,0 +1,91 @@
+id: dissolve_with_stats
+name: 融合并统计（按字段求和/计数）
+description: 按分组字段融合要素，同时对数值字段做 SUM/MEAN/COUNT 统计（如"每个社区的绿地总面积"）。融合结果属性为每组一行。
+domain: analysis
+category: analysis
+triggers: [融合, dissolve, 按字段合并, 面积求和, 分组统计, 汇总面积]
+preconditions:
+  - 输入为面或线；面积/长度统计需投影坐标系
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入图层（如相交后的绿地）
+  output_path:
+    type: string
+    required: true
+    description: 输出图层
+  dissolve_field:
+    type: string
+    required: true
+    description: 分组字段（如社区 BSM/BM）
+  stat_fields:
+    type: string
+    required: true
+    description: 统计字段，如 "Shape_Area SUM" 或 "Shape_Area SUM,人口 SUM"
+  multi_part:
+    type: string
+    default: "MULTI_PART"
+    description: MULTI_PART 保留多部件 / SINGLE_PART 每个部件单独一行
+steps:
+  - 校验字段存在
+  - Dissolve + 统计
+  - 返回组数与统计字段
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  dissolve_field = {{dissolve_field}}
+  stat_fields = {{stat_fields}}
+  multi_part = {{multi_part}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  have = {f.name for f in arcpy.ListFields(input_path)}
+  if dissolve_field not in have:
+      raise ValueError(f"分组字段不存在: {dissolve_field}；可用: {sorted(have)}")
+
+  stats = []
+  for item in str(stat_fields).split(","):
+      parts = item.strip().split()
+      if len(parts) != 2:
+          raise ValueError(f"统计字段格式应为 '字段 统计类型'，收到: {item}")
+      fname, ftype = parts[0], parts[1].upper()
+      if fname not in have:
+          raise ValueError(f"统计字段不存在: {fname}")
+      stats.append([fname, ftype])
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.management.Dissolve(input_path, output_path, dissolve_field, stats, multi_part)
+  count = int(arcpy.management.GetCount(output_path)[0])
+  fields = [f.name for f in arcpy.ListFields(output_path) if f.type not in ("Geometry", "OID")]
+  stat_names = [f"{ftype}_{fname}" for fname, ftype in stats]
+  set_result({"output": output_path, "group_count": count, "dissolve_field": dissolve_field,
+              "stat_fields": stat_fields, "stat_field_names": stat_names, "fields": fields})
+  print(f"Dissolve done: {count} groups by {dissolve_field}; stats={stat_names}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["{{dissolve_field}}"]
+pitfalls:
+  - 统计结果字段名形如 SUM_Shape_Area / COUNT_字段（不是原字段名），后续取值前务必 ListFields 确认。
+  - 统计面积必须用投影坐标系；地理坐标系下 Shape_Area 是"平方度"，无意义。
+  - 融合后组数应显著少于输入要素数；相等说明分组字段选错了（例如每行都唯一）。
+examples:
+  - "把社区内绿地按社区融合，求每个社区绿地总面积"
+  - "按行政区融合并统计人口总和"

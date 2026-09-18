@@ -1,0 +1,86 @@
+id: cleanup_gdb
+name: 交付前清理地理数据库
+description: 交付前删除数据库中的过程数据（临时表/中间图层），只保留结果图层。竞赛与项目验收通常都要求"提交时删除非必要数据"。
+domain: infra
+category: infra
+triggers: [清理, 删除过程数据, 交付清理, 精简数据库, 删临时层, 提交前整理]
+preconditions:
+  - 明确哪些是结果层（keep 列表），其余视为过程数据
+  - 建议先备份（本配方不自动备份，破坏性操作）
+params:
+  gdb_path:
+    type: string
+    required: true
+    description: 目标数据库
+  keep:
+    type: string
+    required: true
+    description: 要保留的图层/表名，逗号分隔（结果层清单）
+  drop_patterns:
+    type: string
+    default: "_tmp,points_tmp,census_tbl"
+    description: 额外要删除的名称片段（逗号分隔）
+  dry_run:
+    type: boolean
+    default: true
+    description: 默认只预览不删除；确认无误后设 false 执行
+steps:
+  - 列出库内全部要素/表
+  - 计算"保留集"与"删除集"
+  - 按 dry_run 预览或执行删除
+  - 返回删除清单与剩余清单
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  gdb_path = {{gdb_path}}
+  keep = [k.strip() for k in str({{keep}}).split(",") if k.strip()]
+  patterns = [p.strip().lower() for p in str({{drop_patterns}}).split(",") if p.strip()]
+  dry_run = bool({{dry_run}})
+
+  if not arcpy.Exists(gdb_path):
+      raise ValueError(f"数据库不存在: {gdb_path}")
+  if not keep:
+      raise ValueError("keep 不能为空：必须显式列出要保留的结果图层")
+
+  arcpy.env.workspace = gdb_path
+  items = (arcpy.ListFeatureClasses() or []) + (arcpy.ListTables() or [])
+  keep_set = set(keep)
+  missing_keep = [k for k in keep if k not in items]
+  if missing_keep:
+      raise ValueError(f"keep 中的图层在库里不存在: {missing_keep}；库内实际: {sorted(items)}")
+
+  to_drop = []
+  for name in items:
+      if name in keep_set:
+          continue
+      low = name.lower()
+      if not patterns or any(p in low for p in patterns):
+          to_drop.append(name)
+
+  dropped = []
+  if not dry_run:
+      for name in to_drop:
+          arcpy.management.Delete(os.path.join(gdb_path, name))
+          dropped.append(name)
+
+  remaining = (arcpy.ListFeatureClasses() or []) + (arcpy.ListTables() or [])
+  set_result({
+      "output": gdb_path,
+      "dry_run": dry_run,
+      "kept": keep,
+      "planned_drop": to_drop,
+      "dropped": dropped,
+      "remaining": remaining,
+  })
+  print(f"cleanup_gdb dry_run={dry_run}: drop={len(to_drop)} remaining={len(remaining)}")
+validation:
+  - type: vector_exists
+    path: "{{gdb_path}}"
+pitfalls:
+  - 默认 dry_run=true，只看不删；确认清单正确后再传 false。
+  - 删除是不可恢复的：执行前确认 keep 列表覆盖全部结果层（含供复查的中间结果）。
+  - 只按名称匹配，不分析依赖关系；被其它图层引用的层不会被识别。
+examples:
+  - "交付前只保留 result_data.gdb 里的最终成果图层"
+  - "清理 *_tmp 过程数据"

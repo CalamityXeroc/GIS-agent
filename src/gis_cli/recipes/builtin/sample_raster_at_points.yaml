@@ -1,0 +1,78 @@
+id: sample_raster_at_points
+name: 点采样栅格值
+description: 把栅格值提取到点上（如"建筑中心点取人口栅格值"），结果写入点要素属性表。
+domain: raster
+category: raster
+triggers: [采样, 提取值, extract values, 点取值, 栅格取值到点]
+preconditions:
+  - 点与栅格坐标系一致
+params:
+  points_path:
+    type: string
+    required: true
+    description: 输入点要素
+  raster_path:
+    type: string
+    required: true
+    description: 输入栅格
+  output_path:
+    type: string
+    required: true
+    description: 输出点要素（含采样值字段）
+  field_name:
+    type: string
+    default: "RASTERVALU"
+    description: 采样值字段名
+steps:
+  - 校验坐标系
+  - ExtractValuesToPoints
+  - 返回空值率
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  points_path = {{points_path}}
+  raster_path = {{raster_path}}
+  output_path = {{output_path}}
+
+  for p in (points_path, raster_path):
+      if not arcpy.Exists(p):
+          raise ValueError(f"输入不存在: {p}")
+  psr = arcpy.Describe(points_path).spatialReference.name
+  rsr = arcpy.Describe(raster_path).spatialReference.name
+  if psr != rsr:
+      raise ValueError(f"坐标系不一致（points={psr}, raster={rsr}），请先统一")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.sa.ExtractValuesToPoints(points_path, raster_path, output_path, "INTERPOLATE", "VALUE_ONLY")
+  fields = [f.name for f in arcpy.ListFields(output_path) if f.type not in ("Geometry", "OID")]
+  val_field = "RASTERVALU" if "RASTERVALU" in fields else (fields[-1] if fields else "")
+  n = 0
+  nulls = 0
+  if val_field:
+      with arcpy.da.SearchCursor(output_path, [val_field]) as cur:
+          for (v,) in cur:
+              n += 1
+              if v is None or v == -9999:
+                  nulls += 1
+  set_result({"output": output_path, "feature_count": n, "value_field": val_field,
+              "null_count": nulls, "null_rate": round(nulls / n, 4) if n else None})
+  print(f"ExtractValuesToPoints done: {n} points, null={nulls}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 点落在栅格 NoData 区会得到 -9999 或空值；空值率高说明点位不在栅格覆盖范围内。
+examples:
+  - "建筑中心点取老年人口栅格值"

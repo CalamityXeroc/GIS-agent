@@ -68,7 +68,28 @@ code_template: |
       page_height={{page_height}},
       aprx_path={{aprx_path}},
   )
+
+  # 分级字段的空值不会上色（会默认为无色/白色），必须显式统计并报告，
+  # 否则"未分析区域"与"数值为 0"在图上无法区分。
+  _total = 0
+  _null = 0
+  with arcpy.da.SearchCursor(input_path, [field_name]) as _cur:
+      for (_v,) in _cur:
+          _total += 1
+          if _v is None:
+              _null += 1
+  _null_rate = round(_null / _total, 4) if _total else 0.0
+  if _null:
+      print(f"⚠ 分级字段 {field_name} 有 {_null}/{_total} 个空值（{_null_rate:.1%}）：空值不会上色，"
+            f"请在报告中说明这些单元\"无数据\"，不要当作 0")
+
   exec(compile(code, "<graduated_colors_map>", "exec"), globals(), globals())
+
+  # 把空值统计补进执行结果（供上层报告/验收使用）
+  _result = globals().get("__arcpy_engine_result__")
+  if isinstance(_result, dict):
+      _result.update({"null_count": _null, "total_count": _total, "null_rate": _null_rate})
+      set_result(_result)
 validation:
   - type: file_exists
     path: "{{output_path}}"
@@ -81,6 +102,8 @@ pitfalls:
   - 地图框必须绑定数据图层，否则导出空白图。
   - 工程(.aprx)必须 aprx.save() 落盘，否则样式/布局只在内存里，用户打开工程看不到分级色。
   - 默认每张图生成同名 .aprx（不覆盖其他图）；想追加到同一工程时传 aprx_path 指向已有工程（会复制再改，不改动原文件）。
+  - 分级字段的空值不上色：若数据有大量空值（如"无绿地社区"），图上会大片留白，必须报告空值数量并改用全量图层出图，否则读者无法区分"无数据"与"已分析"。
+  - 想给全量单元上色时，先用 attribute_join_table 把统计结果挂回全量图层（含空值）再出图。
 examples:
   - "用 forest_cov 字段做绿色分级设色专题图"
   - "制作老年人口占比专题图，标题为‘某市老年人口占比’"

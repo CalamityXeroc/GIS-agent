@@ -1,0 +1,89 @@
+id: frequency_table
+name: 频数统计表
+description: 统计字段取值出现次数（如"每个住宅小区在建筑物图层出现多少次"），输出统计表供连接回图层。
+domain: analysis
+category: analysis
+triggers: [频数, frequency, 出现次数, 计数统计, 分组计数]
+preconditions:
+  - 输入表/要素存在，统计字段已确认
+params:
+  in_table:
+    type: string
+    required: true
+    description: 输入表或要素类
+  out_table:
+    type: string
+    required: true
+    description: 输出统计表（.gdb 内表名）
+  frequency_fields:
+    type: string
+    required: true
+    description: 频数字段，逗号分隔（如 "name"）
+  summary_fields:
+    type: string
+    default: ""
+    description: 可选汇总字段，形如 "高度 MEAN"
+steps:
+  - Frequency 统计
+  - 返回记录数
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  in_table = {{in_table}}
+  out_table = {{out_table}}
+  frequency_fields = {{frequency_fields}}
+  summary_fields = {{summary_fields}}
+
+  if not arcpy.Exists(in_table):
+      raise ValueError(f"输入不存在: {in_table}")
+  have = {f.name for f in arcpy.ListFields(in_table)}
+  freq = [f.strip() for f in str(frequency_fields).split(",") if f.strip()]
+  missing = [f for f in freq if f not in have]
+  if missing:
+      raise ValueError(f"频数字段不存在: {missing}；可用: {sorted(have)}")
+
+  summary = []
+  if str(summary_fields).strip():
+      for item in str(summary_fields).split(","):
+          parts = item.strip().split()
+          if len(parts) != 2:
+              raise ValueError(f"汇总字段格式应为 '字段 统计类型'，收到: {item}")
+          if parts[0] not in have:
+              raise ValueError(f"汇总字段不存在: {parts[0]}")
+          summary.append([parts[0], parts[1].upper()])
+
+  out_folder = os.path.dirname(out_table)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(out_table):
+      arcpy.management.Delete(out_table)
+
+  arcpy.analysis.Frequency(in_table, out_table, freq, summary)
+  count = int(arcpy.management.GetCount(out_table)[0])
+  fields = [f.name for f in arcpy.ListFields(out_table)]
+  freq_field = "FREQUENCY" if "FREQUENCY" in fields else (fields[-1] if fields else "")
+  top = []
+  if freq_field:
+      with arcpy.da.SearchCursor(out_table, freq + [freq_field]) as cur:
+          rows = [(r[-1], r[0]) for r in cur]
+      rows.sort(reverse=True)
+      top = [{"key": str(k), "count": int(c)} for c, k in rows[:5]]
+  set_result({"output": out_table, "record_count": count, "frequency_field": freq_field, "top": top})
+  print(f"Frequency done: {count} groups; top={top[:3]}")
+validation:
+  - type: vector_exists
+    path: "{{out_table}}"
+  - type: feature_count_gt
+    path: "{{out_table}}"
+    value: 0
+pitfalls:
+  - 输出是表（不是要素类），要回填到图层需按公共字段连接（JoinField/attribute_join_table）。
+  - 频数列表头就是 FREQUENCY；汇总列表头形如 MEAN_高度。
+  - 库内表不是文件系统路径，判断存在要用 arcpy.Exists（file_exists 断言会误判）。
+examples:
+  - "统计每个住宅小区下的建筑物数量"
+  - "统计各地类的斑块数量"

@@ -1,0 +1,79 @@
+id: clip_layer
+name: 裁剪（Clip）
+description: 用一个面图层裁剪另一个图层，保留落在裁剪范围内的部分（属性不变）。常用于把研究区限定到目标范围。
+domain: overlay
+category: overlay
+triggers: [裁剪, clip, 裁切, 限定范围, 裁出, 研究区]
+preconditions:
+  - 两图层坐标系一致（不一致先投影）
+params:
+  input_path:
+    type: string
+    required: true
+    description: 被裁剪图层
+  clip_path:
+    type: string
+    required: true
+    description: 裁剪范围（面图层）
+  output_path:
+    type: string
+    required: true
+    description: 输出图层
+steps:
+  - 校验存在与坐标系
+  - Clip 裁剪
+  - 返回要素数与范围
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  clip_path = {{clip_path}}
+  output_path = {{output_path}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  if not arcpy.Exists(clip_path):
+      raise ValueError(f"裁剪范围不存在: {clip_path}")
+  in_sr = arcpy.Describe(input_path).spatialReference.name
+  clip_sr = arcpy.Describe(clip_path).spatialReference.name
+  if in_sr != clip_sr:
+      raise ValueError(f"坐标系不一致（{in_sr} vs {clip_sr}），请先统一投影")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.analysis.Clip(input_path, clip_path, output_path)
+  count = int(arcpy.management.GetCount(output_path)[0])
+  if count == 0:
+      raise ValueError("裁剪结果为空：请检查两图层是否空间重叠、坐标系是否一致")
+  e = arcpy.Describe(output_path).extent
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "extent": [e.XMin, e.YMin, e.XMax, e.YMax],
+      "input_count": int(arcpy.management.GetCount(input_path)[0]),
+  })
+  print(f"Clip done: {count} features (from {arcpy.management.GetCount(input_path)[0]})")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: extent_within_reference
+    path: "{{output_path}}"
+    reference: "{{clip_path}}"
+pitfalls:
+  - 裁剪结果要素数通常少于输入；若相等且范围未变，说明裁剪层没起作用。
+  - 结果为空多半是坐标系不一致或两图层不重叠，不要当成功。
+  - Clip 只裁剪几何，不改变属性结构。
+examples:
+  - "用社区面裁剪绿地数据，只要社区内的绿地"
+  - "用研究区范围裁剪道路"

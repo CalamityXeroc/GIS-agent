@@ -1,0 +1,102 @@
+id: interpolate_surface
+name: 插值成面（IDW/克里金/样条）
+description: 由离散点生成连续栅格面（IDW 反距离权重 / Kriging 克里金 / Spline 样条），用于气象、污染、密度等要素的空间连续化。
+domain: raster
+category: raster
+triggers: [插值, 克里金, kriging, IDW, 反距离权重, 样条, 表面生成]
+preconditions:
+  - 点要素与投影坐标系（距离型插值需要米制单位）
+  - 插值字段为数值型
+params:
+  points_path:
+    type: string
+    required: true
+    description: 输入点要素
+  field_name:
+    type: string
+    required: true
+    description: 插值字段
+  output_path:
+    type: string
+    required: true
+    description: 输出栅格
+  method:
+    type: string
+    default: "IDW"
+    description: IDW / KRIGING / SPLINE
+  cell_size:
+    type: number
+    default: 100
+    description: 输出像元大小（米）
+  power:
+    type: number
+    default: 2
+    description: IDW 幂次
+steps:
+  - 校验点/坐标系/字段
+  - 执行插值
+  - 与输入值域对比（防异常外推）
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  points_path = {{points_path}}
+  field_name = {{field_name}}
+  output_path = {{output_path}}
+  method = str({{method}}).upper()
+  cell_size = float({{cell_size}})
+  power = float({{power}})
+
+  if not arcpy.Exists(points_path):
+      raise ValueError(f"输入点不存在: {points_path}")
+  d = arcpy.Describe(points_path)
+  if d.shapeType != "Point":
+      raise ValueError(f"插值需要点要素，输入是 {d.shapeType}")
+  if d.spatialReference.type == "Geographic":
+      raise ValueError("插值需要投影坐标系（距离单位必须是米），请先投影")
+  flds = {f.name: f.type for f in arcpy.ListFields(points_path)}
+  if field_name not in flds:
+      raise ValueError(f"字段不存在: {field_name}；可用: {sorted(flds)}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  if method == "IDW":
+      out = arcpy.sa.Idw(points_path, field_name, cell_size, power)
+  elif method == "KRIGING":
+      out = arcpy.sa.Kriging(points_path, field_name, "Spherical", cell_size)
+  elif method == "SPLINE":
+      out = arcpy.sa.Spline(points_path, field_name, cell_size, "REGULARIZED")
+  else:
+      raise ValueError(f"method 只支持 IDW/KRIGING/SPLINE，收到 {method}")
+  out.save(output_path)
+
+  vals = []
+  with arcpy.da.SearchCursor(points_path, [field_name]) as cur:
+      for (v,) in cur:
+          if v is not None:
+              vals.append(float(v))
+  r = arcpy.Raster(output_path)
+  in_min, in_max = (min(vals), max(vals)) if vals else (None, None)
+  set_result({"output": output_path, "method": method, "cell_size": r.meanCellWidth,
+              "raster_min": r.minimum, "raster_max": r.maximum,
+              "input_min": in_min, "input_max": in_max})
+  print(f"{method} done: raster range={r.minimum}~{r.maximum}, input range={in_min}~{in_max}")
+validation:
+  - type: raster_exists
+    path: "{{output_path}}"
+  - type: raster_not_constant
+    path: "{{output_path}}"
+pitfalls:
+  - 插值面范围常超出实测值域（外推失真）；交付前比对栅格最值与输入最值并说明。
+  - 地理坐标系下距离单位是度，IDW/克里金结果无意义。
+  - 点数太少（<10）时插值面不可信，应说明样本量。
+examples:
+  - "用监测点插值生成 PM2.5 连续面"
+  - "由雨量站插值生成降雨面"

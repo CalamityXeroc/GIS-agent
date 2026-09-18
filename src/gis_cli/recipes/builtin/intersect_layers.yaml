@@ -1,0 +1,84 @@
+id: intersect_layers
+name: 相交（Intersect）
+description: 求两（多）个图层的几何交集，并保留双方属性。用于"两个条件的共同区域"，如"社区内的绿地""候选范围内的建筑"。
+domain: overlay
+category: overlay
+triggers: [相交, intersect, 交集, 重叠部分, 共同区域, 叠加分析]
+preconditions:
+  - 各图层坐标系一致
+params:
+  input_path:
+    type: string
+    required: true
+    description: 第一个图层（如绿地）
+  overlay_path:
+    type: string
+    required: true
+    description: 第二个图层（如社区面）
+  output_path:
+    type: string
+    required: true
+    description: 输出图层
+  join_attributes:
+    type: string
+    default: "ALL"
+    description: 属性保留方式，ALL/NO_FID/ONLY_FID
+steps:
+  - 校验存在与坐标系
+  - Intersect
+  - 返回要素数与双方字段
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  overlay_path = {{overlay_path}}
+  output_path = {{output_path}}
+  join_attributes = {{join_attributes}}
+
+  for p in (input_path, overlay_path):
+      if not arcpy.Exists(p):
+          raise ValueError(f"输入不存在: {p}")
+  sr1 = arcpy.Describe(input_path).spatialReference.name
+  sr2 = arcpy.Describe(overlay_path).spatialReference.name
+  if sr1 != sr2:
+      raise ValueError(f"坐标系不一致（{sr1} vs {sr2}），请先统一投影")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.analysis.Intersect([input_path, overlay_path], output_path, join_attributes, None, "INPUT")
+  count = int(arcpy.management.GetCount(output_path)[0])
+  if count == 0:
+      raise ValueError("相交结果为空：两图层没有重叠区域，或坐标系不一致")
+  fields = [f.name for f in arcpy.ListFields(output_path) if f.type not in ("Geometry", "OID")]
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "fields": fields,
+      "input_count": int(arcpy.management.GetCount(input_path)[0]),
+      "overlay_count": int(arcpy.management.GetCount(overlay_path)[0]),
+  })
+  print(f"Intersect done: {count} features; fields={len(fields)}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: extent_within_reference
+    path: "{{output_path}}"
+    reference: "{{overlay_path}}"
+pitfalls:
+  - 相交会把重叠处拆分成更多要素，要素数通常多于输入任意一方。
+  - join_attributes="ALL" 时字段会变多，同名字段会加后缀（如 name、name_1），后续取值前先 ListFields 确认。
+  - 面积类计算必须用投影坐标系；WGS84 下求面积得到的是平方度，没有意义。
+examples:
+  - "绿地与社区相交，得到每个社区内的绿地斑块"
+  - "候选区内的建筑物"
