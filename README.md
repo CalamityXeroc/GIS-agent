@@ -169,7 +169,7 @@ gis-agent --help       # 全部命令
 | `similarity_ranking` | 多指标标准化求最相似单元（写 JSON 结果） |
 | `zonal_statistics` | 分区统计栅格（均值/总和等） |
 | `buffer_dissolve` | 缓冲区与融合 |
-| `graduated_colors_map` | 从零建工程→分级设色→四要素→导出 JPG/PDF |
+| `graduated_colors_map` | 从零建工程→分级设色→四要素→导出 JPG/PDF，并保存同名可编辑 **.aprx 工程**（样式与布局已落盘） |
 
 **自定义配方**：把 YAML 放进 `workspace/recipes/`，格式与内置配方一致（`id/name/params/code_template/validation`），启动时自动合并加载。配方模板中 `{{param}}` 会替换为 Python 字面量、`@@param@@` 替换为原文。
 
@@ -187,6 +187,10 @@ workspace/
     ├── backups/      破坏性操作前的自动备份
     └── kernels/      ArcPy 持久内核运行时
 ```
+
+**制图任务的交付物**：除了导出的图片，制图配方还会保存**同名 `.aprx` 工程文件**（与图片同目录），其中已包含分级设色、图层、布局（图名/图例/比例尺/指北针）。你可以直接用 ArcGIS Pro 打开该工程继续微调样式、改标题、重新出图，不必从零重建。
+
+例如 `output/old_pct_map.jpg` 会伴随 `output/old_pct_map.aprx`；把整个 `output/` 目录整体拷走，工程中的数据路径（相对路径）仍然有效。
 
 ## 九、常见问题
 

@@ -1,6 +1,6 @@
 id: graduated_colors_map
 name: 分级设色专题图（含四要素）
-description: 使用已验证的布局代码生成分级设色专题图，自动包含图名、图例、比例尺、指北针，导出 JPG。
+description: 使用已验证的布局代码生成分级设色专题图，自动包含图名、图例、比例尺、指北针，导出 JPG，并保存可继续编辑的 .aprx 工程（样式与布局已落盘）。
 domain: cartography
 triggers: [专题图, 制图, 分级设色, choropleth, 地图, 图例, 指北针, 比例尺]
 preconditions:
@@ -35,10 +35,14 @@ params:
     type: integer
     default: 420
     description: 页面高 mm
+  aprx_path:
+    type: string
+    default: ""
+    description: 工程文件(.aprx)保存路径；空则与输出图同名同目录（output/xx.jpg → output/xx.aprx）
 steps:
   - 调用 build_graduated_colors_code 生成完整布局代码
-  - 执行并导出 JPG
-  - 检查图片非空白
+  - 执行并导出 JPG，同时保存 .aprx 工程（样式/布局已落盘）
+  - 检查图片非空白、工程文件已生成
 code_template: |
   import arcpy
   from gis_cli.arcpy_bridge import build_graduated_colors_code
@@ -62,6 +66,7 @@ code_template: |
       color_ramp_name={{color_ramp_name}},
       page_width={{page_width}},
       page_height={{page_height}},
+      aprx_path={{aprx_path}},
   )
   exec(compile(code, "<graduated_colors_map>", "exec"), globals(), globals())
 validation:
@@ -69,10 +74,13 @@ validation:
     path: "{{output_path}}"
   - type: image_not_blank
     path: "{{output_path}}"
+  - type: result_key_truthy
+    key: "aprx_saved"
 pitfalls:
   - 字段名必须是数据中的真实字段，不能写占位符。
   - 地图框必须绑定数据图层，否则导出空白图。
-  - 导出前确认 aprx/布局存在；无工程时先创建。
+  - 工程(.aprx)必须 aprx.save() 落盘，否则样式/布局只在内存里，用户打开工程看不到分级色。
+  - 默认每张图生成同名 .aprx（不覆盖其他图）；想追加到同一工程时传 aprx_path 指向已有工程（会复制再改，不改动原文件）。
 examples:
   - "用 forest_cov 字段做绿色分级设色专题图"
   - "制作老年人口占比专题图，标题为‘某市老年人口占比’"

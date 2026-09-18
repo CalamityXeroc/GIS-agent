@@ -742,6 +742,7 @@ def build_graduated_colors_code(
     legend_style: str = "",
     scale_bar_style: str = "",
     north_arrow_style: str = "",
+    aprx_path: str = "",
     **kwargs,
 ) -> str:
     """生成分级设色+布局+导出的 ArcPy 代码字符串（可在 execute_code 中直接运行）
@@ -757,6 +758,9 @@ def build_graduated_colors_code(
         legend_style: 图例样式关键词（如"Legend 1"），空=默认
         scale_bar_style: 比例尺样式关键词（如"Scale Bar 1"），空=默认
         north_arrow_style: 指北针样式关键词（如"North Arrow 1"），空=默认
+        aprx_path: 工程文件（.aprx）保存路径；空则与输出图同名同目录，
+                   如 output/old_pct_map.jpg → output/old_pct_map.aprx。
+                   已存在的工程会被复制一份再修改（不会改动原工程）。
     Returns:
         可直接在 ArcPro Python 中执行的代码字符串
     """
@@ -811,32 +815,36 @@ SB_B = NL_B + _gap
 SB_L = SB_R - _sb_w
 SB_T = SB_B + _sb_h
 
-# 自动查找 aprx（从数据文件所在目录向上浅层搜索，避免误拿无关/陈旧工程）
+# 目标工程文件：默认与导出图同名（同目录），也可由调用方指定
 import glob
 import shutil as _shutil
-_input_dir = os.path.dirname(r"{input_path}")
-_search_roots = []
-_p = _input_dir
-for _ in range(4):  # 向上搜 4 层
-    _search_roots.append(_p)
-    _p = os.path.dirname(_p)
-_aprx_files = []
-for _r in _search_roots:
-    _aprx_files.extend(glob.glob(os.path.join(_r, "*.aprx")))
-    _aprx_files.extend(glob.glob(os.path.join(_r, "*", "*.aprx")))
-_aprx_files = [p for p in _aprx_files if os.path.exists(p)]
+_out_dir = os.path.dirname(os.path.abspath(r"{output_path}")) or "."
+os.makedirs(_out_dir, exist_ok=True)
+_aprx_target = r"{aprx_path}".strip()
+if not _aprx_target:
+    _aprx_target = os.path.join(
+        _out_dir, os.path.splitext(os.path.basename(r"{output_path}"))[0] + ".aprx"
+    )
+_aprx_target = os.path.abspath(_aprx_target)
 
+# 基座工程：指定且存在的工程 → 复制一份再改（绝不改动原工程）；否则用 ArcGIS 空白模板
+_base = _aprx_target if os.path.exists(_aprx_target) else None
+if _base is not None:
+    _tmp_swap = _aprx_target + ".base"
+    _shutil.copy2(_base, _tmp_swap)
+    os.remove(_aprx_target)
+    _base = _tmp_swap
 aprx = None
-prj = _aprx_files[0] if _aprx_files else None
-if prj is not None:
+if _base is not None:
     try:
-        aprx = mp.ArcGISProject(prj)
+        _shutil.copy2(_base, _aprx_target)
+        aprx = mp.ArcGISProject(_aprx_target)
+        print(f"复用已有工程副本: {{_base}} -> {{_aprx_target}}")
     except Exception as _exc:
-        print(f"现有工程无法打开({{_exc}})，改用空白模板")
+        print(f"现有工程无法复用({{_exc}})，改用空白模板")
         aprx = None
 
 if aprx is None:
-    # 没有可用工程：复制 ArcGIS 自带空白模板，从零建工程
     _install = ""
     try:
         _install = arcpy.GetInstallInfo().get("InstallDir", "") or ""
@@ -853,12 +861,9 @@ if aprx is None:
             _tmpl = _found[0] if _found else None
     if _tmpl is None:
         raise RuntimeError("未找到 .aprx 项目文件，且未找到 ArcGIS 空白模板 Blank.aprx")
-    _out_dir = os.path.dirname(r"{output_path}") or "."
-    os.makedirs(_out_dir, exist_ok=True)
-    prj = os.path.join(_out_dir, "map_project.aprx")
-    _shutil.copy2(_tmpl, prj)
-    print(f"使用空白模板创建工程: {{prj}}")
-    aprx = mp.ArcGISProject(prj)
+    _shutil.copy2(_tmpl, _aprx_target)
+    print(f"使用空白模板创建工程: {{_aprx_target}}")
+    aprx = mp.ArcGISProject(_aprx_target)
 m = aprx.listMaps()[0]
 # 清除地图中已有图层（避免旧数据干扰）
 for _old_lyr in list(m.listLayers()):
@@ -1093,9 +1098,27 @@ layout.createMapSurroundElement(arcpy.Polygon(arcpy.Array([
     arcpy.Point(SB_L, SB_B),
 ])), "SCALE_BAR", mf, sb_style_item)
 
+# 地图与布局命名（便于在 ArcGIS Pro 中识别）
+_bad_chars = '\\/:*?"<>|'
+_safe_name = "".join(("_" if _c in _bad_chars else _c) for _c in "{_title}").strip() or "{field_name} 专题图"
+try:
+    m.name = _safe_name[:50]
+except Exception:
+    pass
+try:
+    layout.name = _safe_name[:50]
+except Exception:
+    pass
+
 # 导出（自动处理后缀）
 import os.path as _osp
 _out = r"{output_path}"
+# 先落盘工程：样式与布局必须保存，用户才能用 ArcGIS Pro 打开继续修改
+aprx.save()
+if not _osp.exists(_aprx_target):
+    raise RuntimeError(f"工程保存失败: {{_aprx_target}}")
+_aprx_size = _osp.getsize(_aprx_target)
+print(f"APRX 工程已保存: {{_aprx_target}} ({{_aprx_size}} bytes)")
 # 确保输出路径以 .jpg 结尾（arcpy 可能追加 .jpg）
 _out_base, _out_ext = _osp.splitext(_out)
 if _out_ext.lower() not in (".jpg", ".jpeg"):
@@ -1115,11 +1138,14 @@ if _found:
         if _osp.exists(_pdf):
             sz2 = _osp.getsize(_pdf)
             print(f"PDF导出成功: {{_pdf}} ({{sz2}} bytes)")
-            set_result({{"output": _pdf, "size": sz2, "success": True, "jpg_also": _actual}})
+            set_result({{"output": _pdf, "size": sz2, "success": True, "jpg_also": _actual,
+                        "aprx": _aprx_target, "aprx_size": _aprx_size, "aprx_saved": True}})
         else:
-            set_result({{"output": _actual, "size": sz, "success": True, "note": "PDF导出失败，返回JPG"}})
+            set_result({{"output": _actual, "size": sz, "success": True, "note": "PDF导出失败，返回JPG",
+                        "aprx": _aprx_target, "aprx_size": _aprx_size, "aprx_saved": True}})
     else:
-        set_result({{"output": _actual, "size": sz, "success": True}})
+        set_result({{"output": _actual, "size": sz, "success": True,
+                    "aprx": _aprx_target, "aprx_size": _aprx_size, "aprx_saved": True}})
 else:
     raise RuntimeError(f"JPG 文件未生成，尝试路径: {{_out_candidates}}")
 '''

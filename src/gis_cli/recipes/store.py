@@ -263,6 +263,17 @@ class RecipeLibrary:
         if kind == "code_ok":
             ok = bool(getattr(result, "ok", False))
             return ValidationResult(kind, target, ok, "")
+        if kind == "result_key_truthy":
+            key = str(raw.get("key", "") or "")
+            payload = getattr(result, "result", None)
+            value = payload.get(key) if isinstance(payload, dict) else None
+            return ValidationResult(kind, target, bool(value), f"{key}={value!r}")
+        if kind == "result_file_exists":
+            key = str(raw.get("key", "") or "output")
+            payload = getattr(result, "result", None)
+            raw_path = payload.get(key) if isinstance(payload, dict) else None
+            exists = bool(raw_path) and Path(str(raw_path)).exists()
+            return ValidationResult(kind, target, exists, f"{key}={raw_path}")
         return ValidationResult(kind, target, True, "未知断言类型，已跳过")
 
     def _field_values(self, path: str, field: str, *, allowed_set: set[str]) -> tuple[set | None, set]:
