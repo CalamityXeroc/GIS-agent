@@ -731,146 +731,9 @@ def project_layer(
     return run_arcpy_code(code, timeout_seconds=300)
 
 
-def build_graduated_colors_code(
-    input_path: str,
-    field_name: str,
-    output_path: str,
-    page_width: int = 297,
-    page_height: int = 420,
-    title: str = "",
-    color_ramp_name: str = "",
-    legend_style: str = "",
-    scale_bar_style: str = "",
-    north_arrow_style: str = "",
-    aprx_path: str = "",
-    **kwargs,
-) -> str:
-    """生成分级设色+布局+导出的 ArcPy 代码字符串（可在 execute_code 中直接运行）
-
-    Args:
-        input_path: 输入要素类路径
-        field_name: 分级字段名
-        output_path: 输出 JPG 路径
-        page_width: 页面宽度 mm（A3=297, A4竖版=210）
-        page_height: 页面高度 mm（A3=420, A4竖版=297）
-        title: 地图标题（空字符串时自动根据 field_name 生成）
-        color_ramp_name: 色带名称（如 YlOrRd），空字符串时使用默认
-        legend_style: 图例样式关键词（如"Legend 1"），空=默认
-        scale_bar_style: 比例尺样式关键词（如"Scale Bar 1"），空=默认
-        north_arrow_style: 指北针样式关键词（如"North Arrow 1"），空=默认
-        aprx_path: 工程文件（.aprx）保存路径；空则与输出图同名同目录，
-                   如 output/old_pct_map.jpg → output/old_pct_map.aprx。
-                   已存在的工程会被复制一份再修改（不会改动原工程）。
-    Returns:
-        可直接在 ArcPro Python 中执行的代码字符串
-    """
-    _title = (title or "").strip()
-    if not _title:
-        _title = f"{{field_name}} 分级图"
-    code = f'''
-from arcpy import mp, cim
-import arcpy
-import os
-
-# 数据范围 → 自动选择纸张
-_desc = arcpy.Describe(r"{input_path}")
-_ext = _desc.extent
-_asp = _ext.width / _ext.height
-if _asp > 1.2:
-    PAGE_W, PAGE_H = 420, 297  # A3 横版
-elif _asp < 0.8:
-    PAGE_W, PAGE_H = 210, 297  # A4 竖版
-else:
-    PAGE_W, PAGE_H = 297, 420  # A3 横版
-
-# 要素数量 → 自适应图例大小
-_fc = int(arcpy.management.GetCount(r"{input_path}").getOutput(0))
-_mar = int(PAGE_W * 0.04)              # 图廓边距 4%
-_lg_h = 35 if _fc > 50 else 45         # 要素多→图例小
-_lg_w = 90 if _fc > 50 else 110        # 要素多→图例窄
-_sb_h = 20
-_sb_w = 100
-_title_h = 14                           # 图名高度
-_gap = 5                                # 元素间距
-
-# 各元素位置（全在图廓内，百分比计算）
-NL_L, NL_B = _mar, _mar
-NL_R, NL_T = PAGE_W - _mar, PAGE_H - _mar
-
-MF_L = NL_L + _gap
-MF_R = NL_R - _gap
-MF_B = NL_B + _lg_h + _gap * 3          # 底部留图例空间
-MF_T = NL_T - _title_h - _gap * 4       # 顶部留图名空间
-
-NA_X = MF_R - 15
-NA_Y = MF_T - 15
-
-LG_L = NL_L + _gap
-LG_B = NL_B + _gap
-LG_R = LG_L + _lg_w
-LG_T = LG_B + _lg_h
-
-SB_R = NL_R - _gap
-SB_B = NL_B + _gap
-SB_L = SB_R - _sb_w
-SB_T = SB_B + _sb_h
-
-# 目标工程文件：默认与导出图同名（同目录），也可由调用方指定
-import glob
-import shutil as _shutil
-_out_dir = os.path.dirname(os.path.abspath(r"{output_path}")) or "."
-os.makedirs(_out_dir, exist_ok=True)
-_aprx_target = r"{aprx_path}".strip()
-if not _aprx_target:
-    _aprx_target = os.path.join(
-        _out_dir, os.path.splitext(os.path.basename(r"{output_path}"))[0] + ".aprx"
-    )
-_aprx_target = os.path.abspath(_aprx_target)
-
-# 基座工程：指定且存在的工程 → 复制一份再改（绝不改动原工程）；否则用 ArcGIS 空白模板
-_base = _aprx_target if os.path.exists(_aprx_target) else None
-if _base is not None:
-    _tmp_swap = _aprx_target + ".base"
-    _shutil.copy2(_base, _tmp_swap)
-    os.remove(_aprx_target)
-    _base = _tmp_swap
-aprx = None
-if _base is not None:
-    try:
-        _shutil.copy2(_base, _aprx_target)
-        aprx = mp.ArcGISProject(_aprx_target)
-        print(f"复用已有工程副本: {{_base}} -> {{_aprx_target}}")
-    except Exception as _exc:
-        print(f"现有工程无法复用({{_exc}})，改用空白模板")
-        aprx = None
-
-if aprx is None:
-    _install = ""
-    try:
-        _install = arcpy.GetInstallInfo().get("InstallDir", "") or ""
-    except Exception:
-        _install = ""
-    _tmpl = None
-    if _install:
-        _cand = os.path.join(_install, "Resources", "ArcToolBox", "Services",
-                            "routingservices", "data", "Blank.aprx")
-        if os.path.exists(_cand):
-            _tmpl = _cand
-        else:
-            _found = glob.glob(os.path.join(_install, "Resources", "**", "Blank.aprx"), recursive=True)
-            _tmpl = _found[0] if _found else None
-    if _tmpl is None:
-        raise RuntimeError("未找到 .aprx 项目文件，且未找到 ArcGIS 空白模板 Blank.aprx")
-    _shutil.copy2(_tmpl, _aprx_target)
-    print(f"使用空白模板创建工程: {{_aprx_target}}")
-    aprx = mp.ArcGISProject(_aprx_target)
-m = aprx.listMaps()[0]
-# 清除地图中已有图层（避免旧数据干扰）
-for _old_lyr in list(m.listLayers()):
-    m.removeLayer(_old_lyr)
-
-# 添加数据 + 分级设色
-layer = m.addDataFromPath(r"{input_path}")
+def _graduated_renderer_block(field_name: str, input_path: str, color_ramp_name: str) -> str:
+    """分级设色渲染片段（从大模板抽出，便于与分类设色共用布局/工程逻辑）。"""
+    return f'''
 sym = layer.symbology
 sym.updateRenderer("GraduatedColorsRenderer")
 # 字段名容错：大小写/下划线差异时自动匹配真实字段
@@ -1001,6 +864,210 @@ if _force_hue:
     if _palette and hasattr(sym.renderer, "classBreaks") and sym.renderer.classBreaks:
         for _idx, _cb in enumerate(sym.renderer.classBreaks):
             _cb.symbol.color = _palette[min(_idx, len(_palette) - 1)]
+'''
+
+
+def _unique_renderer_block(field_name: str, input_path: str, category_colors: str, other_color: str,
+                           default_color: str = "") -> str:
+    """唯一值（分类）设色渲染片段：按值显式配色，如「标杆社区:#1F77B4;需整改社区:#2CA02C」。"""
+    return f'''
+sym = layer.symbology
+sym.updateRenderer("UniqueValueRenderer")
+# 字段名容错：大小写/下划线差异时自动匹配真实字段
+_field_name = "{field_name}".strip()
+_all_fields = [f.name for f in arcpy.ListFields(r"{input_path}")]
+if _field_name:
+    _field_norm = _field_name.lower().replace("_", "")
+    for _f in _all_fields:
+        if _f.lower() == _field_name.lower() or _f.lower().replace("_", "") == _field_norm:
+            _field_name = _f
+            break
+if _field_name not in _all_fields:
+    raise ValueError(f"分类字段不存在: {{_field_name}}；可用字段: {{_all_fields}}")
+sym.renderer.fields = [_field_name]
+
+def _hex_to_rgb(_h: str):
+    _h = str(_h).strip().lstrip("#")
+    return [int(_h[0:2], 16), int(_h[2:4], 16), int(_h[4:6], 16), 100]
+
+_color_map = {{}}
+for _item in "{category_colors}".split(";"):
+    if ":" in _item:
+        _k, _v = _item.split(":", 1)
+        _color_map[_k.strip()] = _v.strip()
+_default = "{default_color}".strip() or "{other_color}".strip() or "#D9D9D9"
+_applied = {{}}
+for _grp in sym.renderer.groups:
+    for _cls in _grp.items:
+        _vals = list(_cls.values) if _cls.values else []
+        _key = ""
+        if _vals:
+            _v0 = _vals[0]
+            _key = str(_v0[0]) if isinstance(_v0, (list, tuple)) else str(_v0)
+        _hex = _color_map.get(_key, _default)
+        _cls.symbol.color = {{"RGB": _hex_to_rgb(_hex)}}
+        _cls.label = _key or str(getattr(_cls, "label", ""))
+        _applied[_key] = _hex
+print(f"唯一值配色: {{_applied}}")
+'''
+
+
+def build_graduated_colors_code(
+    input_path: str,
+    field_name: str,
+    output_path: str,
+    page_width: int = 297,
+    page_height: int = 420,
+    title: str = "",
+    color_ramp_name: str = "",
+    legend_style: str = "",
+    scale_bar_style: str = "",
+    north_arrow_style: str = "",
+    aprx_path: str = "",
+    renderer_mode: str = "graduated",
+    category_colors: str = "",
+    other_color: str = "",
+    default_color: str = "",
+    **kwargs,
+) -> str:
+    """生成分级设色+布局+导出的 ArcPy 代码字符串（可在 execute_code 中直接运行）
+
+    Args:
+        input_path: 输入要素类路径
+        field_name: 分级字段名
+        output_path: 输出 JPG 路径
+        page_width: 页面宽度 mm（A3=297, A4竖版=210）
+        page_height: 页面高度 mm（A3=420, A4竖版=297）
+        title: 地图标题（空字符串时自动根据 field_name 生成）
+        color_ramp_name: 色带名称（如 YlOrRd），空字符串时使用默认
+        legend_style: 图例样式关键词（如"Legend 1"），空=默认
+        scale_bar_style: 比例尺样式关键词（如"Scale Bar 1"），空=默认
+        north_arrow_style: 指北针样式关键词（如"North Arrow 1"），空=默认
+        aprx_path: 工程文件（.aprx）保存路径；空则与输出图同名同目录，
+                   如 output/old_pct_map.jpg → output/old_pct_map.aprx。
+                   已存在的工程会被复制一份再修改（不会改动原工程）。
+    Returns:
+        可直接在 ArcPro Python 中执行的代码字符串
+    """
+    _title = (title or "").strip()
+    if not _title:
+        _title = f"{{field_name}} 分类图" if renderer_mode == "unique" else f"{{field_name}} 分级图"
+    if str(renderer_mode).lower() == "unique":
+        _renderer_block = _unique_renderer_block(field_name, input_path, category_colors, other_color, default_color)
+    else:
+        _renderer_block = _graduated_renderer_block(field_name, input_path, color_ramp_name)
+    code = f'''
+from arcpy import mp, cim
+import arcpy
+import os
+
+# 数据范围 → 自动选择纸张
+_desc = arcpy.Describe(r"{input_path}")
+_ext = _desc.extent
+_asp = _ext.width / _ext.height
+if _asp > 1.2:
+    PAGE_W, PAGE_H = 420, 297  # A3 横版
+elif _asp < 0.8:
+    PAGE_W, PAGE_H = 210, 297  # A4 竖版
+else:
+    PAGE_W, PAGE_H = 297, 420  # A3 横版
+
+# 要素数量 → 自适应图例大小
+_fc = int(arcpy.management.GetCount(r"{input_path}").getOutput(0))
+_mar = int(PAGE_W * 0.04)              # 图廓边距 4%
+_lg_h = 35 if _fc > 50 else 45         # 要素多→图例小
+_lg_w = 90 if _fc > 50 else 110        # 要素多→图例窄
+_sb_h = 20
+_sb_w = 100
+_title_h = 14                           # 图名高度
+_gap = 5                                # 元素间距
+
+# 各元素位置（全在图廓内，百分比计算）
+NL_L, NL_B = _mar, _mar
+NL_R, NL_T = PAGE_W - _mar, PAGE_H - _mar
+
+MF_L = NL_L + _gap
+MF_R = NL_R - _gap
+MF_B = NL_B + _lg_h + _gap * 3          # 底部留图例空间
+MF_T = NL_T - _title_h - _gap * 4       # 顶部留图名空间
+
+NA_X = MF_R - 15
+NA_Y = MF_T - 15
+
+LG_L = NL_L + _gap
+LG_B = NL_B + _gap
+LG_R = LG_L + _lg_w
+LG_T = LG_B + _lg_h
+
+SB_R = NL_R - _gap
+SB_B = NL_B + _gap
+SB_L = SB_R - _sb_w
+SB_T = SB_B + _sb_h
+
+# 目标工程文件：默认与导出图同名（同目录），也可由调用方指定
+import glob
+import shutil as _shutil
+_out_dir = os.path.dirname(os.path.abspath(r"{output_path}")) or "."
+os.makedirs(_out_dir, exist_ok=True)
+_aprx_target = r"{aprx_path}".strip()
+if not _aprx_target:
+    _aprx_target = os.path.join(
+        _out_dir, os.path.splitext(os.path.basename(r"{output_path}"))[0] + ".aprx"
+    )
+_aprx_target = os.path.abspath(_aprx_target)
+
+# 基座工程：指定且存在的工程 → 复制一份再改（绝不改动原工程）；否则用 ArcGIS 空白模板
+_base = _aprx_target if os.path.exists(_aprx_target) else None
+if _base is not None:
+    _tmp_swap = _aprx_target + ".base"
+    _shutil.copy2(_base, _tmp_swap)
+    os.remove(_aprx_target)
+    _base = _tmp_swap
+aprx = None
+if _base is not None:
+    try:
+        _shutil.copy2(_base, _aprx_target)
+        aprx = mp.ArcGISProject(_aprx_target)
+        print(f"复用已有工程副本: {{_base}} -> {{_aprx_target}}")
+    except Exception as _exc:
+        print(f"现有工程无法复用({{_exc}})，改用空白模板")
+        aprx = None
+
+if _base is not None and "_tmp_swap" in dir() and os.path.exists(_tmp_swap):
+    # 复用已有工程时会产生临时副本，用完即删（否则留下 .aprx.base）
+    try:
+        os.remove(_tmp_swap)
+    except Exception:
+        pass
+
+if aprx is None:
+    _install = ""
+    try:
+        _install = arcpy.GetInstallInfo().get("InstallDir", "") or ""
+    except Exception:
+        _install = ""
+    _tmpl = None
+    if _install:
+        _cand = os.path.join(_install, "Resources", "ArcToolBox", "Services",
+                            "routingservices", "data", "Blank.aprx")
+        if os.path.exists(_cand):
+            _tmpl = _cand
+        else:
+            _found = glob.glob(os.path.join(_install, "Resources", "**", "Blank.aprx"), recursive=True)
+            _tmpl = _found[0] if _found else None
+    if _tmpl is None:
+        raise RuntimeError("未找到 .aprx 项目文件，且未找到 ArcGIS 空白模板 Blank.aprx")
+    _shutil.copy2(_tmpl, _aprx_target)
+    print(f"使用空白模板创建工程: {{_aprx_target}}")
+    aprx = mp.ArcGISProject(_aprx_target)
+m = aprx.listMaps()[0]
+# 清除地图中已有图层（避免旧数据干扰）
+for _old_lyr in list(m.listLayers()):
+    m.removeLayer(_old_lyr)
+
+# 添加数据 + 分级设色
+layer = m.addDataFromPath(r"{input_path}")
+{_renderer_block}
 layer.symbology = sym
 # 启用标注
 try:
@@ -1099,7 +1166,7 @@ layout.createMapSurroundElement(arcpy.Polygon(arcpy.Array([
 ])), "SCALE_BAR", mf, sb_style_item)
 
 # 地图与布局命名（便于在 ArcGIS Pro 中识别）
-_bad_chars = '\\/:*?"<>|'
+_bad_chars = r'\\/:*?"<>|'
 _safe_name = "".join(("_" if _c in _bad_chars else _c) for _c in "{_title}").strip() or "{field_name} 专题图"
 try:
     m.name = _safe_name[:50]

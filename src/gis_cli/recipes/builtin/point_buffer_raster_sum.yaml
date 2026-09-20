@@ -1,0 +1,126 @@
+id: point_buffer_raster_sum
+name: 点缓冲区栅格求和（圆形缓冲区逐像元解析计算，支持重叠）
+description: >
+  对每个点要素，统计其半径 R 的圆形缓冲区内栅格值之和（如"社区中心 500 米范围内的老年人口"）。
+  圆形缓冲区可以解析判定（像元中心到点的距离 ≤ R），因此逐个点在局部窗口上用 numpy 计算，
+  秒级完成；缓冲区可以任意重叠（这是面转栅格类做法做不到的：一个像元只能归属一个分区）。
+domain: raster
+category: raster
+triggers: [缓冲区统计, 服务人口, 500米范围, 圆形缓冲, 点缓冲, 可达性统计, 服务半径, buffer statistics]
+preconditions:
+  - 点与栅格坐标系一致（同一投影坐标系）
+  - 缓冲半径为投影单位（米）
+params:
+  points_path:
+    type: string
+    required: true
+    description: 点要素（如社区中心点，含唯一标识字段）
+  id_field:
+    type: string
+    required: true
+    description: 点要素的唯一标识字段（会写入输出表）
+  raster_path:
+    type: string
+    required: true
+    description: 数值栅格（如老年人口栅格）
+  radius:
+    type: number
+    required: true
+    description: 缓冲半径（投影单位，米）
+  output_table:
+    type: string
+    required: true
+    description: 输出统计表（GDB 内表：标识字段 / SUM_VALUE / CELL_COUNT）
+  nodata_as_zero:
+    type: boolean
+    default: true
+    description: 栅格 NoData 是否按 0 计
+steps:
+  - 读取栅格为数组并取得格网参数
+  - 逐点在半径窗口内按距离判定求和
+  - 输出统计表并回报合计
+code_template: |
+  import arcpy, os, numpy as np
+  arcpy.env.overwriteOutput = True
+
+  points_path = {{points_path}}
+  id_field = {{id_field}}
+  raster_path = {{raster_path}}
+  radius = float({{radius}})
+  output_table = {{output_table}}
+  nodata_as_zero = bool({{nodata_as_zero}})
+
+  if not arcpy.Exists(points_path) or not arcpy.Exists(raster_path):
+      raise ValueError("点或栅格数据不存在")
+  p_sr = arcpy.Describe(points_path).spatialReference
+  r_sr = arcpy.Describe(raster_path).spatialReference
+  if p_sr.name != r_sr.name:
+      raise ValueError(f"坐标系不一致: points={p_sr.name}, raster={r_sr.name}，请先投影")
+
+  out_folder = os.path.dirname(output_table)
+  if not str(out_folder).lower().endswith(".gdb") or not arcpy.Exists(out_folder):
+      raise ValueError("输出必须是已存在的文件地理数据库内的表")
+
+  desc = arcpy.Describe(raster_path)
+  ext = desc.extent
+  ncols, nrows = int(desc.width), int(desc.height)
+  cellw = (ext.XMax - ext.XMin) / ncols
+  cellh = (ext.YMax - ext.YMin) / nrows
+  arr = arcpy.RasterToNumPyArray(
+      raster_path, lower_left_corner=ext.lowerLeft, ncols=ncols, nrows=nrows,
+      nodata_to_value=(0.0 if nodata_as_zero else np.nan),
+  ).astype("float64")
+  x0, y0 = ext.XMin, ext.YMax  # 数组(0,0) 像元中心基准：左上角
+
+  r2 = radius * radius
+  out_rows = []
+  for pid, shp in arcpy.da.SearchCursor(points_path, [id_field, "SHAPE@XY"]):
+      if shp is None:
+          continue
+      px, py = float(shp[0]), float(shp[1])
+      c0 = max(0, int(np.floor((px - radius - x0) / cellw)))
+      c1 = min(ncols, int(np.ceil((px + radius - x0) / cellw)))
+      r0 = max(0, int(np.floor((y0 - (py + radius)) / cellh)))
+      r1 = min(nrows, int(np.ceil((y0 - (py - radius)) / cellh)))
+      if c1 <= c0 or r1 <= r0:
+          out_rows.append((pid, 0.0, 0))
+          continue
+      window = arr[r0:r1, c0:c1]
+      xs = x0 + (np.arange(c0, c1) + 0.5) * cellw
+      ys = y0 - (np.arange(r0, r1) + 0.5) * cellh
+      inside = ((xs[None, :] - px) ** 2 + (ys[:, None] - py) ** 2) <= r2
+      vals = window[inside]
+      if nodata_as_zero:
+          total = float(np.nansum(vals))
+      else:
+          total = float(np.nansum(vals[np.isfinite(vals)]))
+      out_rows.append((pid, total, int(inside.sum())))
+
+  if arcpy.Exists(output_table):
+      arcpy.management.Delete(output_table)
+  arcpy.management.CreateTable(out_folder, os.path.basename(output_table))
+  arcpy.management.AddField(output_table, id_field, "LONG")
+  arcpy.management.AddField(output_table, "SUM_VALUE", "DOUBLE")
+  arcpy.management.AddField(output_table, "CELL_COUNT", "LONG")
+  with arcpy.da.InsertCursor(output_table, [id_field, "SUM_VALUE", "CELL_COUNT"]) as cur:
+      for pid, total, cnt in out_rows:
+          cur.insertRow([int(round(float(pid))), float(total), int(cnt)])
+
+  grand = float(sum(r[1] for r in out_rows))
+  nonzero = sum(1 for r in out_rows if r[1] > 0)
+  set_result({"output": output_table, "point_count": len(out_rows), "total_value": grand,
+              "radius": radius, "points_with_data": nonzero})
+  print(f"point_buffer_raster_sum: {len(out_rows)} points, total={grand:,.2f}, nonzero={nonzero}")
+validation:
+  - type: vector_exists
+    path: "{{output_table}}"
+  - type: feature_count_gt
+    path: "{{output_table}}"
+    value: 0
+pitfalls:
+  - 缓冲区相互重叠时必须用本配方：面转栅格类做法一个像元只能属于一个分区，重叠区会丢数。
+  - 半径用投影单位（米）；地理坐标系下会按度算，结果错误。
+  - 结果语义 = 像元中心落在圆内即计入，与分区统计口径一致。
+examples:
+  - "社区中心 500 米内的老年人口（绿地服务人口）"
+  - "每个加油站 2 公里范围内的车流量合计"

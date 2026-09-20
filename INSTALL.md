@@ -129,3 +129,21 @@ gis-agent skills
 
 **7. 想扩展能力**
 在 `workspace/recipes/` 新增 YAML 配方（参考 `src/gis_cli/recipes/builtin/` 中的写法：`params` 声明参数、`code_template` 写代码、`validation` 写断言），启动时自动加载合并。
+
+---
+
+## 制图功能的额外依赖与注意事项
+
+自动版式出图（导出图上的标题与图例渲染、版面体检）与“出图前提示 ArcGIS Pro 是否在运行”需要：
+
+```bash
+"E:\ArcGISPro3.6\bin\Python\envs\arcgispro-py3\python.exe" -m pip install Pillow psutil
+```
+
+- **Pillow**：导出图上的标题/图例叠加、版面体检（缺失时会自动跳过这些增强，不影响出图与工程保存）
+- **psutil**：出图前检测 ArcGIS Pro 是否在运行（缺失时只是不做提醒）
+
+⚠️ **出图前请完全退出 ArcGIS Pro**：Pro 与本项目的 ArcPy 调用会互相干扰，可能导致 Pro 弹出严重错误甚至崩溃。
+
+出图配方还支持“设计先行”：先用工具 `map_design` 看设计说明（纸张/图名/图例/比例尺/指北针 + 理由），
+再出图；交付后用 `check_map_project`（或 `scripts/inspect_map_layout.py`）核验版面。

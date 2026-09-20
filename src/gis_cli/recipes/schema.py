@@ -52,6 +52,7 @@ class Recipe:
     name: str
     description: str = ""
     domain: str = "general"
+    category: str = ""
     triggers: list[str] = field(default_factory=list)
     preconditions: list[str] = field(default_factory=list)
     params: dict[str, RecipeParam] = field(default_factory=dict)
@@ -109,6 +110,7 @@ class Recipe:
             "name": self.name,
             "description": self.description,
             "domain": self.domain,
+            "category": self.category,
             "triggers": self.triggers,
             "preconditions": self.preconditions,
             "params": {k: v.to_dict() for k, v in self.params.items()},
@@ -136,6 +138,7 @@ class Recipe:
             name=str(data.get("name", "") or ""),
             description=str(data.get("description", "") or ""),
             domain=str(data.get("domain", "general") or "general"),
+            category=str(data.get("category", "") or data.get("domain", "general") or "general"),
             triggers=[str(t) for t in (data.get("triggers") or [])],
             preconditions=[str(t) for t in (data.get("preconditions") or [])],
             params=params,

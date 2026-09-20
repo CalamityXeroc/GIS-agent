@@ -30,7 +30,7 @@ params:
   bottom_include_null:
     type: boolean
     default: true
-    description: 空值是否计入后 N 名候选（多数场景：无值=最差，应计入）
+    description: 空值是否当作最差优先入选后 N 名（多数场景：无值=最差，应计入）
   second_field:
     type: string
     default: ""
@@ -91,10 +91,10 @@ code_template: |
   with_vals.sort(key=lambda r: r[1], reverse=True)
 
   top_oids = {r[0] for r in with_vals[:top_n]}
-  # 后 N 名：有值按升序；空值是否并入选候选
+  # 后 N 名：空值＝最差（优先入选，可用第二字段在空值内排序），其次是有值中最低的
   if bottom_include_null:
-      candidates = sorted(with_vals, key=lambda r: r[1]) + sorted(
-          nulls, key=lambda r: (r[2] if r[2] is not None else 0), reverse=True)
+      candidates = sorted(nulls, key=lambda r: (r[2] if r[2] is not None else 0), reverse=True) + sorted(
+          with_vals, key=lambda r: r[1])
   else:
       candidates = sorted(with_vals, key=lambda r: r[1])
   bottom_oids = {r[0] for r in candidates[:bottom_n]}
@@ -131,6 +131,9 @@ validation:
     field: "BOTTOM_FLAG"
     value: 0
 pitfalls:
+  - 后 N 名的语义：bottom_include_null=true 时空值视为最差、优先占用名额，剩余名额才由最低值补齐；
+    空值内部可用 second_field 排序（如按老年人口降序＝整改迫切性）。
+  - 前 N 名只从有值记录里取（空值不参与）。
   - 空值不参与排名，但在"最差 N 名"场景通常应计入后 N 名（无绿地=最需要整改），必须显式选择并在报告里说明。
   - 含空值要素的 RANK 为 NULL——这是有意的，不要用 0 或平均值填充。
   - 前后 N 名可能重叠（总数少于 2N 时），要在结果里给出 overlap。

@@ -31,7 +31,7 @@ steps:
   - ZonalStatisticsAsTable
   - 返回统计记录数
 code_template: |
-  import arcpy
+  import arcpy, os
   arcpy.env.overwriteOutput = True
 
   zone_path = {{zone_path}}
@@ -52,16 +52,64 @@ code_template: |
       arcpy.management.Delete(output_table)
 
   zone = zone_field if zone_field else "OBJECTID"
+  # ZonalStatisticsAsTable 要求分区字段为整型；浮点/文本（如 BSM=Double）会报参数无效。
+  # 这里自动建一个整型副本并用它统计，事后把输出表的字段名改回原名，下游 join 无需改代码。
+  cast_note = ""
+  zone_source, zone_used = zone_path, zone
+  ftype = None
+  for f in arcpy.ListFields(zone_path):
+      if f.name.upper() == str(zone).upper():
+          ftype = f.type
+          break
+  if ftype not in (None, "Short", "SmallInteger", "Long", "Integer", "OID"):
+      out_folder = os.path.dirname(output_table)
+      if str(out_folder).lower().endswith(".gdb") and arcpy.Exists(out_folder):
+          tmp = os.path.join(out_folder, "zz_zone_int_tmp")
+      else:
+          tmp = r"in_memory\zone_int_tmp"
+      if arcpy.Exists(tmp):
+          arcpy.management.Delete(tmp)
+      # 先把原值读进内存，再删字段、用同名整型字段重建，保证统计表的分区字段名不变
+      values = {}
+      with arcpy.da.SearchCursor(zone_path, ["OID@", zone]) as cur:
+          for oid, val in cur:
+              values[oid] = None if val is None else int(round(float(val)))
+      kept = sum(1 for val in values.values() if val is not None)
+      arcpy.management.CopyFeatures(zone_path, tmp)
+      arcpy.management.DeleteField(tmp, zone)
+      arcpy.management.AddField(tmp, zone, "LONG")
+      with arcpy.da.UpdateCursor(tmp, ["OID@", zone]) as cur:
+          for oid, _ in cur:
+              val = values.get(oid)
+              if val is None:
+                  cur.deleteRow()
+                  continue
+              cur.updateRow([oid, val])
+      zone_source = tmp
+      cast_note = f"分区字段 {zone}({ftype}) 非整型，已转同名声整型副本统计（保留 {kept} 条）"
+      print(cast_note)
+
   arcpy.sa.ZonalStatisticsAsTable(
-      in_zone_data=zone_path,
-      zone_field=zone,
+      in_zone_data=zone_source,
+      zone_field=zone_used,
       in_value_raster=raster_path,
       out_table=output_table,
       statistics_type=statistics,
   )
 
+  if zone_used != zone:
+      # 兜底：万一仍有名字差异，把统计表的字段名改回原名（要素类可改；表不支持则忽略）
+      try:
+          arcpy.management.AlterField(output_table, zone_used, zone, zone)
+      except Exception as exc:
+          print(f"AlterField 跳过: {str(exc)[:120]}")
+  if "zz_zone_int_tmp" in str(zone_source) or str(zone_source).startswith("in_memory"):
+      if arcpy.Exists(zone_source):
+          arcpy.management.Delete(zone_source)
+
   count = int(arcpy.management.GetCount(output_table)[0])
-  set_result({"output": output_table, "record_count": count, "statistics": statistics, "zone_field": zone})
+  set_result({"output": output_table, "record_count": count, "statistics": statistics,
+              "zone_field": zone, "casted_from": ftype if cast_note else None})
   print(f"Zonal statistics done: {count} records")
 validation:
   - type: vector_exists
@@ -70,9 +118,11 @@ validation:
     path: "{{output_table}}"
     value: 0
 pitfalls:
+  - 分区字段必须是整型：浮点/文本（如社区 BSM）会被自动转成整型副本后统计（至少需能无损转整数）。
   - 分区字段建议用唯一 ID；用名称可能因重名合并。
   - 栅格有 NoData 时统计结果会受影响。
   - 输出是库内表，不是文件系统路径：判定存在要用 arcpy.Exists（file_exists 断言会误判）。
+  - 很慢：缓冲区（数千个）分区统计 5 米栅格通常要十几分钟，调用时把 timeout_seconds 调到 1800 以上。
 examples:
   - "统计每个行政区的人口栅格总和"
   - "按社区汇总建筑物尺度人口"

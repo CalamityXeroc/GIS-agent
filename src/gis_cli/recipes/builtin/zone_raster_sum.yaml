@@ -1,0 +1,160 @@
+id: zone_raster_sum
+name: 分区求和（栅格化分区 + 逐像元累加，适合大量小分区）
+description: >
+  把分区面转成与数值栅格同格网的整数栅格，再用逐像元累加得到每个分区的栅格值合计。
+  用于"每个社区 500 米缓冲区内的老年人口"这类几千个相互重叠的小分区统计：
+  arcpy 的 ZonalStatisticsAsTable 在这种场景要十几分钟，且在持久内核里可能触发致命崩溃；
+  本配方秒级完成，结果与分区统计语义一致（像元中心落在分区内即计入）。
+domain: raster
+category: raster
+triggers: [分区求和, 缓冲区分区统计, 栅格分区合计, 快速分区统计, bincount, 服务人口, zonal sum]
+preconditions:
+  - 分区与栅格坐标系一致；栅格为连续数值栅格（人口/密度/高程等）
+  - 分区字段能无损失地转成整数（用 ID/编号，不要用名称）
+params:
+  zone_path:
+    type: string
+    required: true
+    description: 分区面要素（如社区 500 米缓冲区）
+  zone_field:
+    type: string
+    required: true
+    description: 分区唯一标识字段（整型，或可无损转整数的数值字段）
+  raster_path:
+    type: string
+    required: true
+    description: 数值栅格（如老年人口栅格）
+  output_table:
+    type: string
+    required: true
+    description: 输出统计表（GDB 内表，字段：分区字段 / SUM_VALUE / CELL_COUNT）
+  nodata_as_zero:
+    type: boolean
+    default: true
+    description: 栅格 NoData 是否按 0 计（人口补缺后通常为 true）
+steps:
+  - 分区字段整型化（必要时）
+  - 面转栅格（与数值栅格同格网、以数值栅格为捕捉栅格）
+  - 逐像元按分区号累加
+  - 输出统计表并回报合计
+code_template: |
+  import arcpy, os, numpy as np
+  arcpy.env.overwriteOutput = True
+
+  zone_path = {{zone_path}}
+  zone_field = {{zone_field}}
+  raster_path = {{raster_path}}
+  output_table = {{output_table}}
+  nodata_as_zero = bool({{nodata_as_zero}})
+
+  if not arcpy.Exists(zone_path) or not arcpy.Exists(raster_path):
+      raise ValueError("分区或栅格数据不存在")
+  zone_sr = arcpy.Describe(zone_path).spatialReference
+  raster_sr = arcpy.Describe(raster_path).spatialReference
+  if zone_sr.name != raster_sr.name:
+      raise ValueError(f"坐标系不一致: zone={zone_sr.name}, raster={raster_sr.name}，请先投影")
+
+  out_folder = os.path.dirname(output_table)
+  if not str(out_folder).lower().endswith(".gdb") or not arcpy.Exists(out_folder):
+      raise ValueError("输出必须是已存在的文件地理数据库内的表")
+
+  # ---- 1) 分区字段整型化（面转栅格要求整型值字段）
+  values = {}
+  with arcpy.da.SearchCursor(zone_path, ["OID@", zone_field]) as cur:
+      for oid, val in cur:
+          values[oid] = None if val is None else int(round(float(val)))
+  kept = sum(1 for v in values.values() if v is not None)
+  if kept == 0:
+      raise ValueError("分区字段全为空，无法统计")
+
+  tmp_zone = os.path.join(out_folder, "zz_zone_int_tmp")
+  if arcpy.Exists(tmp_zone):
+      arcpy.management.Delete(tmp_zone)
+  arcpy.management.CopyFeatures(zone_path, tmp_zone)
+  ftype = [f.type for f in arcpy.ListFields(tmp_zone) if f.name == zone_field][0]
+  if ftype != "Integer":
+      arcpy.management.DeleteField(tmp_zone, zone_field)
+      arcpy.management.AddField(tmp_zone, zone_field, "LONG")
+      with arcpy.da.UpdateCursor(tmp_zone, ["OID@", zone_field]) as cur:
+          for oid, _ in cur:
+              v = values.get(oid)
+              if v is None:
+                  cur.deleteRow()
+                  continue
+              cur.updateRow([oid, v])
+
+  # ---- 2) 面转栅格（与数值栅格同格网：捕捉栅格 + 范围对齐）
+  value_raster = arcpy.Raster(raster_path)
+  cell = value_raster.meanCellWidth
+  desc = arcpy.Describe(raster_path)
+  ext = desc.extent
+  arcpy.env.snapRaster = raster_path
+  arcpy.env.extent = raster_path
+  arcpy.env.outputCoordinateSystem = raster_sr
+  tmp_raster = os.path.join(out_folder, "zz_zone_raster_tmp")
+  if arcpy.Exists(tmp_raster):
+      arcpy.management.Delete(tmp_raster)
+  arcpy.conversion.PolygonToRaster(tmp_zone, zone_field, tmp_raster,
+                                   "MAXIMUM_AREA", "", cell, "DO_NOT_BUILD")
+  ncols, nrows = int(desc.width), int(desc.height)
+  zone_arr = arcpy.RasterToNumPyArray(tmp_raster, lower_left_corner=ext.lowerLeft,
+                                      ncols=ncols, nrows=nrows, nodata_to_value=-1)
+  value_arr = arcpy.RasterToNumPyArray(
+      raster_path, lower_left_corner=ext.lowerLeft, ncols=ncols, nrows=nrows,
+      nodata_to_value=(0.0 if nodata_as_zero else np.nan),
+  )
+  if zone_arr.shape != value_arr.shape:
+      raise ValueError(f"格网不对齐: zone={zone_arr.shape}, value={value_arr.shape}")
+
+  # ---- 3) 逐像元按分区号累加
+  flat_zone = zone_arr.ravel()
+  flat_val = value_arr.ravel().astype("float64")
+  valid = flat_zone > 0
+  ids = flat_zone[valid].astype("int64")
+  vals = flat_val[valid]
+  if not nodata_as_zero:
+      finite = np.isfinite(vals)
+      ids, vals = ids[finite], vals[finite]
+  zone_ids, counts = np.unique(ids, return_counts=True)
+  sums = np.bincount(ids, weights=vals, minlength=int(ids.max()) + 1)[zone_ids]
+
+  # ---- 4) 输出统计表
+  if arcpy.Exists(output_table):
+      arcpy.management.Delete(output_table)
+  arcpy.management.CreateTable(out_folder, os.path.basename(output_table))
+  arcpy.management.AddField(output_table, zone_field, "LONG")
+  arcpy.management.AddField(output_table, "SUM_VALUE", "DOUBLE")
+  arcpy.management.AddField(output_table, "CELL_COUNT", "LONG")
+  with arcpy.da.InsertCursor(output_table, [zone_field, "SUM_VALUE", "CELL_COUNT"]) as cur:
+      for zid, s, c in zip(zone_ids.tolist(), sums.tolist(), counts.tolist()):
+          cur.insertRow([int(zid), float(s), int(c)])
+
+  arcpy.management.Delete(tmp_zone)
+  if arcpy.Exists(tmp_raster):
+      arcpy.management.Delete(tmp_raster)
+
+  total = float(np.nansum(sums))
+  set_result({"output": output_table, "zone_count": int(len(zone_ids)), "total_value": total,
+              "cell_size": float(cell), "zones_with_data": int((counts > 0).sum())})
+  print(f"zone_raster_sum: {len(zone_ids)} zones, total={total:,.2f}, cell={cell}")
+validation:
+  - type: vector_exists
+    path: "{{output_table}}"
+  - type: feature_count_gt
+    path: "{{output_table}}"
+    value: 0
+  - type: field_stats_between
+    path: "{{output_table}}"
+    field: "SUM_VALUE"
+    stat: "sum"
+    value: [1, 100000000000]
+pitfalls:
+  - 本配方适合**互不重叠**的分区（行政区/地块）。分区若有重叠（缓冲区），一个像元只能归属一个分区，
+    重叠区会丢数，必须改用 point_buffer_raster_sum（圆形缓冲区解析计算）。
+  - 分区太多、相互重叠（几千个缓冲区）时，ZonalStatisticsAsTable 要十几分钟，还可能让持久内核致命崩溃；
+    本配方秒级完成，优先用它。
+  - 结果语义 = 像元中心落在分区内即计入，与分区统计一致；分区边界外的像元不计。
+  - 分区字段必须是整型（浮点/文本会自动转成同名整型副本）。
+examples:
+  - "社区 500 米缓冲区内的老年人口合计"
+  - "每个站点 1 公里范围内的像元值总和"

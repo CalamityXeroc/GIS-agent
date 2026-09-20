@@ -41,6 +41,8 @@ class LoopConfig:
 
 _DIAGNOSIS_TOOLS = {"catalog_query", "read_document", "list_recipes"}
 
+_ALLOWED_ROOT = {"input", "output", ".gis_agent", "config", "logs", "README.md"}
+
 
 class AgentLoop:
     """Bounded agent loop with tool calling and code repair."""
@@ -60,6 +62,8 @@ class AgentLoop:
         config: LoopConfig | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         auto_extract_requirements: bool = True,
+        use_error_memory: bool = True,
+        use_project_log: bool = True,
     ):
         self.workspace = Path(workspace)
         self.llm = llm_client
@@ -73,6 +77,12 @@ class AgentLoop:
         self.config = config or LoopConfig()
         self.on_event = on_event
         self.auto_extract_requirements = auto_extract_requirements
+        self.use_error_memory = use_error_memory
+        self.use_project_log = use_project_log
+        self._hints_seen: list[str] = []
+        self._design_notes: list[str] = []
+        self._hygiene_warned: set[str] = set()
+        self._finish_summary: str = ""
         self.codec = AutoCodec(llm_client, protocol=Protocol(self.config.tool_protocol))
         self.repairer = (
             CodeRepairer(
@@ -258,10 +268,13 @@ class AgentLoop:
             observation = self._run_code_with_repair(action)
         else:
             observation = self.registry.execute(action.tool, action.args, self.context)
+            observation = self._enrich_failure(observation)
 
         if observation.artifacts:
             for path in observation.artifacts:
                 self.state.add_artifact(path)
+        self._check_workspace_hygiene(observation)
+        self._collect_design_note(observation)
         self.recorder.record(
             "tool_result",
             {
@@ -274,8 +287,45 @@ class AgentLoop:
         self._emit("tool_result", {"tool": action.tool, "ok": observation.ok, "summary": observation.summary})
         return observation, False
 
+    def _check_workspace_hygiene(self, observation: Observation) -> None:
+        """工作区根目录出现意外项时提醒（Windows 反斜杠转义常造出假目录）。"""
+        try:
+            strays = sorted(
+                p.name
+                for p in self.workspace.iterdir()
+                if p.name not in _ALLOWED_ROOT and not p.name.startswith(".")
+            )
+        except Exception:
+            return
+        fresh = [name for name in strays if name not in self._hygiene_warned]
+        if not fresh:
+            return
+        self._hygiene_warned.update(fresh)
+        note = (
+            "工作区根目录出现预期外的项："
+            + ", ".join(fresh[:5])
+            + "。产出必须写在 output/ 下；这通常是 Windows 路径反斜杠转义错误"
+            "（如 `\"...\\data\\...\"`）导致，请核对路径（用原始字符串或正斜杠）并清理误建目录。"
+        )
+        observation.hint = (observation.hint + "\n" + note) if observation.hint else note
+        self.recorder and self.recorder.record("workspace_hygiene", {"strays": fresh[:8]})
+
+    def _collect_design_note(self, observation: Observation) -> None:
+        """把制图配方回传的"设计说明"记下来，写入项目日志（下次同主题出图可沿用）。"""
+        data = observation.data if isinstance(observation.data, dict) else {}
+        candidates = [data, data.get("result"), data.get("design"), data.get("spec")]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            note = candidate.get("design_note") or candidate.get("summary_note")
+            if note and str(note) not in self._design_notes:
+                self._design_notes.append(str(note)[:400])
+                self.recorder and self.recorder.record("map_design", {"design_note": str(note)[:400]})
+                return
+
     def _run_code_with_repair(self, action: Action) -> Observation:
         observation = self.registry.execute("execute_code", action.args, self.context)
+        observation = self._enrich_failure(observation)
         if observation.ok or self.repairer is None:
             return observation
 
@@ -316,6 +366,7 @@ class AgentLoop:
 
     def _handle_finish(self, action: Action) -> tuple[Observation, bool]:
         observation = self.registry.execute("finish", action.args, self.context)
+        self._finish_summary = str(observation.summary or "")
         verdict = self.verifier.verify(self.state) if self.verifier is not None else {"pass": True, "summary": "未配置验证器"}
         self.recorder.record("verification", verdict)
         self._emit("verification", verdict)
@@ -362,6 +413,37 @@ class AgentLoop:
             return []
 
     # ------------------------------------------------------------- messages
+    # ------------------------------------------------------------ error memory
+    def _enrich_failure(self, observation: Observation) -> Observation:
+        """Append distilled fix suggestions to a failing observation's hint."""
+        if observation.ok or not self.use_error_memory:
+            return observation
+        try:
+            from ..runtime.error_memory import enrich_hint
+
+            error = observation.error or {}
+            text = " ".join(
+                [
+                    str(observation.summary or ""),
+                    str(error.get("type", "")),
+                    str(error.get("message", "")),
+                    str(error.get("traceback", ""))[-2000:],
+                    str(error.get("stderr", ""))[-1500:],
+                ]
+            )
+            enriched = enrich_hint(observation.hint or "", text)
+            if enriched and enriched != (observation.hint or ""):
+                observation.hint = enriched
+                for line in enriched.splitlines():
+                    if line.startswith("[错误记忆/") and line not in self._hints_seen:
+                        self._hints_seen.append(line)
+                self.recorder and self.recorder.record(
+                    "error_memory", {"hint": observation.hint[:600]}
+                )
+        except Exception as exc:  # pragma: no cover - 记忆模块不能影响主流程
+            logger.warning("error memory failed: %s", exc)
+        return observation
+
     def _system_prompt(self) -> str:
         output_dir = self.workspace / "output"
         return (
@@ -382,18 +464,54 @@ class AgentLoop:
             "6. **自检交付**：交付前调用 verify_outputs；确认产物满足需求后再调用 finish。\n"
             "7. **少问多做**：能从数据目录/文档推断的信息不要问用户；只在关键信息确实缺失时用 ask_user。\n"
             "8. **中文输出**：与用户交流、任务清单、方法论说明全部用中文。\n\n"
+            "## 方法论纪律（常驻，违反会导致返工）\n"
+            "- **先看后算**：任何计算前先确认真实字段名/几何类型/坐标系/要素数；名字一律从 catalog_query 或"
+            "`arcpy.ListFields` 拿，禁止凭常识猜（中文名会被 DBF 截断）。\n"
+            "- **坐标系最贵**：距离/面积/密度/缓冲必须先投影到投影坐标系并使用同一坐标系；写代码前打印"
+            "`Describe(路径).spatialReference.factoryCode` 核对，错一次全盘重做。\n"
+            "- **缺失值不编造**：空值/null/NoData 必须如实报告或按方法说明处理（补 0 要写清楚），"
+            "不得静默当成 0、也不得直接丟弃；空值数量写进结论。\n"
+            "- **单位与量纲**：面积 m²/km²、人口 人/万人、比例 0-1/0-100 要统一并写明；换算系数写进说明。\n"
+            "- **数字要守恒**：交付前用独立途径核对总量（如分摊前后合计、分区合计 vs 全体合计），"
+            "差异超 1% 必须查清或如实说明。\n"
+            "- **方法可复现**：结论里写清公式与口径（数据源、筛选条件、统计范围），让第三者能重跑。\n"
+            "- **坑要记下**：踩到的工具/API/数据坑写进 finish 说明，系统会记入项目日志供后续任务使用。\n\n"
             f"## 数据目录摘要\n{self._catalog_digest()}\n\n"
             f"## 需求清单\n{self.state.requirements_digest() or '（由你从用户需求中提炼，并用 update_tasklist 呈现）'}\n\n"
-            f"## 已验证的 GIS 配方\n{self._recipes_digest('')}"
+            f"## 操作目录（可用配方，共 {len(self.recipes.all()) if self.recipes is not None else 0} 个；"
+            "优先用配方，配方不适用再用 execute_code）\n"
+            f"{self._recipe_catalog()}"
         )
 
     def _initial_user_message(self, goal: str, doc_paths: list[str] | None) -> str:
-        text = f"任务目标：\n{goal}\n"
+        text = ""
+        if self.use_project_log:
+            try:
+                from .project_log import digest as _log_digest
+
+                recent = _log_digest(self.workspace)
+                if recent:
+                    text += recent + "\n\n"
+            except Exception as exc:  # pragma: no cover
+                logger.warning("project log digest failed: %s", exc)
+        text += f"任务目标：\n{goal}\n"
         if doc_paths:
             text += "\n相关文档（可先用 read_document 读取）：\n"
             text += "\n".join(f"- {p}" for p in doc_paths)
         text += "\n请开始：先建立任务清单，再逐步执行。"
         return text
+
+    def _recipe_catalog(self) -> str:
+        """紧凑操作目录（不再反复 list_recipes 就能看到全部可用操作）。"""
+        if self.recipes is None:
+            return "（未配置配方库）"
+        try:
+            if hasattr(self.recipes, "catalog_digest"):
+                return self.recipes.catalog_digest()
+            return self._recipes_digest("")
+        except Exception as exc:
+            logger.warning("recipe catalog failed: %s", exc)
+            return self._recipes_digest("")
 
     def _append_assistant(
         self,
@@ -554,7 +672,28 @@ class AgentLoop:
                     "turns": self.state.turn,
                 },
             )
+        if self.use_project_log:
+            self._write_project_log()
         self._emit("run_end", self.state.to_dict())
+
+    def _write_project_log(self) -> None:
+        """把本次运行的事实结论追加到项目日志（确定性，不调用模型）。"""
+        try:
+            from .project_log import record_run
+
+            record_run(
+                self.workspace,
+                goal=self.state.goal,
+                status=self.state.status,
+                turns=self.state.turn,
+                artifacts=self.state.artifacts,
+                summary=self._finish_summary or self.state.error or "",
+                hints=self._hints_seen,
+                design_notes=self._design_notes,
+                run_id=self.state.run_id,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning("project log write failed: %s", exc)
 
     def _continue(self) -> TaskState:
         """Continue an interrupted run with existing messages."""

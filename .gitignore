@@ -45,6 +45,8 @@ arcpy_engine/
 *.aprx
 *.jpg
 *.jpeg
+!docs/images/*.jpg
+!docs/images/*.jpeg
 
 # Logs / temp
 *.log

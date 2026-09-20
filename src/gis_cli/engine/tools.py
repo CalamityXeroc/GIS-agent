@@ -33,6 +33,31 @@ _CODE_MARKER_RECIPES = (
 )
 
 
+def _recipe_soft_hint(ctx: EngineContext, description: str, code: str) -> str:
+    """代码执行成功，但该操作其实有自带断言的配方时，提一句（不阻断）。"""
+    if getattr(ctx, "recipes", None) is None:
+        return ""
+    norm = (code or "").lower().replace(" ", "")
+    markers = (
+        ("analysis.intersect(", "intersect_layers"),
+        ("dissolve(", "dissolve_with_stats"),
+        ("zonalstatisticsastable(", "zonal_statistics"),
+        ("zonalstatistics(", "zonal_statistics_raster"),
+        ("polygontoraster(", "polygon_to_raster"),
+        ("analysis.buffer(", "buffer_dissolve"),
+        ("slope(", "terrain_derivatives"),
+        ("idw(", "interpolate_surface"),
+    )
+    for marker, rid in markers:
+        if marker in norm and ctx.recipes.get(rid) is not None:
+            recipe = ctx.recipes.get(rid)
+            return (
+                f"提示（不阻断）：此操作对应已验证配方「{rid}」（{recipe.name}），"
+                f"配方自带数据断言与踩坑说明；同类操作下次可直接 run_recipe(recipe_id={rid})，更稳。"
+            )
+    return ""
+
+
 def _recipe_hint(ctx: EngineContext, description: str, code: str) -> str:
     """自写代码失败时提示可替代的已验证配方，避免无限修补自写代码。"""
     if getattr(ctx, "recipes", None) is None:
@@ -239,12 +264,14 @@ def build_default_registry() -> EngineToolRegistry:
             for path in artifacts:
                 if ctx.state is not None:
                     ctx.state.add_artifact(path)
+            soft_hint = _recipe_soft_hint(ctx, description, code)
             return Observation(
                 ok=True,
                 summary=summary,
                 data={"stdout": result.stdout[-4000:], "result": result.result},
                 artifacts=artifacts,
                 images=result.display_images[:3],
+                hint=soft_hint,
             )
         error = result.error or {"type": "Unknown", "message": "execution failed"}
         hint = "请根据 traceback 修正代码后重试；优先检查字段名/坐标系/路径是否存在。"
@@ -336,7 +363,12 @@ def build_default_registry() -> EngineToolRegistry:
         params = args.get("params") or {}
         if not isinstance(params, dict):
             return Observation(ok=False, summary="params 必须是对象", error={"type": "BadParams"})
-        return ctx.recipes.run(recipe_id, params, ctx)
+        raw_timeout = args.get("timeout_seconds")
+        try:
+            timeout = float(raw_timeout) if raw_timeout else None
+        except (TypeError, ValueError):
+            timeout = None
+        return ctx.recipes.run(recipe_id, params, ctx, timeout=timeout)
 
     registry.register(
         EngineTool(
@@ -350,6 +382,10 @@ def build_default_registry() -> EngineToolRegistry:
                 "properties": {
                     "recipe_id": {"type": "string", "description": "配方 id"},
                     "params": {"type": "object", "description": "配方参数键值对"},
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "可选：覆盖执行超时秒数（缓冲区分区统计等重活建议 1800 以上）",
+                    },
                 },
                 "required": ["recipe_id", "params"],
             },
@@ -361,7 +397,14 @@ def build_default_registry() -> EngineToolRegistry:
     def _list_recipes(args: dict[str, Any], ctx: EngineContext) -> Observation:
         if ctx.recipes is None:
             return Observation(ok=False, summary="配方库不可用", error={"type": "NoRecipes"})
-        query = str(args.get("query", "") or "")
+        query = str(args.get("query", "") or "").strip()
+        if not query and hasattr(ctx.recipes, "catalog_digest"):
+            # 空查询＝看总目录：避免逐个关键词试探
+            return Observation(
+                ok=True,
+                summary=f"配方总目录（{len(ctx.recipes.all())} 个）",
+                data={"catalog": ctx.recipes.catalog_digest()},
+            )
         items = ctx.recipes.search(query)
         return Observation(
             ok=True,
@@ -372,10 +415,10 @@ def build_default_registry() -> EngineToolRegistry:
     registry.register(
         EngineTool(
             name="list_recipes",
-            description="按关键词检索 GIS 方法论配方，返回配方 id、用途、参数与前置条件。",
+            description="检索配方：给关键词返回配方 id/用途/参数/前置条件；query 留空返回按类别分组的全部配方目录。",
             parameters={
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "关键词，可空表示全部"}},
+                "properties": {"query": {"type": "string", "description": "关键词；留空表示全部"}},
             },
             handler=_list_recipes,
         )
@@ -434,6 +477,135 @@ def build_default_registry() -> EngineToolRegistry:
                 "required": ["question"],
             },
             handler=_ask_user,
+        )
+    )
+
+    # --------------------------------------------------------- map_design
+    def _map_design(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """先出"设计说明"（纸张/图名/图例/比例尺/指北针 + 理由），再照它出图。
+
+        让模型只负责语义选择（主题/用途/介质/是否覆盖），几何与合法性由规则引擎算。
+        """
+        layers: list[Any] = []
+        if isinstance(args.get("layers"), list):
+            layers.extend(args["layers"])
+        if args.get("data_path"):
+            layers.insert(0, str(args["data_path"]))
+        if not layers:
+            return Observation(ok=False, summary="缺少 data_path 或 layers", error={"type": "BadArgs"})
+        try:
+            from ..cartography import design_only
+
+            intent = {
+                key: args[key]
+                for key in (
+                    "theme", "purpose", "medium", "orientation", "legend_labels", "style_profile",
+                    "title", "region", "scale", "map_kind", "field", "legend_title", "color_ramp",
+                )
+                if args.get(key)
+            }
+            if args.get("overrides"):
+                intent["overrides"] = args["overrides"]
+            result = design_only(layers, intent, code_runner=getattr(ctx, "code_runner", None))
+        except Exception as exc:
+            return Observation(ok=False, summary=f"设计失败: {str(exc)[:200]}",
+                               error={"type": type(exc).__name__, "message": str(exc)[:400]})
+        facts = result.get("facts") or {}
+        brief = {
+            "数据长宽比": round(float(facts.get("aspect") or 1.0), 2),
+            "要素数": (facts.get("primary") or {}).get("feature_count"),
+            "推测渲染模式": facts.get("render_mode"),
+            "角区占用": facts.get("corner_usage"),
+        }
+        return Observation(
+            ok=True,
+            summary="设计完成：\n" + str(result.get("summary") or "")[:1500],
+            data={"design": result.get("summary"), "spec": result.get("spec"), "facts_brief": brief,
+                  "design_note": (result.get("spec") or {}).get("design_note", "")},
+        )
+
+    registry.register(
+        EngineTool(
+            name="map_design",
+            description=(
+                "制图设计（不渲染）：根据数据事实与主题，给出纸张朝向、图名格式与字号、图例内容与位置、"
+                "比例尺刻度与单位、指北针样式，并附每个决定的理由。出图前先调用它，可先向用户说明版式选择。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "主数据路径"},
+                    "layers": {"type": "array", "items": {"type": "string"}, "description": "多图层叠加时的图层路径"},
+                    "field": {"type": "string", "description": "分级/分类字段"},
+                    "theme": {"type": "string", "description": "图主题材（如 老年人口/绿地服务价值）"},
+                    "region": {"type": "string", "description": "区域名（如 郑州市）"},
+                    "scale": {"type": "string", "description": "尺度词（如 社区尺度）"},
+                    "purpose": {"type": "string", "description": "用途：分布/评价/规划/对比/汇报"},
+                    "medium": {"type": "string", "description": "介质：print_A4/print_A3/screen_16_9"},
+                    "orientation": {"type": "string", "description": "朝向：auto/portrait/landscape"},
+                    "legend_labels": {"type": "string", "description": "图例标签：semantic/range/both"},
+                    "style_profile": {"type": "string", "description": "风格档位：competition_standard/screen_report/dense_raster"},
+                    "overrides": {"type": "object", "description": "强制覆盖设计（点路径）"},
+                },
+                "required": ["data_path"],
+            },
+            handler=_map_design,
+        )
+    )
+
+    # --------------------------------------------------------- check_map_project
+    def _check_map_project(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """核验地图工程（.aprx）内部的渲染器/配色/布局四要素。
+
+        不要用 execute_code 在内核里 mp.ArcGISProject 打开工程：实测第二次打开会挂死。
+        """
+        aprx_path = str(args.get("aprx_path", "") or "").strip()
+        if not aprx_path:
+            return Observation(ok=False, summary="缺少 aprx_path", error={"type": "BadArgs"})
+        if ctx.recipes is None:
+            return Observation(ok=False, summary="断言引擎不可用", error={"type": "NoRecipes"})
+        raw: dict[str, Any] = {"type": "aprx_map_check", "path": aprx_path}
+        for key in ("renderer", "colors"):
+            if args.get(key):
+                raw[key] = args[key]
+        if args.get("elements"):
+            raw["elements"] = list(args["elements"])
+        result = ctx.recipes.run_assertions([raw])[0]
+        return Observation(
+            ok=bool(result.ok),
+            summary=("工程核验通过：" if result.ok else "工程核验未通过：") + result.detail[:400],
+            data=result.to_dict(),
+            hint="" if result.ok else "按提示修正渲染器/配色/布局后重新出图（用 category_map / graduated_colors_map）。",
+        )
+
+    registry.register(
+        EngineTool(
+            name="check_map_project",
+            description=(
+                "核验 .aprx 地图工程：唯一值/分级渲染器、各类别配色（#RRGGBB）、布局四要素（图名/图例/比例尺/指北针）"
+                "是否都落盘。交付制图成果前用它自检；不要在 execute_code 里用 mp.ArcGISProject 打开工程（会挂死）。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "aprx_path": {"type": "string", "description": "工程文件路径"},
+                    "renderer": {
+                        "type": "string",
+                        "description": "期望渲染器类型（UniqueValueRenderer / GraduatedColorsRenderer），可空",
+                    },
+                    "colors": {
+                        "type": "string",
+                        "description": '期望配色，如 "标杆社区=#1F77B4;需整改社区=#2CA02C"，可空',
+                    },
+                    "elements": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "必须存在的布局要素（图名/图例/比例尺/指北针），可空",
+                    },
+                },
+                "required": ["aprx_path"],
+            },
+            handler=_check_map_project,
         )
     )
 

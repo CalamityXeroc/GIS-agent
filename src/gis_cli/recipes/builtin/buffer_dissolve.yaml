@@ -19,15 +19,14 @@ params:
   dissolve_field:
     type: string
     default: ""
-    description: 融合字段，空则全部融合为一条
+    description: 融合字段；留空则不按字段融合（见 dissolve_type）
   dissolve_type:
     type: string
     default: "ALL"
-    description: ALL 或 LIST
+    description: ALL=全部融合为一条；LIST=按 dissolve_field 融合；NONE=不融合、保留每条要素的所有属性
 steps:
   - 校验投影坐标系
-  - Buffer_analysis
-  - Dissolve_management
+  - Buffer_analysis（按 dissolve_type 决定融合方式）
   - 返回面积与要素数
 code_template: |
   import arcpy
@@ -37,6 +36,7 @@ code_template: |
   output_path = {{output_path}}
   distance = {{distance}}
   dissolve_field = {{dissolve_field}}
+  dissolve_type = str({{dissolve_type}}).strip().upper() or "ALL"
 
   if not arcpy.Exists(input_path):
       raise ValueError(f"输入数据不存在: {input_path}")
@@ -47,15 +47,28 @@ code_template: |
   if arcpy.Exists(output_path):
       arcpy.management.Delete(output_path)
 
-  arcpy.analysis.Buffer(input_path, output_path, distance, dissolve_option="ALL")
+  # 融合方式直接交给 Buffer 的 dissolve_option：
+  #   NONE=保留每条要素（属性不丢，可后续回连）；LIST=按字段融合；ALL=全部合一。
+  if dissolve_type == "NONE" or dissolve_type == "KEEP":
+      option, field = "NONE", ""
+  elif dissolve_field:
+      option, field = "LIST", dissolve_field
+  else:
+      option, field = "ALL", ""
+
+  arcpy.analysis.Buffer(input_path, output_path, distance, dissolve_option=option,
+                        dissolve_field=field or None)
 
   count = int(arcpy.management.GetCount(output_path)[0])
   area = 0.0
   with arcpy.da.SearchCursor(output_path, ["SHAPE@AREA"]) as cur:
       for row in cur:
           area += row[0] or 0.0
-  set_result({"output": output_path, "feature_count": count, "total_area": area, "distance": distance})
-  print(f"Buffer done: {count} features, area={area:.2f}")
+  fields = [f.name for f in arcpy.ListFields(output_path)]
+  set_result({"output": output_path, "feature_count": count, "total_area": area,
+              "distance": distance, "dissolve_option": option,
+              "kept_field": bool(field and field in fields)})
+  print(f"Buffer done: {count} features, area={area:.2f}, option={option}")
 validation:
   - type: vector_exists
     path: "{{output_path}}"
@@ -65,6 +78,9 @@ validation:
 pitfalls:
   - 缓冲距离单位要写清楚（Meters/Kilometers）。
   - 地理坐标系下 Buffer 会用度，结果错误。
+  - 需要把缓冲结果回连到原要素（如按 BSM 统计）时必须用 dissolve_type=NONE，
+    否则融合会丢掉标识字段，后续 join 无键可用。
+  - 只有确实需要连续范围（如服务区总面积）时才用 ALL。
 examples:
   - "医院 1 公里缓冲区"
   - "河流两侧 500 米缓冲并融合"

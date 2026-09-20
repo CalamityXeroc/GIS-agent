@@ -83,9 +83,57 @@ class RecipeLibrary:
         scored.sort(key=lambda item: (-item[0], item[1].id))
         return [recipe.to_dict() for _, recipe in scored[:limit]]
 
+    def catalog_digest(self, *, max_chars: int = 5200) -> str:
+        """紧凑操作目录：按类别分组列出全部配方（id / 用途 / 必填参数）。
+
+        目的是让模型不必反复调用 list_recipes 就能看到全部可选操作。
+        """
+        self.ensure_loaded()
+        groups: dict[str, list[Recipe]] = {}
+        for recipe in self._recipes.values():
+            groups.setdefault(recipe.category or recipe.domain or "general", []).append(recipe)
+        order = sorted(groups, key=lambda key: (-len(groups[key]), key))
+        label = {
+            "raster": "栅格",
+            "overlay": "叠加分析",
+            "geometry": "几何处理",
+            "analysis": "矢量分析",
+            "spatial_analysis": "空间分析",
+            "spatial_statistics": "空间统计",
+            "table": "属性表",
+            "data_management": "数据管理",
+            "projection": "投影与坐标系",
+            "data_quality": "数据质量",
+            "cartography": "制图",
+            "mapping": "制图",
+            "infra": "基础设施",
+        }
+        lines: list[str] = []
+        for key in order:
+            items = sorted(groups[key], key=lambda r: r.id)
+            title = label.get(key, key)
+            lines.append(f"### {title}（{len(items)}）")
+            for recipe in items:
+                required = [
+                    name
+                    for name, spec in recipe.params.items()
+                    if spec.required
+                ]
+                params = ", ".join(required) if required else "—"
+                brief = (recipe.name or recipe.description).strip()
+                brief = brief.split("（")[0].split("(")[0].strip()
+                lines.append(f"- {recipe.id}: {brief} ｜必填: {params}")
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[: max_chars - 40] + "\n…（更多配方用 list_recipes 关键词检索）"
+        return text
+
     # -------------------------------------------------------------------- run
-    def run(self, recipe_id: str, params: dict[str, Any], ctx: Any) -> Any:
-        """Execute a recipe and its validation assertions."""
+    def run(self, recipe_id: str, params: dict[str, Any], ctx: Any, *, timeout: float | None = None) -> Any:
+        """Execute a recipe and its validation assertions.
+
+        ``timeout`` 可覆盖默认执行超时（缓冲区分区统计这类重活常需要 20 分钟以上）。
+        """
         from ..engine.state import Observation
 
         recipe = self.get(recipe_id)
@@ -107,7 +155,12 @@ class RecipeLibrary:
                 error={"type": "RecipeParamError", "message": str(exc)},
             )
 
-        result = runner.run(code, workspace=str(getattr(ctx, "workspace", ".")))
+        default_timeout = float(getattr(ctx, "exec_timeout", 0) or 0)
+        result = runner.run(
+            code,
+            timeout=float(timeout or default_timeout or 600.0),
+            workspace=str(getattr(ctx, "workspace", ".")),
+        )
         if not result.ok:
             return Observation(
                 ok=False,
@@ -229,6 +282,16 @@ class RecipeLibrary:
                 return ValidationResult(kind, target, False, f"非法范围: {expected}")
             ok = count is not None and lo <= count <= hi
             return ValidationResult(kind, target, ok, f"count={count} expected in [{lo},{hi}]")
+        if kind == "field_value_counts":
+            expect = raw.get("value") or {}
+            if not isinstance(expect, dict) or not expect:
+                return ValidationResult(kind, target, False, "value 需要写成 {类别: 数量} 映射")
+            counts, bad = self._field_value_counts(
+                target, str(raw.get("field", "") or ""), {str(k): int(v) for k, v in expect.items()}
+            )
+            ok = counts is not None and not bad
+            detail = f"counts={counts}" if ok else f"不符: {bad}；实际={counts}"
+            return ValidationResult(kind, target, ok, detail)
         if kind == "field_values_subset":
             allowed = expected if isinstance(expected, list) else [expected]
             allowed_set = {str(a) for a in allowed}
@@ -301,6 +364,22 @@ class RecipeLibrary:
             return ValidationResult(kind, target, ok, f"range={info}")
         if kind == "image_not_blank":
             return self._image_check(target)
+        if kind == "aprx_map_check":
+            return self._aprx_map_check(target, raw)
+        if kind == "map_layout_ok":
+            # 版面体检：图名居中/图例不压数据/比例尺整数刻度/元素不越界（制图交付的硬指标）
+            try:
+                from ..cartography import qc as _qc
+
+                verdict = _qc.check_layout(
+                    target,
+                    spec=raw.get("spec") or None,
+                    image_path=str(raw.get("image") or ""),
+                    min_font_pt=float(raw.get("min_font_pt") or 7.0),
+                )
+                return ValidationResult(kind, target, bool(verdict.get("ok")), _qc.summarize(verdict))
+            except Exception as exc:  # pragma: no cover - 依赖 arcpy
+                return ValidationResult(kind, target, False, f"版面体检失败: {str(exc)[:120]}")
         if kind == "code_ok":
             ok = bool(getattr(result, "ok", False))
             return ValidationResult(kind, target, ok, "")
@@ -316,6 +395,34 @@ class RecipeLibrary:
             exists = bool(raw_path) and Path(str(raw_path)).exists()
             return ValidationResult(kind, target, exists, f"{key}={raw_path}")
         return ValidationResult(kind, target, True, "未知断言类型，已跳过")
+
+    def _field_value_counts(
+        self, path: str, field: str, expected: dict[str, int]
+    ) -> tuple[dict[str, int] | None, dict[str, tuple[int, int]]]:
+        """统计字段各取值个数，返回 (实际计数, {取值: (实际, 期望)}) 不符项。"""
+        if not field:
+            return None, {}
+        try:
+            import arcpy  # type: ignore
+
+            if not arcpy.Exists(path):
+                return None, {}
+            fields = {f.name for f in arcpy.ListFields(path)}
+            if field not in fields:
+                return None, {}
+            counts: dict[str, int] = {}
+            with arcpy.da.SearchCursor(path, [field]) as cur:
+                for (value,) in cur:
+                    key = "" if value is None else str(value)
+                    counts[key] = counts.get(key, 0) + 1
+            bad = {
+                key: (counts.get(key, 0), want)
+                for key, want in expected.items()
+                if counts.get(key, 0) != want
+            }
+            return counts, bad
+        except Exception:
+            return None, {}
 
     def _field_values(self, path: str, field: str, *, allowed_set: set[str]) -> tuple[set | None, set]:
         """Read all values of a field via the kernel; return (values, unexpected)."""
@@ -495,14 +602,27 @@ class RecipeLibrary:
             return None
         return record.get("raster_min"), record.get("raster_max")
 
-    def _describe(self, path: str) -> dict[str, Any] | None:
-        """Describe one path via the kernel (best effort).
+    def _describe(self, path: str, *, attempts: int = 2) -> dict[str, Any] | None:
+        """Describe one path via the kernel (best effort)，失败再退到进程内 arcpy。
 
         Uses ``arcpy.Exists`` rather than ``Path.exists`` so GDB feature
         classes/tables (which are not filesystem paths) work too.
+
+        刚被看门狗杀掉内核时，GDB 可能仍被残留进程占着，``arcpy.Exists`` 会瞬时为 False，
+        因此这里重试一次再下结论，避免把已有数据判成"不存在"。
         """
+        record: dict[str, Any] | None = None
+        for index in range(max(1, attempts)):
+            record = self._describe_once(path)
+            if record and record.get("exists"):
+                return record
+            if index + 1 < max(1, attempts):
+                time.sleep(1.0)
+        return record
+
+    def _describe_once(self, path: str) -> dict[str, Any] | None:
         if self.code_runner is None:
-            return None
+            return self._describe_in_process(path)
         code = (
             "import arcpy, json\n"
             f"_p = {path!r}\n"
@@ -532,7 +652,119 @@ class RecipeLibrary:
         outcome = self.code_runner.run(code, timeout=180)
         if outcome.ok and isinstance(outcome.result, dict):
             return outcome.result
-        return None
+        # 内核忙/卡死时不能就此判定“不存在”（那样会误报产出缺失，把 agent 逼去重建数据）。
+        # 退回本进程内直接调 arcpy（断言评估通常在带 arcpy 的主进程里跑）。
+        return self._describe_in_process(path)
+
+    @staticmethod
+    def _describe_in_process(path: str) -> dict[str, Any] | None:
+        """不经内核、在当前进程内用 arcpy 描述数据（内核不可用时的兼容退路）。"""
+        try:
+            import arcpy  # type: ignore
+        except Exception:
+            return None
+        try:
+            record: dict[str, Any] = {"exists": bool(arcpy.Exists(path))}
+            if not record["exists"]:
+                return record
+            desc = arcpy.Describe(path)
+            sr = getattr(desc, "spatialReference", None)
+            record["wkid"] = getattr(sr, "factoryCode", None) if sr else None
+            record["crs_name"] = getattr(sr, "name", "") if sr else ""
+            record["geom_type"] = getattr(desc, "shapeType", "") or ""
+            try:
+                record["feature_count"] = int(arcpy.management.GetCount(path)[0])
+            except Exception:
+                record["feature_count"] = None
+            try:
+                record["fields"] = [f.name for f in arcpy.ListFields(path)]
+            except Exception:
+                record["fields"] = []
+            try:
+                record["raster_min"] = float(arcpy.management.GetRasterProperties(path, "MINIMUM").getOutput(0))
+                record["raster_max"] = float(arcpy.management.GetRasterProperties(path, "MAXIMUM").getOutput(0))
+            except Exception:
+                record["raster_min"] = None
+                record["raster_max"] = None
+            return record
+        except Exception:
+            return None
+
+    def _aprx_map_check(self, path: str, raw: dict[str, Any]) -> ValidationResult:
+        """核验 .aprx 工程：渲染器类型、各类别配色、布局四要素是否都落盘。
+
+        断言参数：
+          renderer: 期望渲染器类型（UniqueValueRenderer / GraduatedColorsRenderer）
+          colors: 期望配色，形如 "标杆社区=#1F77B4;需整改社区=#2CA02C"
+          elements: 必须存在的布局要素（子集：图名/图例/比例尺/指北针）
+        """
+        target = Path(path)
+        if not target.exists():
+            return ValidationResult("aprx_map_check", path, False, "工程文件不存在")
+        try:
+            from arcpy import mp  # type: ignore
+
+            project = mp.ArcGISProject(str(target))
+        except Exception as exc:
+            return ValidationResult("aprx_map_check", path, False, f"无法打开工程: {str(exc)[:120]}")
+
+        problems: list[str] = []
+        want_renderer = str(raw.get("renderer", "") or "")
+        want_colors = _parse_color_expectations(str(raw.get("colors", "") or ""))
+        want_elements = [str(e) for e in (raw.get("elements") or [])]
+
+        found_colors: dict[str, str] = {}
+        renderer_types: list[str] = []
+        for map_obj in project.listMaps():
+            for layer in map_obj.listLayers():
+                if layer.isGroupLayer:
+                    continue
+                try:
+                    renderer = layer.symbology.renderer
+                except Exception:
+                    continue
+                renderer_types.append(type(renderer).__name__)
+                if type(renderer).__name__ == "UniqueValueRenderer":
+                    for group in renderer.groups:
+                        for item in group.items:
+                            vals = list(item.values) if item.values else []
+                            key = ""
+                            if vals:
+                                v0 = vals[0]
+                                key = str(v0[0]) if isinstance(v0, (list, tuple)) else str(v0)
+                            found_colors[key] = _symbol_hex(item.symbol)
+
+        if want_renderer and want_renderer not in renderer_types:
+            problems.append(f"渲染器为 {renderer_types or ['(无图层)']}，期望 {want_renderer}")
+        for key, expected_hex in want_colors.items():
+            actual = found_colors.get(key, "")
+            if actual.upper() != expected_hex.upper():
+                problems.append(f"{key} 配色={actual or '(未找到)'} 期望 {expected_hex}")
+
+        if want_elements:
+            element_names: list[str] = []
+            element_types: list[str] = []
+            for layout in project.listLayouts():
+                for element in layout.listElements():
+                    element_names.append(str(element.name))
+                    element_types.append(str(element.type).upper())
+            joined = " ".join(element_names).lower()
+            surrounds = sum(1 for t in element_types if "MAPSURROUND" in t)
+            checks = {
+                "图名": any("TEXT" in t for t in element_types),
+                "图例": any("LEGEND" in t for t in element_types),
+                "比例尺": ("scale" in joined or "比例尺" in " ".join(element_names)) or surrounds >= 2,
+                "指北针": ("north" in joined or "指北针" in " ".join(element_names)) or surrounds >= 2,
+                "地图框": any("MAPFRAME" in t for t in element_types),
+            }
+            for name in want_elements:
+                if not checks.get(name, False):
+                    problems.append(f"布局缺少「{name}」")
+
+        detail = "；".join(problems[:4])
+        if not problems:
+            detail = f"渲染器={renderer_types[:1]} 配色={found_colors}"
+        return ValidationResult("aprx_map_check", path, not problems, detail)
 
     def _image_check(self, path: str) -> ValidationResult:
         target = Path(path)
@@ -559,6 +791,32 @@ class RecipeLibrary:
         recipe.to_yaml(path)
         self._recipes[recipe.id] = recipe
         return str(path)
+
+
+def _symbol_hex(symbol: Any) -> str:
+    """取符号颜色的 #RRGGBB（ArcGIS 返回 Color 对象或 dict 两种形态）。"""
+    color = getattr(symbol, "color", None)
+    if color is None:
+        return ""
+    rgb = getattr(color, "RGB", None)
+    if rgb is None and isinstance(color, dict):
+        rgb = color.get("RGB")
+    if not rgb:
+        return ""
+    try:
+        return "#{:02X}{:02X}{:02X}".format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    except Exception:
+        return ""
+
+
+def _parse_color_expectations(text: str) -> dict[str, str]:
+    """解析 "值=#RRGGBB;值2=#RRGGBB" 形式的期望配色。"""
+    out: dict[str, str] = {}
+    for chunk in str(text or "").split(";"):
+        if "=" in chunk:
+            key, value = chunk.split("=", 1)
+            out[key.strip()] = value.strip()
+    return out
 
 
 def _resolve(text: str, params: dict[str, Any]) -> str:

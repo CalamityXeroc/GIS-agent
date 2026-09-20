@@ -13,12 +13,32 @@ GIS Agent 是一个面向 **ArcGIS Pro 3.6** 的智能代理：你用中文描�
 - **自然语言驱动**：描述目标即可，不需要记 ArcPy 函数名与参数
 - **有界智能循环**：观察（看真实数据）→ 决策（选方法/配方）→ 执行（写代码跑 ArcPy）→ 校验，循环直到达标
 - **代码自修复**：执行报错时把 traceback 回喂模型自动改代码重试（有次数上限）
-- **方法论配方库**：内置 17 个经过验证的 GIS 配方（投影、拓扑修复、空间连接、邻接统计、汇总到分区、热点分析、普查指标、相似城市、分级设色出图…），直接调用即可，避免重复踩坑
+- **方法论配方库**：内置 44 个经过验证的 GIS 配方（投影、拓扑修复、空间连接、邻接统计、汇总到分区、热点分析、普查指标、相似城市、叠加分析、几何处理、栅格分析、属性表、制图…），直接调用即可，避免重复踩坑
+- **制图设计引擎**：出图不再写死尺寸——先采集数据事实（范围长宽比、字段分布、九宫格占用度），再由规则引擎自动决定**纸张朝向、图名格式与字号、图例内容与位置、比例尺整数刻度与单位、指北针样式**，渲染后自动做**版面体检**并微调重渲；每张图都交付可编辑 `.aprx` 工程
 - **数据目录感知**：自动扫描工作区数据（路径、几何类型、坐标系、要素数、字段名与样本），模型基于真实 schema 写代码而不是猜字段
+- **错误记忆**：把实测踩到的 ArcPy 故障模式（如 `SelectLayerByAttribute` 在内核挂死、分区字段必须整型、路径反斜杠转义）固化成“错误 → 修复建议”，失败时自动附给模型
+- **操作目录常驻**：全部配方按类别分组写进系统提示词，模型一眼看得到可用操作，不必反复试探
+- **项目日志**：每次运行把事实结论（产物、关键数字、口径、踩过的坑、制图设计）追写到 `workspace/.gis_agent/PROJECT_LOG.md`，下一次运行自动读回，链式任务能接着做
 - **交付前验收**：结构化断言 + 语义检查双层验收，不通过不算完成
 - **安全护栏**：破坏性操作（删除/覆盖）执行前自动备份到 `.gis_agent/backups/`
 - **全程可追溯**：每次运行写 JSONL + Markdown 报告到 `.gis_agent/traces/`，能看到每一步的决策与产出
-- **稳定兜底**：ArcPy 持久内核执行（快）＋ 子进程兜底（稳）；内核卡死自动中断→硬杀→重启；网关限流自动退避
+- **稳定兜底**：ArcPy 持久内核执行（快）＋ 子进程兜底（稳）；内核卡死自动中断→硬杀→重启；网关限流自动退避；主模型连续超时自动熔断并切换备用模型
+
+### 示例产出（同一套引擎自动出图）
+
+下面两张图由引擎的制图管线（`map_design` → 配方 → `check_map_project` → 版面体检）产出：
+纸张朝向、图名位置与字号、图例内容与位置、比例尺刻度与单位、指北针样式全部由规则引擎按数据自动决定，
+并通过“图名居中 / 图例不压图框 / 刻度取整 / 只有一个边框”等自动体检；同时交付同名 `.aprx` 工程。
+
+**图 1 · 分级设色（社区老年人口）**：A4 竖版；图名顶部居中 20pt；图例右下（语义词 少/较少/中/较多/多，整数分界）；
+左下黑白交替比例尺 0/0.5/1/2/3/4 千米；右上八芒罗盘玫瑰。
+
+![分级设色示例](docs/images/example-1-graduated.jpg)
+
+**图 2 · 分类设色（社区绿地服务评价）**：三类社区显式配色（其他=灰、标杆社区=蓝、需整改社区=绿）；
+图例按数据自动放置在最空的一角（占用度相近时回归“右下”惯例），不与图框重叠。
+
+![分类设色示例](docs/images/example-2-categorical.jpg)
 
 ## 二、环境要求
 
@@ -147,29 +167,37 @@ gis-agent --help       # 全部命令
 - **自修复有界**：修复次数上限 + 修复失败升级强模型，不会无限循环
 - **备份可回溯**：破坏性操作前自动复制到 `.gis_agent/backups/<时间戳>/`
 
-## 七、内置配方（17 个）
+## 七、内置配方（44 个）
 
-用 `gis-agent loop` 时模型会自动检索调用；也可以直接指定"用 xx 配方"。
+用 `gis-agent loop` 时模型会自动检索调用；也可以直接指定“用 xx 配方”。
 
-| 配方 ID | 用途 |
-|---|---|
-| `define_then_project` | 坐标系丢失时先定义再真实投影 |
-| `project_to_crs` | 投影变换到目标坐标系 |
-| `topology_repair_keep_attrs` | 找出重叠面并去重（保留属性） |
-| `csv_points_spatial_join` | CSV 经纬度转点、投影、与面空间连接 |
-| `attribute_join_table` | 按公共字段把表挂接到图层 |
-| `field_calculate` | 新增/计算字段（含表达式） |
-| `spatial_join_summary` | 空间连接并统计数量 |
-| `polygon_neighbor_stats` | 邻接关系求取 + 邻域均值 + 高于均值标记 |
-| `aggregate_to_zones` | 按空间归属把源要素汇总到分区面（SUM/MEAN 等） |
-| `summarize_stats` | 按分组字段汇总统计表 |
-| `hotspot_analysis` | Getis-Ord Gi* 热点/冷点分析 |
-| `local_morans_i` | Anselin Local Moran's I 局部自相关 |
-| `census_city_indicators` | 占比类指标按人口加权汇总到上级区划 |
-| `similarity_ranking` | 多指标标准化求最相似单元（写 JSON 结果） |
-| `zonal_statistics` | 分区统计栅格（均值/总和等） |
-| `buffer_dissolve` | 缓冲区与融合 |
-| `graduated_colors_map` | 从零建工程→分级设色→四要素→导出 JPG/PDF，并保存同名可编辑 **.aprx 工程**（样式与布局已落盘） |
+**制图（2）**　`graduated_colors_map`（分级设色：自动版式 + 版面体检 + 可编辑 `.aprx`）、
+`category_map`（分类设色/唯一值，显式配色 + 自动版式）
+
+**栅格（11）**　`polygon_to_raster`、`polygonize_raster`、`project_raster`、`raster_calculator`（地图代数，支持“像元值/区内总值×区域人数”分摊与补缺）、
+`zonal_statistics_raster`、`raster_extract_by_mask`、`sample_raster_at_points`、`interpolate_surface`（IDW/Kriging/Spline）、
+`terrain_derivatives`（坡度等地形派生）、`zone_raster_sum`（不重叠分区求和）、
+`point_buffer_raster_sum`（**圆形缓冲区解析求和**：几千个重叠缓冲区秒级完成，替代慢且易崩的分区统计）
+
+**空间分析与统计（11）**　`aggregate_to_zones`（汇总到分区）、`buffer_dissolve`（缓冲区与融合，可保留属性）、
+`polygon_neighbor_stats`（邻接求取 + 邻域均值 + 高于均值标记）、`spatial_join_summary`、`summarize_stats`、
+`frequency_table`（频数表）、`neighbor_sum_filter`（邻接汇总 + 阈值筛选）、`dissolve_with_stats`、`select_by_attribute`、
+`rank_top_bottom_flag`（前后 N 名打标，空值按“最差”优先入选）、`zonal_statistics`（分区统计表格版）
+
+**空间统计与建模（4）**　`hotspot_analysis`（Getis-Ord Gi*）、`local_morans_i`、
+`census_city_indicators`（占比指标按人口加权汇总到上级区划）、`similarity_ranking`（多指标标准化求最相似单元）
+
+**叠加（4）**　`clip_layer`、`intersect_layers`、`erase_layer`、`union_layers`
+
+**几何（4）**　`feature_to_centroid`、`multipart_to_singlepart`、`minimum_bounding_geometry`、`simplify_geometry`
+
+**数据管理（3）**　`csv_points_spatial_join`（CSV 经纬度转点 + 投影 + 空间连接）、`field_calculate`（新增/计算字段）、`attribute_join_table`（按公共字段挂接表）
+
+**投影与坐标系（2）**　`define_then_project`（先定义再真实投影）、`project_to_crs`
+
+**数据质量（1）**　`topology_repair_keep_attrs`（重叠面去重并保留属性）
+
+**基础设施（2）**　`cleanup_gdb`（交付前清理，支持预览）、`create_file_gdb`
 
 **自定义配方**：把 YAML 放进 `workspace/recipes/`，格式与内置配方一致（`id/name/params/code_template/validation`），启动时自动合并加载。配方模板中 `{{param}}` 会替换为 Python 字面量、`@@param@@` 替换为原文。
 
@@ -188,9 +216,21 @@ workspace/
     └── kernels/      ArcPy 持久内核运行时
 ```
 
-**制图任务的交付物**：除了导出的图片，制图配方还会保存**同名 `.aprx` 工程文件**（与图片同目录），其中已包含分级设色、图层、布局（图名/图例/比例尺/指北针）。你可以直接用 ArcGIS Pro 打开该工程继续微调样式、改标题、重新出图，不必从零重建。
+**制图任务的交付物**：除了导出的图片，制图配方还会保存**同名 `.aprx` 工程文件**（与图片同目录），其中已包含渲染样式、图层、布局（图名/图例/比例尺/指北针）。你可以直接用 ArcGIS Pro 打开该工程继续微调样式、改标题、重新出图，不必从零重建。
 
-例如 `output/old_pct_map.jpg` 会伴随 `output/old_pct_map.aprx`；把整个 `output/` 目录整体拷走，工程中的数据路径（相对路径）仍然有效。
+例如 `output/old_pct_map.jpg` 会伴随 `output/old_pct_map.aprx` 与 `output/old_pct_map.spec.json`（**设计规格**：纸张、图名、图例、比例尺、指北针、配色与每个决定的理由）；把整个 `output/` 目录整体拷走，工程中的数据路径（相对路径）仍然有效。
+
+**制图版式规则（自动，可在参数里覆盖）**
+
+| 项目 | 规则 |
+|---|---|
+| 纸张/朝向 | 数据近方形→A4 竖版；宽扁→横版；屏幕汇报→16:9（可用 `orientation`/`medium` 强制） |
+| 图名 | `区域+尺度+主题+图种` 自动拼装，字号按“一行放得下”反算（12–20pt），顶部居中 |
+| 图例 | 单一符号不放图例；多图层符号清单不加标题；分类用类别名、分级默认语义词（少/较少/中/较多/多）；位置按九宫格占用度选最空的角（差距不大时回归右下） |
+| 比例尺 | 按地图比例尺反算，取整数刻度（如 0/0.5/1/2/3/4 千米）；单位自动；两遍校正保证刻度取整 |
+| 指北针 | 区域全图用八芒罗盘玫瑰（约 18–19mm） |
+| 配色 | 按主题关键词选色带（人口→YlOrRd、绿地→Greens…）；分类用定性色板，重点要素高饱和 |
+| 版式体检 | 出图后自动检查：图名字号与居中、图例是否压住数据/图框、比例尺刻度是否整数、四要素是否互相压盖、是否只有一层边框；不合格自动微调重渲 |
 
 ## 九、常见问题
 
@@ -229,6 +269,7 @@ gis-agent loop "..."  # 引擎模式（推荐）
 
 - 安装、依赖与故障排查：`INSTALL.md`
 - 模型配置示例：`config/llm_config.example.json`
+- **制图规则与自动版式**：`docs/cartography.md`（规则表、风格档位、参数覆盖方式、ArcGIS 制图 API 实测踩坑清单）
 
 ## 许可与致谢
 

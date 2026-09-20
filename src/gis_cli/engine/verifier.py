@@ -68,6 +68,21 @@ set_result({"records": records})
 '''
 
 
+def _artifact_exists(path: str) -> bool:
+    """已删除的产物不该再算产物（文件系统或 GDB 语义都试一下）。"""
+    try:
+        if Path(path).exists():
+            return True
+    except Exception:
+        pass
+    try:
+        import arcpy  # type: ignore
+
+        return bool(arcpy.Exists(path))
+    except Exception:
+        return False
+
+
 class Verifier:
     """Two-layer verifier: structural + semantic."""
 
@@ -100,12 +115,15 @@ class Verifier:
         seen = {r.get("path") for r in results}
         for path in paths:
             if path not in seen:
+                # 内核检查失败时不能退回文件系统判断：GDB 内要素类/栅格会误报“产出不存在”，
+                # 反而把 agent 逼去重建已有数据。用 arcpy 感知的存在性判断。
+                exists = _artifact_exists(path)
                 target = Path(path)
                 results.append(
                     {
                         "path": path,
-                        "exists": target.exists(),
-                        "size": target.stat().st_size if target.exists() and target.is_file() else None,
+                        "exists": exists,
+                        "size": target.stat().st_size if exists and target.is_file() else None,
                     }
                 )
         for record in results:
@@ -208,7 +226,11 @@ class Verifier:
     # ----------------------------------------------------------------- verify
     def verify(self, state: Any) -> dict[str, Any]:
         """Full verification of the current state."""
-        artifacts = list(getattr(state, "artifacts", []) or [])
+        # 已删除的产物（如误建后又清理的目录）要从产物清单里剔除，
+        # 否则验收会一直报错，把 agent 逼去追根本不存在的文件。
+        artifacts = [path for path in (getattr(state, "artifacts", []) or []) if _artifact_exists(str(path))]
+        if state is not None and hasattr(state, "artifacts"):
+            state.artifacts = artifacts
         if not artifacts:
             # Outputs exist on disk but were never registered (e.g. code did
             # not set_result the paths) — discover them instead of failing.

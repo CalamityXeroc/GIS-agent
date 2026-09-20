@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gis-task-cli"
-version = "0.5.0"
+version = "0.6.0"
 description = "General-purpose GIS task solving CLI for ArcGIS Pro workflows"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,7 @@ office = [
 ]
 image = [
   "Pillow>=10.0.0",
+  "psutil>=5.9.0",
 ]
 dev = [
   "pytest>=8.3.2",

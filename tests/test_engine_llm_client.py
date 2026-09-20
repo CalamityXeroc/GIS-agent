@@ -70,3 +70,35 @@ def test_total_timeout_caps_gateway_stall(monkeypatch):
         elapsed = _time.monotonic() - t0
         assert "全局超时" in str(exc), str(exc)
         assert elapsed < 5.0, f"took {elapsed:.1f}s"
+
+
+def test_model_circuit_breaker_skips_stalled_primary():
+    """主模型超时达阈值后进入冷却，下一次直接先走备用模型（不再白等）。"""
+    from gis_cli.engine.llm_client import LLMError
+
+    client = EngineLLMClient(
+        EngineLLMConfig(
+            model="primary-model",
+            fallback_models=["backup-model"],
+            model_failure_threshold=2,
+            model_cooldown_seconds=300.0,
+        )
+    )
+    client._record_failure("primary-model", LLMError("timeout", status_code=None))
+    assert client._order_by_health(["primary-model", "backup-model"])[0] == "primary-model"
+    client._record_failure("primary-model", LLMError("timeout", status_code=None))
+    assert client._order_by_health(["primary-model", "backup-model"]) == ["backup-model", "primary-model"]
+    # 成功一次后计数清零，冷却解除
+    client._record_success("primary-model")
+    assert client._order_by_health(["primary-model", "backup-model"])[0] == "primary-model"
+
+
+def test_model_circuit_breaker_ignores_non_retryable():
+    """参数/权限类错误不该被当成网关卡死而冷却模型。"""
+    from gis_cli.engine.llm_client import LLMError
+
+    client = EngineLLMClient(
+        EngineLLMConfig(model="m", fallback_models=["b"], model_failure_threshold=1)
+    )
+    client._record_failure("m", LLMError("bad request", status_code=400))
+    assert client._cooldown_until == {}

@@ -77,6 +77,9 @@ class EngineLLMConfig:
     # 单模型整轮（含重试）的绝对时间上限；网关拉锯时不再无限缠绵。
     total_timeout: float = 420.0
     fallback_models: list[str] = field(default_factory=list)
+    # 熔断：同一模型连续失败（超时/连不上）达到阈值后冷却一段时间，先走备用模型。
+    model_failure_threshold: int = 2
+    model_cooldown_seconds: float = 300.0
     routing_rules: dict[str, list[str]] = field(default_factory=dict)
     max_concurrency: int = 1
     retry_count: int = 6
@@ -100,6 +103,8 @@ class EngineLLMConfig:
             timeout=float(data.get("timeout", cls.timeout)),
             total_timeout=float(engine.get("request_total_timeout_seconds", data.get("total_timeout", 420.0))),
             fallback_models=[str(m) for m in data.get("fallback_models", []) if str(m).strip()],
+            model_failure_threshold=int(engine.get("model_failure_threshold", data.get("model_failure_threshold", 2))),
+            model_cooldown_seconds=float(engine.get("model_cooldown_seconds", data.get("model_cooldown_seconds", 300.0))),
             routing_rules={
                 str(k).lower(): [str(v) for v in vals]
                 for k, vals in (data.get("routing_rules") or {}).items()
@@ -143,6 +148,8 @@ class EngineLLMClient:
         self._lock = threading.Lock()
         self._semaphore = threading.BoundedSemaphore(max(1, config.max_concurrency))
         self._consecutive_429 = 0
+        self._failures: dict[str, int] = {}
+        self._cooldown_until: dict[str, float] = {}
 
     # ------------------------------------------------------------------ setup
     @property
@@ -182,11 +189,12 @@ class EngineLLMClient:
             raise LLMError(
                 "未配置模型：请在 config/llm_config.json 中填写 model（可同时配置 fallback_models）"
             )
+        candidates = self._order_by_health(candidates)
 
         last_error: Exception | None = None
         for candidate in candidates:
             try:
-                return self._chat_once(
+                response = self._chat_once(
                     messages,
                     model=candidate,
                     tools=tools,
@@ -195,11 +203,52 @@ class EngineLLMClient:
                     max_tokens=max_tokens,
                     response_format=response_format,
                 )
+                self._record_success(candidate)
+                return response
             except LLMError as exc:
                 last_error = exc
+                self._record_failure(candidate, exc)
                 logger.warning("model %s failed: %s", candidate, exc)
                 continue
         raise LLMError(f"All models failed. Last error: {last_error}")
+
+    # -------------------------------------------------------------- 模型熔断
+    def _order_by_health(self, candidates: list[str]) -> list[str]:
+        """把处于冷却期的模型排到最后（没别的选择时仍会尝试）。"""
+        now = time.monotonic()
+
+        def cooling(candidate: str) -> bool:
+            until = self._cooldown_until.get(candidate, 0.0)
+            if until and until <= now:
+                self._cooldown_until.pop(candidate, None)
+                self._failures.pop(candidate, None)
+                return False
+            return until > now
+
+        healthy = [c for c in candidates if not cooling(c)]
+        cooling_models = [c for c in candidates if cooling(c)]
+        if cooling_models:
+            logger.warning("模型冷却中，先试其他模型: %s", ", ".join(cooling_models))
+        return healthy + cooling_models
+
+    def _record_success(self, model: str) -> None:
+        self._failures.pop(model, None)
+        self._cooldown_until.pop(model, None)
+
+    def _record_failure(self, model: str, exc: Exception) -> None:
+        """连续超时/连接失败达阈值后冷却该模型（网关卡死时不再白等）。"""
+        if getattr(exc, "status_code", None) not in (None, 429):
+            return
+        self._failures[model] = self._failures.get(model, 0) + 1
+        if self._failures[model] < max(1, self.config.model_failure_threshold):
+            return
+        self._cooldown_until[model] = time.monotonic() + self.config.model_cooldown_seconds
+        logger.warning(
+            "模型 %s 连续失败 %s 次，冷却 %.0f 秒",
+            model,
+            self._failures[model],
+            self.config.model_cooldown_seconds,
+        )
 
     def _chat_once(
         self,

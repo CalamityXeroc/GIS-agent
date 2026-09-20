@@ -1,16 +1,21 @@
 id: graduated_colors_map
-name: 分级设色专题图（含四要素）
-description: 使用已验证的布局代码生成分级设色专题图，自动包含图名、图例、比例尺、指北针，导出 JPG，并保存可继续编辑的 .aprx 工程（样式与布局已落盘）。
+name: 分级设色专题图（自动版式 + 可编辑工程）
+description: >
+  分级设色出图：先采集数据事实（范围长宽比、要素数、字段分布、九宫格占用度），
+  由制图规则引擎自动决定纸张朝向、图名格式与字号、图例内容与位置、比例尺整数刻度与单位、
+  指北针样式，再渲染导出 JPG 并保存可编辑 .aprx；渲染后自动做版面体检，不合格会微调重渲。
+  图例标签默认用简洁语义词（少/较少/中/较多/多），可选取整区间或两者结合。
 domain: cartography
-triggers: [专题图, 制图, 分级设色, choropleth, 地图, 图例, 指北针, 比例尺]
+category: cartography
+triggers: [专题图, 制图, 分级设色, choropleth, 地图, 图例, 指北针, 比例尺, 出图, 版式]
 preconditions:
-  - 已通过 catalog_query 确认分级字段名存在且为数值型
-  - 输入为面要素
+  - 已确认分级字段真实存在且为数值型
+  - 输入为面要素（也支持栅格）
 params:
   input_path:
     type: string
     required: true
-    description: 输入面要素路径
+    description: 输入数据路径
   field_name:
     type: string
     required: true
@@ -19,33 +24,67 @@ params:
     type: string
     required: true
     description: 输出 JPG 路径
+  theme:
+    type: string
+    default: ""
+    description: 图主题材（如"老年人口"），决定图名与配色
   title:
     type: string
     default: ""
-    description: 地图标题，空则自动生成
+    description: 完整图名（给了就不再自动拼装）
+  region:
+    type: string
+    default: ""
+    description: 区域名（如"郑州市"），自动拼进图名
+  scale:
+    type: string
+    default: ""
+    description: 尺度词（如"社区尺度"），自动拼进图名
+  purpose:
+    type: string
+    default: "分布"
+    description: 用途（分布/评价/规划/对比/汇报），影响版式取舍
+  medium:
+    type: string
+    default: ""
+    description: 输出介质（print_A4 / print_A3 / screen_16_9），空则按数据自动
+  orientation:
+    type: string
+    default: "auto"
+    description: 朝向（auto/portrait/landscape）
+  legend_labels:
+    type: string
+    default: ""
+    description: 图例标签（semantic 语义词 / range 取整区间 / both 两者），空则用档位默认
+  legend_title:
+    type: string
+    default: ""
+    description: 图例标题（空则用主题）
   color_ramp_name:
     type: string
     default: ""
-    description: 色带名（如 Greens、YlOrRd、Reds），空则自动
-  page_width:
-    type: integer
-    default: 297
-    description: 页面宽 mm
-  page_height:
-    type: integer
-    default: 420
-    description: 页面高 mm
+    description: 色带名（如 Greens、YlOrRd），空则按主题自动
+  style_profile:
+    type: string
+    default: ""
+    description: 风格档位（competition_standard / screen_report / dense_raster），空则默认
   aprx_path:
     type: string
     default: ""
-    description: 工程文件(.aprx)保存路径；空则与输出图同名同目录（output/xx.jpg → output/xx.aprx）
+    description: 工程文件(.aprx)路径；空则与图片同名同目录
+  overrides:
+    type: object
+    default: {}
+    description: '强制覆盖设计（点路径，如 {"legend.outside": true, "title.height_pt": 18}）'
 steps:
-  - 调用 build_graduated_colors_code 生成完整布局代码
-  - 执行并导出 JPG，同时保存 .aprx 工程（样式/布局已落盘）
-  - 检查图片非空白、工程文件已生成
+  - 采集数据事实（范围/字段分布/占用度）
+  - 规则引擎产出布局规格（纸张、图名、图例、比例尺、指北针、配色）
+  - 渲染导出 JPG + 保存 .aprx
+  - 版面体检（图名居中/图例不压数据/刻度整数/元素不越界），不合格则微调重渲
 code_template: |
+  import json, os
   import arcpy
-  from gis_cli.arcpy_bridge import build_graduated_colors_code
+  from gis_cli.cartography import create_map
 
   input_path = {{input_path}}
   field_name = {{field_name}}
@@ -53,43 +92,55 @@ code_template: |
 
   if not arcpy.Exists(input_path):
       raise ValueError(f"输入数据不存在: {input_path}")
-
   fields = [f.name for f in arcpy.ListFields(input_path)]
   if field_name not in fields:
       raise ValueError(f"字段不存在: {field_name}；可用字段: {fields}")
 
-  code = build_graduated_colors_code(
-      input_path=input_path,
-      field_name=field_name,
-      output_path=output_path,
-      title={{title}},
-      color_ramp_name={{color_ramp_name}},
-      page_width={{page_width}},
-      page_height={{page_height}},
-      aprx_path={{aprx_path}},
-  )
+  intent = {
+      "theme": {{theme}} or {{title}},
+      "title": {{title}},
+      "region": {{region}},
+      "scale": {{scale}},
+      "purpose": {{purpose}},
+      "medium": {{medium}},
+      "orientation": {{orientation}},
+      "legend_labels": {{legend_labels}},
+      "legend_title": {{legend_title}},
+      "color_ramp": {{color_ramp_name}},
+      "style_profile": {{style_profile}},
+      "field": field_name,
+      "overrides": {{overrides}},
+  }
+  result = create_map([input_path], intent, output_path=output_path,
+                      aprx_path={{aprx_path}}, field=field_name)
 
-  # 分级字段的空值不会上色（会默认为无色/白色），必须显式统计并报告，
-  # 否则"未分析区域"与"数值为 0"在图上无法区分。
-  _total = 0
-  _null = 0
-  with arcpy.da.SearchCursor(input_path, [field_name]) as _cur:
-      for (_v,) in _cur:
-          _total += 1
-          if _v is None:
-              _null += 1
-  _null_rate = round(_null / _total, 4) if _total else 0.0
-  if _null:
-      print(f"⚠ 分级字段 {field_name} 有 {_null}/{_total} 个空值（{_null_rate:.1%}）：空值不会上色，"
-            f"请在报告中说明这些单元\"无数据\"，不要当作 0")
+  # 分级字段空值不上色：必须显式统计并报告，否则"未分析"与"值为 0"在图上无法区分
+  total = 0
+  nulls = 0
+  with arcpy.da.SearchCursor(input_path, [field_name]) as cur:
+      for (value,) in cur:
+          total += 1
+          if value is None:
+              nulls += 1
+  null_rate = round(nulls / total, 4) if total else 0.0
+  if nulls:
+      print(f"注意：分级字段 {field_name} 有 {nulls}/{total} 个空值（{null_rate:.1%}）不上色，"
+              "请在结论中说明这些单元为「无数据」")
 
-  exec(compile(code, "<graduated_colors_map>", "exec"), globals(), globals())
+  # 设计规格落盘（便于追溯与复现）
+  spec_path = os.path.splitext(result["output"])[0] + ".spec.json"
+  with open(spec_path, "w", encoding="utf-8") as fh:
+      json.dump({k: v for k, v in result.items() if k != "spec"}, fh, ensure_ascii=False, indent=2)
 
-  # 把空值统计补进执行结果（供上层报告/验收使用）
-  _result = globals().get("__arcpy_engine_result__")
-  if isinstance(_result, dict):
-      _result.update({"null_count": _null, "total_count": _total, "null_rate": _null_rate})
-      set_result(_result)
+  set_result({
+      "output": result["output"], "size": result.get("size"), "success": True,
+      "aprx": result.get("aprx"), "aprx_size": result.get("aprx_size"), "aprx_saved": result.get("aprx_saved"),
+      "design_note": result.get("design_note"), "qc_ok": result.get("qc_ok"),
+      "qc_summary": result.get("qc_summary"), "repair_rounds": result.get("repair_rounds"),
+      "spec_path": spec_path, "notes": (result.get("notes") or [])[:12],
+      "null_count": nulls, "total_count": total, "null_rate": null_rate,
+      "decisions": [f"{d.get('key')}={d.get('value')}" for d in (result.get("decisions") or [])],
+  })
 validation:
   - type: file_exists
     path: "{{output_path}}"
@@ -97,13 +148,15 @@ validation:
     path: "{{output_path}}"
   - type: result_key_truthy
     key: "aprx_saved"
+  - type: file_exists
+    path: "{{output_path}}"
+    # 规格边车文件（同名 .spec.json）由代码模板写出，便于复现设计
 pitfalls:
-  - 字段名必须是数据中的真实字段，不能写占位符。
-  - 地图框必须绑定数据图层，否则导出空白图。
-  - 工程(.aprx)必须 aprx.save() 落盘，否则样式/布局只在内存里，用户打开工程看不到分级色。
-  - 默认每张图生成同名 .aprx（不覆盖其他图）；想追加到同一工程时传 aprx_path 指向已有工程（会复制再改，不改动原文件）。
-  - 分级字段的空值不上色：若数据有大量空值（如"无绿地社区"），图上会大片留白，必须报告空值数量并改用全量图层出图，否则读者无法区分"无数据"与"已分析"。
-  - 想给全量单元上色时，先用 attribute_join_table 把统计结果挂回全量图层（含空值）再出图。
+  - 字段名必须是数据中的真实字段（中文名可能被 DBF 截断），先 catalog_query 确认。
+  - 图例默认用语义词（少/较少/中/较多/多）保持简洁；需要精确数值时传 legend_labels=range（会自动取整）。
+  - 版式由规则引擎决定：数据近方形→A4 竖版；宽扁→横版；数据满覆盖时图例自动移到图框外。
+  - '想固定某个决定时用 overrides，例如 {"orientation": "portrait"} 或 {"legend.outside": true}。'
+  - 空值不上色，必须报告空值数量；要给全量上色先用 attribute_join_table 把结果挂回全量图层。
 examples:
-  - "用 forest_cov 字段做绿色分级设色专题图"
-  - "制作老年人口占比专题图，标题为‘某市老年人口占比’"
+  - "用 ELDER_N 字段做老年人口分级设色图，theme=老年人口，region=郑州市，scale=社区尺度"
+  - "绿地服务价值分级图，legend_labels=range 让图例显示取整区间"

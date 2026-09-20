@@ -1,0 +1,141 @@
+id: category_map
+name: 分类设色专题图（唯一值 + 自动版式 + 可编辑工程）
+description: >
+  按分类字段唯一值上色（如"标杆社区=蓝、需整改社区=绿"），版式与图例/比例尺/指北针由制图规则引擎
+  自动决定（纸张朝向、图例是否加标题、位置与字号、比例尺整数刻度），导出 JPG 同时保存可编辑 .aprx，
+  渲染后自动做版面体检。图例条目直接用类别名，多图层符号清单按惯例不加标题。
+domain: cartography
+category: cartography
+triggers: [分类设色, 唯一值, 分类图, category map, unique values, 标杆社区, 需整改社区, 专题图, 制图]
+preconditions:
+  - 已确认分类字段真实存在（文本或整型）
+  - 输入为面要素；类别数建议 ≤12
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入面要素路径
+  category_field:
+    type: string
+    required: true
+    description: 分类字段名（如"类别"）
+  output_path:
+    type: string
+    required: true
+    description: 输出 JPG 路径
+  category_colors:
+    type: string
+    default: ""
+    description: '值到颜色映射，如 "标杆社区:#1F77B4;需整改社区:#2CA02C"；空则按调色板自动分配'
+  other_color:
+    type: string
+    default: ""
+    description: 未在映射中的类别颜色（默认浅灰 #E8E8E8）
+  theme:
+    type: string
+    default: ""
+    description: 图主题材（决定图名与图例标题）
+  title:
+    type: string
+    default: ""
+    description: 完整图名（给了就不再自动拼装）
+  region:
+    type: string
+    default: ""
+    description: 区域名（如"郑州市"）
+  scale:
+    type: string
+    default: ""
+    description: 尺度词（如"社区尺度"）
+  legend_title:
+    type: string
+    default: ""
+    description: 图例标题（空则用主题；多图层时自动不加标题）
+  style_profile:
+    type: string
+    default: ""
+    description: 风格档位（competition_standard / screen_report / dense_raster）
+  aprx_path:
+    type: string
+    default: ""
+    description: 工程文件(.aprx)路径；空则与图片同名同目录
+  overrides:
+    type: object
+    default: {}
+    description: '强制覆盖设计（点路径，如 {"legend.outside": true}）'
+steps:
+  - 采集数据事实与分类分布
+  - 规则引擎产出布局规格
+  - 渲染导出 JPG + 保存 .aprx（唯値渲染器 + 显式配色）
+  - 版面体检并回报各类别要素数
+code_template: |
+  import json, os
+  import arcpy
+  from gis_cli.cartography import create_map
+
+  input_path = {{input_path}}
+  category_field = {{category_field}}
+  output_path = {{output_path}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  fields = [f.name for f in arcpy.ListFields(input_path)]
+  if category_field not in fields:
+      raise ValueError(f"分类字段不存在: {category_field}；可用字段: {fields}")
+
+  # 未映射的类别落到"其他"颜色
+  overrides = dict({{overrides}})
+  _other = {{other_color}}
+  if _other:
+      overrides.setdefault("renderer.nodata_color", _other)
+
+  intent = {
+      "theme": {{theme}} or {{title}},
+      "title": {{title}},
+      "region": {{region}},
+      "scale": {{scale}},
+      "legend_title": {{legend_title}},
+      "category_colors": {{category_colors}},
+      "style_profile": {{style_profile}},
+      "mode": "unique",
+      "field": category_field,
+      "overrides": overrides,
+  }
+  result = create_map([input_path], intent, output_path=output_path,
+                      aprx_path={{aprx_path}}, field=category_field)
+
+  counts = {}
+  with arcpy.da.SearchCursor(input_path, [category_field]) as cur:
+      for (value,) in cur:
+          key = "(空)" if value is None else str(value)
+          counts[key] = counts.get(key, 0) + 1
+  print(f"类别要素数: {counts}")
+
+  spec_path = os.path.splitext(result["output"])[0] + ".spec.json"
+  with open(spec_path, "w", encoding="utf-8") as fh:
+      json.dump({k: v for k, v in result.items() if k != "spec"}, fh, ensure_ascii=False, indent=2)
+
+  set_result({
+      "output": result["output"], "size": result.get("size"), "success": True,
+      "aprx": result.get("aprx"), "aprx_size": result.get("aprx_size"), "aprx_saved": result.get("aprx_saved"),
+      "design_note": result.get("design_note"), "qc_ok": result.get("qc_ok"),
+      "qc_summary": result.get("qc_summary"), "repair_rounds": result.get("repair_rounds"),
+      "spec_path": spec_path, "notes": (result.get("notes") or [])[:12],
+      "category_counts": counts,
+      "decisions": [f"{d.get('key')}={d.get('value')}" for d in (result.get("decisions") or [])],
+  })
+validation:
+  - type: file_exists
+    path: "{{output_path}}"
+  - type: image_not_blank
+    path: "{{output_path}}"
+  - type: result_key_truthy
+    key: "aprx_saved"
+pitfalls:
+  - 颜色映射里的值必须与数据里的类别值完全一致（含空格）；写错会整片显示成"其他"浅灰。
+  - 类别过多（>12）时图例拥挤，建议先归并小类。
+  - 图例标题在多图层符号清单场景会自动省略（惯例），需要标题请显式传 legend_title。
+  - 工程(.aprx)已 aprx.save() 落盘；想追加到同一工程时传 aprx_path 指向已有工程（会复制再改，不动原文件）。
+examples:
+  - "标杆社区=蓝、需整改社区=绿的分类设色图，theme=社区绿地服务评价"
+  - "按土地利用类型上色的类型图"
