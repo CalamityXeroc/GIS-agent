@@ -320,3 +320,172 @@ def stroke_rect(
 
 
 __all__ = ["stamp_title", "stamp_unit_label", "stamp_legend", "clear_rect", "stroke_rect", "resolve_font"]
+
+
+# --------------------------------------------------------------------------- 迁移图
+def map_to_px(
+    points: list[tuple[float, float]],
+    extent: dict,
+    box_mm: tuple[float, float, float, float],
+    *,
+    page_height_mm: float,
+    dpi: float,
+) -> list[tuple[float, float]]:
+    """地图数据坐标 → 导出图像素坐标（纯函数，便于单测）。
+
+    约定与 LayoutSpec 一致：``box_mm`` 的 y 以页面**左下角**为原点，而图像像素 y 轴向下，
+    因此最后一步要做 y 翻转。
+
+    注意：``extent`` 必须是**渲染后实测**的地图框范围（MapFrame.getExtent），
+    不能用设计值——相机按图框纵横比微调过，用设计值会让箭头整体偏移。
+    """
+    if not points:
+        return []
+    x, y, w, h = (float(v) for v in box_mm)
+    xmin = float(extent.get("xmin", 0.0))
+    ymin = float(extent.get("ymin", 0.0))
+    width = float(extent.get("width") or (float(extent.get("xmax", 0.0)) - xmin) or 1.0)
+    height = float(extent.get("height") or (float(extent.get("ymax", 0.0)) - ymin) or 1.0)
+    mm_to_px = float(dpi) / 25.4
+    out: list[tuple[float, float]] = []
+    for px_x, px_y in points:
+        mm_x = x + (float(px_x) - xmin) / width * w
+        mm_y = y + (float(px_y) - ymin) / height * h
+        out.append((mm_x * mm_to_px, (float(page_height_mm) - mm_y) * mm_to_px))
+    return out
+
+
+def _draw_arrow(draw: Any, start: tuple[float, float], end: tuple[float, float],
+                color: str, width: int, head_px: float) -> None:
+    """线段 + 箭头头部（实心三角形）。"""
+    import math
+
+    draw.line([start, end], fill=color, width=width)
+    angle = math.atan2(end[1] - start[1], end[0] - start[0])
+    spread = math.radians(22)
+    tip = end
+    left = (end[0] - head_px * math.cos(angle - spread), end[1] - head_px * math.sin(angle - spread))
+    right = (end[0] - head_px * math.cos(angle + spread), end[1] - head_px * math.sin(angle + spread))
+    draw.polygon([tip, left, right], fill=color)
+
+
+def stamp_arrows(
+    image_path: str,
+    arrows: list[dict],
+    *,
+    extent: dict,
+    box_mm: tuple[float, float, float, float],
+    page_height_mm: float,
+    dpi: float,
+    color: str = "#B2182B",
+    width: int = 3,
+    head_mm: float = 3.0,
+    label_size_pt: float = 9.0,
+    font_name: str = "微软雅黑",
+    halo: bool = True,
+) -> dict:
+    """在导出图上画**方向箭头 + 年份标注**（分布中心迁移图用）。
+
+    ``arrows`` 每项：``{"from": [x, y], "to": [x, y], "label": "1995"}``（数据坐标）。
+    标签默认画在终点外侧；带白色描边光晕，压在深色底图上也能看清。
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except Exception as exc:  # pragma: no cover - 取决于 Pillow
+        return {"ok": False, "detail": f"Pillow 不可用: {exc}"}
+    if not arrows:
+        return {"ok": True, "drawn": 0, "detail": "没有箭头需要绘制"}
+
+    target = Path(image_path)
+    if not target.exists():
+        return {"ok": False, "detail": f"图片不存在: {target}"}
+
+    pairs = [(item.get("from") or [0, 0], item.get("to") or [0, 0]) for item in arrows]
+    flat = [tuple(point) for pair in pairs for point in pair]
+    pixels = map_to_px(flat, extent, box_mm, page_height_mm=page_height_mm, dpi=dpi)
+    font_file = resolve_font(font_name, desired_bold=False)
+    size_px = max(8, int(round(float(label_size_pt) * (float(dpi) / 25.4) / (72.0 / 25.4))))
+
+    try:
+        with Image.open(target) as img:
+            canvas = img.convert("RGB")
+        draw = ImageDraw.Draw(canvas)
+        head_px = max(4.0, float(head_mm) * float(dpi) / 25.4)
+        font = ImageFont.truetype(font_file, size_px) if font_file else None
+        for index, item in enumerate(arrows):
+            start = pixels[index * 2]
+            end = pixels[index * 2 + 1]
+            _draw_arrow(draw, start, end, color, max(1, int(width)), head_px)
+            label = str(item.get("label") or "")
+            if not label:
+                continue
+            # 标签放在终点外侧 8% 处，避免压住箭头
+            lx = end[0] + (end[0] - start[0]) * 0.08
+            ly = end[1] + (end[1] - start[1]) * 0.08
+            if font is not None:
+                if halo:
+                    for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, 1), (-1, 1), (1, -1)):
+                        draw.text((lx + dx, ly + dy), label, font=font, fill="#FFFFFF")
+                draw.text((lx, ly), label, font=font, fill=color)
+            else:  # pragma: no cover - 无可用字体时退化
+                draw.text((lx, ly), label, fill=color)
+        canvas.save(target, quality=92)
+    except Exception as exc:  # pragma: no cover
+        return {"ok": False, "detail": f"绘制失败: {str(exc)[:120]}"}
+    return {"ok": True, "drawn": len(arrows), "font": font_file, "size_px": size_px}
+
+
+def stamp_point_labels(
+    image_path: str,
+    labels: list[dict],
+    *,
+    extent: dict,
+    box_mm: tuple[float, float, float, float],
+    page_height_mm: float,
+    dpi: float,
+    color: str = "#333333",
+    size_pt: float = 9.0,
+    font_name: str = "微软雅黑",
+    offset_px: tuple[int, int] = (5, -14),
+    halo: bool = True,
+) -> dict:
+    """在导出图上的给定数据坐标处写文字（逐年分布中心标年份用）。
+
+    ``labels`` 每项：``{"at": [x, y], "text": "1995", "color": "#..."}``（数据坐标，可选覆盖颜色）。
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        return {"ok": False, "detail": f"Pillow 不可用: {exc}"}
+    if not labels:
+        return {"ok": True, "drawn": 0, "detail": "没有标注需要绘制"}
+    target = Path(image_path)
+    if not target.exists():
+        return {"ok": False, "detail": f"图片不存在: {target}"}
+
+    points = [tuple(item.get("at") or [0, 0]) for item in labels]
+    pixels = map_to_px(points, extent, box_mm, page_height_mm=page_height_mm, dpi=dpi)
+    font_file = resolve_font(font_name, desired_bold=False)
+    size_px = max(8, int(round(float(size_pt) * (float(dpi) / 25.4) / (72.0 / 25.4))))
+    try:
+        with Image.open(target) as img:
+            canvas = img.convert("RGB")
+        draw = ImageDraw.Draw(canvas)
+        font = ImageFont.truetype(font_file, size_px) if font_file else None
+        for (px, py), item in zip(pixels, labels):
+            text = str(item.get("text") or "")
+            if not text:
+                continue
+            item_color = str(item.get("color") or color)
+            tx, ty = px + offset_px[0], py + offset_px[1]
+            if font is not None:
+                if halo:
+                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        draw.text((tx + dx, ty + dy), text, font=font, fill="#FFFFFF")
+                draw.text((tx, ty), text, font=font, fill=item_color)
+            else:  # pragma: no cover
+                draw.text((tx, ty), text, fill=item_color)
+        canvas.save(target, quality=92)
+    except Exception as exc:  # pragma: no cover
+        return {"ok": False, "detail": f"绘制失败: {str(exc)[:120]}"}
+    return {"ok": True, "drawn": len(labels), "font": font_file, "size_px": size_px}

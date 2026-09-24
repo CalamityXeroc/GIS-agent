@@ -6,56 +6,69 @@
   "max_tokens": 2048,
   "timeout": 60,
   "provider": "siliconflow",
-  "fallback_models": ["deepseek-chat"],
   "enable_prompt_optimizer": true,
   "enable_baml_standardizer": true,
   "provider_models": {
-    "siliconflow": ["Qwen/Qwen3.5-32B", "Pro/zai-org/GLM-5"],
-    "openai": ["gpt-4o-mini"]
+    "siliconflow": [
+      "Qwen/Qwen3.5-32B",
+      "Pro/zai-org/GLM-5"
+    ],
+    "openai": [
+      "gpt-4o-mini"
+    ]
   },
   "routing_rules": {
-    "agent": ["deepseek-chat"],
-    "agent_strong": ["Pro/zai-org/GLM-5"],
-    "code": ["Pro/zai-org/GLM-5"],
-    "code_repair": ["Pro/zai-org/GLM-5"],
-    "planning": ["Qwen/Qwen3.5-32B"],
-    "intent": ["gpt-4o-mini"],
-    "task_refine": ["Qwen/Qwen3.5-32B"],
-    "requirements": ["Pro/zai-org/GLM-5"],
-    "verify": ["deepseek-chat"],
-    "compact": ["deepseek-chat"]
-  },
-  "engine": {
-    "max_turns": 60,
-    "max_repairs": 4,
-    "llm_max_concurrency": 1,
-    "request_retry": 6,
-    "request_backoff_seconds": 8.0,
-    "request_max_backoff_seconds": 90.0,
-    "request_total_timeout_seconds": 420.0,
-    "tool_protocol": "auto",
-    "context_soft_limit_tokens": 120000,
-    "kernel_idle_timeout_seconds": 1800,
-    "kernel_exec_timeout_seconds": 600,
-    "exploration_turn_budget": 3,
-    "escalate_after_failures": 2,
-    "auto_backup_destructive": true,
-    "backup_dir": "workspace/.gis_agent/backups",
-    "auto_extract_requirements": true
+    "planning": [
+      "Qwen/Qwen3.5-32B"
+    ],
+    "intent": [
+      "gpt-4o-mini"
+    ],
+    "task_refine": [
+      "Qwen/Qwen3.5-32B"
+    ]
   },
   "baml_functions": {
-    "planning": ["generate_gis_plan"],
-    "intent": ["infer_gis_intent"],
-    "task_refine": ["refine_gis_task"],
-    "recovery": ["suggest_gis_recovery"]
+    "planning": [
+      "generate_gis_plan"
+    ],
+    "intent": [
+      "infer_gis_intent"
+    ],
+    "task_refine": [
+      "refine_gis_task"
+    ],
+    "recovery": [
+      "suggest_gis_recovery"
+    ]
   },
   "enable_baml_preflight": true,
   "baml_preflight_strict": false,
-  "baml_required_capabilities": ["intent", "task_refine", "planning", "recovery"],
+  "baml_required_capabilities": [
+    "intent",
+    "task_refine",
+    "planning",
+    "recovery"
+  ],
   "enable_baml_builtin_fallback": true,
-  
-  "_comment": "这是配置示例文件，请复制为 llm_config.json 并填入真实的 API Key。engine 段用于新引擎（gis-agent loop）：max_turns/max_repairs 控制循环与自修复上限，kernel_* 控制 ArcPy 持久内核超时，backup_dir 为破坏性操作自动备份目录",
-  
+  "_comment": "这是配置示例文件，请复制为 llm_config.json 并填入真实的 API Key",
+  "engine": {
+    "max_turns": 60,
+    "max_repairs": 4,
+    "kernel_exec_timeout_seconds": 600,
+    "run_deadline_seconds": 7200,
+    "auto_backup_destructive": true,
+    "auto_extract_requirements": true,
+    "hygiene_check": "warn",
+    "_comment_engine": {
+      "run_deadline_seconds": "整跑截止时间（秒）。网关长时间不可用时，单轮调用会反复重试；没有总截止时一次 run 可能整夜空转。到点后状态置 deadline_exceeded。",
+      "hygiene_check": "交付卫生检查：warn（默认，验收时仅提醒过程库重做残留/过程文件）| block（计入验收失败）| off。",
+      "model_failure_threshold": "主模型连续超时/连断达到该次数就冷却，直接走备用模型（写在本段或 llm 根段都行）。",
+      "model_cooldown_seconds": "首次冷却时长；同一模型反复失败会指数升级（上限 model_cooldown_max_seconds=3600）。",
+      "vision_check": "图面识图质检：warn（默认，让识图模型看图并提醒中文是否可读/图面是否被裁）| block（计入验收失败）| off。需在配置里设 \"vision\": true 且模型支持识图。"
+    },
+    "vision_check": "warn"
+  },
   "_examples": {
     "硅基流动 (SiliconFlow)": {
       "api_base": "https://api.siliconflow.cn/v1",
@@ -77,5 +90,7 @@
       "api_base": "https://api.openai.com/v1",
       "model": "gpt-4"
     }
-  }
+  },
+  "vision": false,
+  "_comment_vision": "模型支持识图时设为 true：把产出的图附进对话，让模型自己核对图面（并启用图面识图质检）。"
 }

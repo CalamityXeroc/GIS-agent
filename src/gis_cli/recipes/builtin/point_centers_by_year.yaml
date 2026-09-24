@@ -1,0 +1,136 @@
+id: point_centers_by_year
+name: 逐年分布中心与迁移路径
+description: >
+  按年计算点群的分布中心（平均中心），输出中心点要素、相邻年连线要素（含距离）与 CSV，
+  供绘制"分布中心迁移图"（箭头 + 年份标注）使用。
+domain: spatial_analysis
+category: spatial_analysis
+triggers: [分布中心, 迁移路径, 重心, 平均中心, 中心迁移, movement]
+preconditions:
+  - 点数据已投影（距离才有米制含义）
+params:
+  points:
+    type: string
+    required: true
+    description: 输入点要素
+  year_field:
+    type: string
+    default: "YEAR"
+    description: 年份字段
+  out_centers:
+    type: string
+    required: true
+    description: 输出中心点要素类（含 YEAR、X、Y、N）
+  out_lines:
+    type: string
+    default: ""
+    description: 输出迁移连线要素类（含 FROM_YEAR、TO_YEAR、DIST_M）
+  csv_path:
+    type: string
+    default: ""
+    description: 输出 CSV（年份, X, Y, 点数, 距上年迁移距离）
+steps:
+  - 按年求 X/Y 均值与点数
+  - 写出中心点、连线段、CSV
+  - 返回逐年中心与迁移距离
+code_template: |
+  import arcpy, os, csv, numpy as np
+
+  arcpy.env.overwriteOutput = True
+
+  points = {{points}}
+  year_field = str({{year_field}} or "YEAR").strip()
+  out_centers = {{out_centers}}
+  out_lines = str({{out_lines}} or "").strip()
+  csv_path = str({{csv_path}} or "").strip()
+
+  if not arcpy.Exists(points):
+      raise ValueError(f"点数据不存在: {points}")
+  sr = arcpy.Describe(points).spatialReference
+  if not getattr(sr, "factoryCode", None):
+      raise ValueError("点数据没有坐标系，请先投影")
+
+  rows = []
+  with arcpy.da.SearchCursor(points, [year_field, "SHAPE@X", "SHAPE@Y"]) as cursor:
+      for year, x, y in cursor:
+          if year is None or x is None or y is None:
+              continue
+          rows.append((int(year), float(x), float(y)))
+  if not rows:
+      raise ValueError("没有可用点")
+
+  centers = []
+  for year in sorted({r[0] for r in rows}):
+      pts = np.asarray([(r[1], r[2]) for r in rows if r[0] == year], dtype="float64")
+      centers.append({"year": year, "x": float(pts[:, 0].mean()), "y": float(pts[:, 1].mean()), "n": int(pts.shape[0])})
+
+  gdb = os.path.dirname(out_centers)
+  if not arcpy.Exists(gdb):
+      raise ValueError(f"输出库不存在: {gdb}")
+  name = os.path.basename(out_centers)
+  if arcpy.Exists(out_centers):
+      arcpy.management.Delete(out_centers)
+  arcpy.management.CreateFeatureclass(gdb, name, "POINT", spatial_reference=sr)
+  arcpy.management.AddField(out_centers, "YEAR", "LONG")
+  arcpy.management.AddField(out_centers, "X", "DOUBLE")
+  arcpy.management.AddField(out_centers, "Y", "DOUBLE")
+  arcpy.management.AddField(out_centers, "N", "LONG")
+  with arcpy.da.InsertCursor(out_centers, ["SHAPE@XY", "YEAR", "X", "Y", "N"]) as cursor:
+      for item in centers:
+          cursor.insertRow([(item["x"], item["y"]), item["year"], item["x"], item["y"], item["n"]])
+
+  segments = []
+  for i in range(len(centers) - 1):
+      a, b = centers[i], centers[i + 1]
+      dist = float(np.hypot(b["x"] - a["x"], b["y"] - a["y"]))
+      segments.append({"from_year": a["year"], "to_year": b["year"], "distance_m": dist,
+                       "ax": a["x"], "ay": a["y"], "bx": b["x"], "by": b["y"]})
+
+  if out_lines and segments:
+      line_name = os.path.basename(out_lines)
+      if arcpy.Exists(out_lines):
+          arcpy.management.Delete(out_lines)
+      arcpy.management.CreateFeatureclass(gdb, line_name, "POLYLINE", spatial_reference=sr)
+      arcpy.management.AddField(out_lines, "FROM_YEAR", "LONG")
+      arcpy.management.AddField(out_lines, "TO_YEAR", "LONG")
+      arcpy.management.AddField(out_lines, "DIST_M", "DOUBLE")
+      with arcpy.da.InsertCursor(out_lines, ["SHAPE@", "FROM_YEAR", "TO_YEAR", "DIST_M"]) as cursor:
+          for seg in segments:
+              line = arcpy.Polyline(arcpy.Array([arcpy.Point(seg["ax"], seg["ay"]),
+                                                arcpy.Point(seg["bx"], seg["by"])]), sr)
+              cursor.insertRow([line, seg["from_year"], seg["to_year"], seg["distance_m"]])
+
+  if csv_path:
+      os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+      with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:
+          writer = csv.writer(fh)
+          writer.writerow(["year", "x", "y", "points", "migration_m"])
+          for i, item in enumerate(centers):
+              dist = segments[i - 1]["distance_m"] if i else 0.0
+              writer.writerow([item["year"], round(item["x"], 2), round(item["y"], 2), item["n"], round(dist, 1)])
+
+  set_result({
+      "output": out_centers,
+      "lines": out_lines,
+      "csv": csv_path,
+      "centers": centers,
+      "segments": [{k: round(v, 2) if isinstance(v, float) else v for k, v in seg.items()} for seg in segments],
+      "total_migration_m": round(sum(s["distance_m"] for s in segments), 1),
+  })
+  print(f"逐年中心 {len(centers)} 个，迁移段 {len(segments)} 段，合计 {total_migration_m if False else sum(s['distance_m'] for s in segments):.0f} m")
+validation:
+  - type: vector_exists
+    path: "{{out_centers}}"
+  - type: feature_count_gt
+    path: "{{out_centers}}"
+    value: 5
+pitfalls:
+  - >-
+    年均中心用的是**算术平均中心**（Mean Center）；若要中位数中心请另用专门工具。
+  - >-
+    迁移距离用投影坐标的欧氏距离（米）；地理坐标系下算出来是度，没意义。
+  - >-
+    迁移图的年份标注与箭头二选一（都画会重复），图例要说明箭头含义。
+examples:
+  - >-
+    求 1982-2001 逐年分布中心并输出迁移折线，供画带方向的迁移图

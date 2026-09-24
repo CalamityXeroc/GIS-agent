@@ -1,0 +1,165 @@
+id: kernel_density
+name: 核密度分析（支持多期统一分级）
+description: >
+  对点要素做核密度估计，搜索邻域可用"面积"给出（自动换算半径），多期分析时会计算
+  覆盖各期的统一分级上界，便于多张密度图共用同一图例（横向对比）。
+domain: raster
+category: raster
+triggers: [核密度, 密度图, 点密度, kernel density, 聚集程度, 热点密度]
+preconditions:
+  - 点数据已投影到投影坐标系（半径单位是米）
+params:
+  points:
+    type: string
+    required: true
+    description: 输入点要素
+  where:
+    type: string
+    default: ""
+    description: 可选筛选条件（如 "NAME = 'Giraffe'"）
+  out_dir:
+    type: string
+    required: true
+    description: 输出目录（每期一个 TIFF）
+  period_field:
+    type: string
+    default: "YEAR"
+    description: 分期字段；留空则只出一期
+  periods:
+    type: string
+    default: ""
+    description: 分期定义（如 "1982-1986,1987-1991"）；留空则按 period_field 的每个取值各出一期
+  neighborhood_area_km2:
+    type: number
+    default: 100
+    description: 搜索邻域**面积**（km²），内部按 半径=√(面积/π) 换算
+  cell_size:
+    type: number
+    default: 100
+    description: 输出像元大小（米）
+  breaks:
+    type: string
+    default: ""
+    description: >
+      统一分级边界（逗号分隔，如 "0,2,4,6,8"）。留空则按各期最大值自动给出
+      suggested_bounds（区间上界取整步长），供多张图共用。
+steps:
+  - 按分期筛选点并建临时要素类
+  - 半径按面积换算，逐期做 KernelDensity
+  - 汇总各期最大值，给出统一分级边界
+  - 返回每期统计与分级建议
+code_template: |
+  import arcpy, os, math, tempfile, numpy as np
+
+  arcpy.env.overwriteOutput = True
+
+  points = {{points}}
+  where = str({{where}} or "").strip()
+  out_dir = {{out_dir}}
+  period_field = str({{period_field}} or "YEAR").strip()
+  periods_spec = str({{periods}} or "").strip()
+  area_km2 = float({{neighborhood_area_km2}} or 100)
+  cell = float({{cell_size}} or 100)
+  breaks_spec = str({{breaks}} or "").strip()
+
+  if not arcpy.Exists(points):
+      raise ValueError(f"点数据不存在: {points}")
+  os.makedirs(out_dir, exist_ok=True)
+  radius = math.sqrt(area_km2 / math.pi) * 1000.0
+
+  # 分期
+  periods = []
+  if periods_spec:
+      for piece in periods_spec.replace("，", ",").split(","):
+          piece = piece.strip()
+          if not piece:
+              continue
+          if "-" in piece:
+              start, end = piece.split("-", 1)
+              periods.append((piece, f"{period_field} >= {int(start)} AND {period_field} <= {int(end)}"))
+          else:
+              periods.append((piece, f"{period_field} = {int(piece)}"))
+  elif period_field:
+      years = []
+      with arcpy.da.SearchCursor(points, [period_field], where_clause=where or None) as cursor:
+          for (value,) in cursor:
+              if value is not None:
+                  years.append(int(value))
+      for year in sorted(set(years)):
+          periods.append((str(year), f"{period_field} = {year}"))
+  if not periods:
+      periods = [("all", where)]
+
+  work = tempfile.mkdtemp(prefix="kde_")
+  gdb = os.path.join(work, "kde.gdb")
+  arcpy.management.CreateFileGDB(work, "kde.gdb")
+  stats = []
+  rasters = []
+  for tag, clause in periods:
+      fc = os.path.join(gdb, f"pts_{tag.replace('-', '_').replace(' ', '')}")
+      where_bits = [bit for bit in (where, clause) if bit]
+      arcpy.management.FeatureClassToFeatureClass(points, gdb, os.path.basename(fc), " AND ".join(where_bits) or None)
+      count = int(arcpy.management.GetCount(fc)[0])
+      if count == 0:
+          continue
+      # 实测：KernelDensity 不接受 out_raster 关键字；要接住返回的 Raster 再 save
+      density = arcpy.sa.KernelDensity(
+          in_features=fc, population_field="NONE", cell_size=cell,
+          search_radius=radius, area_unit_scale_factor="SQUARE_KILOMETERS",
+      )
+      out_raster = os.path.join(out_dir, f"kde_{tag}.tif")
+      density.save(out_raster)
+      rasters.append(out_raster)
+      arr = arcpy.RasterToNumPyArray(out_raster, nodata_to_value=np.nan).astype("float64")
+      stats.append({
+          "period": tag,
+          "points": count,
+          "max": float(np.nanmax(arr)),
+          "p95": float(np.nanpercentile(arr, 95)),
+          "raster": out_raster,
+      })
+
+  # 统一分级：给定则用给定的，否则按各期最大值给整数步长建议
+  bounds = []
+  if breaks_spec:
+      bounds = sorted(float(x) for x in breaks_spec.replace("，", ",").split(",") if x.strip())
+  else:
+      overall = max((s["max"] for s in stats), default=0.0)
+      if overall > 0:
+          step = 10 ** int(math.floor(math.log10(max(overall / 5.0, 1e-6))))
+          for factor in (1, 2, 2.5, 5, 10):
+              if overall / (step * factor) <= 6:
+                  step = step * factor
+                  break
+          value = 0.0
+          bounds = [0.0]
+          while value < overall:
+              value += step
+              bounds.append(round(value, 6))
+
+  set_result({
+      "output": rasters[0] if rasters else "",
+      "outputs": rasters,
+      "stats": stats,
+      "radius_m": round(radius, 1),
+      "neighborhood_area_km2": area_km2,
+      "cell_size": cell,
+      "suggested_bounds": bounds,
+      "legend_note": "多期统一图例请把 suggested_bounds 传给制图配方（class_bounds）",
+  })
+  print(f"核密度完成：{len(rasters)} 期，半径 {radius:.0f} m，分级建议 {bounds}")
+validation:
+  - type: raster_not_constant
+    path: "{{out_dir}}/kde_all.tif"
+pitfalls:
+  - >-
+    半径来自**面积**：√(面积/π)。100 km² → 约 5642 m。
+  - >-
+    `arcpy.sa.KernelDensity` **不接受** out_raster 关键字参数，必须接住返回的 Raster 对象再 `.save(path)`。
+  - >-
+    多期统一图例：用返回值里的 suggested_bounds 作制图配方的 class_bounds，四张图才能横向对比。
+  - >-
+    密度值随搜索半径变化，跨任务比较前先统一半径与像元大小。
+examples:
+  - >-
+    按五年一期（1982-1986…）做四期核密度，邻域面积 100 km²，并给出统一分级

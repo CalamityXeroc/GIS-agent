@@ -170,6 +170,23 @@ _RULES: list[tuple[str, list[str], str, str]] = [
         "SelectLayerByAttribute/AddJoin/CalculateField 等对“图层”参数都要这样处理。",
     ),
     (
+        "mpl-cjk",
+        [r"missing from font", r"findfont: Font family .* not found", r"Glyph \d+ .* missing"],
+        "matplotlib 缺中文字形（图里的中文会变成方框）",
+        "内核启动时已自动配置中文字体（微软雅黑/黑体），若仍报缺字形，说明代码里显式指定了不带中文字形的字体"
+        "（如 `fontfamily='Arial'`、`plt.rcParams['font.family']='serif'`）或覆盖了 rcParams。"
+        "正确做法：`plt.rcParams['font.sans-serif']=['Microsoft YaHei','SimHei','SimSun']` 且 "
+        "`plt.rcParams['axes.unicode_minus']=False`；**不要用 simsunb.ttf**（SimSun-ExtB 只有生僻字，会全变方框）。"
+        "画完必须 `savefig` 到 output/ 再交付，交付前看一眼图上中文是否可读。",
+    ),
+    (
+        "mpl-show",
+        [r"FigureCanvasAgg.*non-interactive", r"plt\.show\(\).*(Agg|non-interactive)", r"show\(\) is deprecated"],
+        "后台无窗口，plt.show() 不会显示图",
+        "内核使用无界面后端（Agg），图必须 `fig.savefig(输出路径, dpi=150, bbox_inches='tight')` 落盘后才能作为成果交付，"
+        "不要依赖 `plt.show()`。",
+    ),
+    (
         "layer-select-hang",
         [
             r"SelectLayerByAttribute",

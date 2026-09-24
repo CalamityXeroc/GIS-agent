@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +38,9 @@ class LoopConfig:
     verbose: bool = False
     max_diagnosis_turns: int = 3
     escalate_after_failures: int = 2
+    # 整跑截止时间：网关半死不活时，单轮 LLM 调用可能反复重试几十分钟，
+    # 若无总截止，一次 run 会整夜空转（实测 11.7h/22 轮）。到时后置 deadline_exceeded。
+    run_deadline_seconds: float = 7200.0
 
 
 _DIAGNOSIS_TOOLS = {"catalog_query", "read_document", "list_recipes"}
@@ -112,6 +116,7 @@ class AgentLoop:
         run_id = new_run_id()
         self.recorder = self.recorder or RunRecorder(run_id, self.workspace / ".gis_agent" / "traces")
         self.state = TaskState(run_id=run_id, goal=goal, workspace=str(self.workspace))
+        self._deadline = None
         self.context.state = self.state
         for item in requirements or []:
             if isinstance(item, Requirement):
@@ -146,8 +151,23 @@ class AgentLoop:
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": self._initial_user_message(goal, doc_paths)},
         ]
+        self._deadline = (
+            time.monotonic() + self.config.run_deadline_seconds
+            if self.config.run_deadline_seconds and self.config.run_deadline_seconds > 0
+            else None
+        )
 
         while self.state.turn < self.config.max_turns and self.state.status == "running":
+            if self._deadline is not None and time.monotonic() > self._deadline:
+                self.state.status = "deadline_exceeded"
+                self.state.error = (
+                    f"整跑截止时间已到（run_deadline_seconds={self.config.run_deadline_seconds:g}s，"
+                    f"已完成 {self.state.turn} 轮）。通常是模型网关长时间不可用导致单轮反复重试；"
+                    "可排查网关后用 resume 从 trace 续跑。"
+                )
+                self.recorder.record("deadline_exceeded", {"turns": self.state.turn, "error": self.state.error})
+                self._emit("deadline_exceeded", {"turns": self.state.turn, "error": self.state.error})
+                break
             self.state.turn += 1
             self.recorder.record("turn", {"turn": self.state.turn})
             self._emit("turn", {"turn": self.state.turn, "tasklist": self.state.tasklist_digest()})
@@ -158,6 +178,7 @@ class AgentLoop:
                 if self._consecutive_failures >= max(1, self.config.escalate_after_failures)
                 else "agent"
             )
+            self._sanitize_messages()
             try:
                 response, actions = self.codec.call(
                     self._messages,
@@ -209,6 +230,8 @@ class AgentLoop:
                 self._append_observation(observation, action)
                 if stop:
                     break
+
+            self._append_turn_images(turn_observations)
 
             # Speed guardrails: exploration budget + failure escalation.
             self._update_guards(actions, turn_observations)
@@ -415,8 +438,16 @@ class AgentLoop:
     # ------------------------------------------------------------- messages
     # ------------------------------------------------------------ error memory
     def _enrich_failure(self, observation: Observation) -> Observation:
-        """Append distilled fix suggestions to a failing observation's hint."""
-        if observation.ok or not self.use_error_memory:
+        """Append distilled fix suggestions to a failing observation's hint.
+
+        也处理**成功但带 stderr 告警**的观察：matplotlib 缺字形（图里中文变方框）
+        只写 stderr，若只在失败时匹配，这类问题永远看不见。
+        """
+        if not self.use_error_memory:
+            return observation
+        data = observation.data if isinstance(observation.data, dict) else {}
+        stderr_text = str(data.get("stderr") or "")
+        if observation.ok and not stderr_text:
             return observation
         try:
             from ..runtime.error_memory import enrich_hint
@@ -429,6 +460,7 @@ class AgentLoop:
                     str(error.get("message", "")),
                     str(error.get("traceback", ""))[-2000:],
                     str(error.get("stderr", ""))[-1500:],
+                    stderr_text[-1500:],
                 ]
             )
             enriched = enrich_hint(observation.hint or "", text)
@@ -475,6 +507,11 @@ class AgentLoop:
             "- **数字要守恒**：交付前用独立途径核对总量（如分摊前后合计、分区合计 vs 全体合计），"
             "差异超 1% 必须查清或如实说明。\n"
             "- **方法可复现**：结论里写清公式与口径（数据源、筛选条件、统计范围），让第三者能重跑。\n"
+            "- **按规范命名**：分类编码的类别名一律用任务给定的代码表（如土地覆盖 1=水域 2=林地 5=耕地 7=建筑区 8=裸地 11=牧场），"
+            "报告与图例都不能只给编码或自创名称。\n"
+            "- **交付前清点**：过程库只留必要中间件——同一个名称前缀出现多个版本（如 dem_mosaic_wgs84 / dem_mosaic_utm / dem_mosaic）"
+            "是重做残留，必须删；`output/` 里不留 .pkl/.tmp/.bak 过程文件（可先移入过程库）。"
+            "清理用 `cleanup_gdb`（先 dry_run 预览再执行），并保证结果库里的成果层一个不少。\n"
             "- **坑要记下**：踩到的工具/API/数据坑写进 finish 说明，系统会记入项目日志供后续任务使用。\n\n"
             f"## 数据目录摘要\n{self._catalog_digest()}\n\n"
             f"## 需求清单\n{self.state.requirements_digest() or '（由你从用户需求中提炼，并用 update_tasklist 呈现）'}\n\n"
@@ -534,6 +571,41 @@ class AgentLoop:
         else:
             self._messages.append({"role": "assistant", "content": content or ""})
 
+    def _sanitize_messages(self) -> None:
+        """保证消息序列合法：role=tool 必须紧跟带 tool_calls 的 assistant 消息。
+
+        严格端点（实测 DeepSeek）会直接 400：
+        ``Messages with role 'tool' must be a response to a preceding message with 'tool_calls'``。
+        上下文压缩、协议切换、附图插入都可能破坏这个顺序，这里统一兜底修正：
+        孤立的 tool 消息降级成 user 文本（内容完整保留，不丢信息）。
+        """
+        fixed: list[dict[str, Any]] = []
+        pending: set[str] = set()
+        for message in self._messages:
+            role = str(message.get("role", ""))
+            if role == "assistant":
+                pending = {
+                    str(call.get("id"))
+                    for call in (message.get("tool_calls") or [])
+                    if isinstance(call, dict) and call.get("id")
+                }
+                fixed.append(message)
+                continue
+            if role == "tool":
+                tool_id = str(message.get("tool_call_id") or "")
+                if tool_id and tool_id in pending:
+                    pending.discard(tool_id)
+                    fixed.append(message)
+                else:
+                    fixed.append({"role": "user", "content": str(message.get("content") or "")})
+                continue
+            if role == "user":
+                pending.clear()
+            fixed.append(message)
+        if len(fixed) != len(self._messages):
+            logger.debug("消息序列已修正：%d -> %d", len(self._messages), len(fixed))
+        self._messages = fixed
+
     def _append_user(self, content: str) -> None:
         self._messages.append({"role": "user", "content": content})
 
@@ -548,6 +620,57 @@ class AgentLoop:
             self._messages.append(
                 {"role": "user", "content": f"工具 {action.tool} 的返回：\n{payload}"}
             )
+
+    def _vision_enabled(self) -> bool:
+        """配置里开了识图、且客户端声明支持时才附图。"""
+        try:
+            return bool(getattr(self.llm.config, "vision", False))
+        except Exception:  # pragma: no cover - 配置对象异常不影响主流程
+            return False
+
+    def _append_turn_images(self, observations: list[Observation]) -> None:
+        """模型能识图时，把观察到的图片附进对话，让它自己核对图面。
+
+        这正是过去“中文变方框的图一路通过验收”的补救：模型能看图，
+        就能在图面上发现标题/图例不可读、地图被裁、图幅空白等问题。
+        """
+        if not self._vision_enabled():
+            return
+        try:
+            from ..runtime.image_input import as_data_url, is_image_path
+
+            candidates: list[str] = []
+            for observation in observations:
+                candidates += [str(item) for item in (observation.images or [])]
+                candidates += [str(p) for p in (observation.artifacts or []) if is_image_path(p)]
+            seen: set[str] = set()
+            candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+            parts = []
+            for item in candidates[:2]:
+                url = as_data_url(item)
+                if url:
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
+            if not parts:
+                return
+            self._messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "上面工具的图片产出（请核对图面：图名/图例/比例尺是否齐全且可读，"
+                                "中文有没有变成方框或乱码，图幅是否被裁切/过大面积空白）。"
+                            ),
+                        },
+                        *parts,
+                    ],
+                }
+            )
+            if self.recorder is not None:
+                self.recorder.record("vision_images", {"count": len(parts), "files": candidates[:2]})
+        except Exception as exc:  # pragma: no cover - 附图失败不影响主流程
+            logger.debug("attach observation images failed: %s", exc)
 
     # ------------------------------------------------------------ compaction
     def _estimate_tokens(self) -> int:
@@ -704,6 +827,7 @@ class AgentLoop:
             if self.recorder is not None:
                 self.recorder.record("turn", {"turn": self.state.turn, "resumed": True})
             self._compact_if_needed()
+            self._sanitize_messages()
             try:
                 response, actions = self.codec.call(
                     self._messages,
@@ -724,6 +848,7 @@ class AgentLoop:
                 self._append_observation(observation, action)
                 if stop:
                     break
+            self._append_turn_images(turn_observations)
             if stop:
                 break
         if self.state.status == "running":

@@ -112,7 +112,10 @@ class QualityCheckTool(Tool[QualityCheckInput, QualityCheckOutput]):
             )
         
         valid_checks = {"geometry", "topology", "attributes", "crs"}
-        invalid = set(input_data.check_types) - valid_checks
+        # Normalize common singular forms to plural shorthand
+        _alias = {"attribute": "attributes", "topo": "topology", "geo": "geometry"}
+        normalized = [_alias.get(c, c) for c in input_data.check_types]
+        invalid = set(normalized) - valid_checks
         if invalid:
             return ValidationResult.failure(
                 f"Invalid check types: {invalid}. Valid: {valid_checks}",

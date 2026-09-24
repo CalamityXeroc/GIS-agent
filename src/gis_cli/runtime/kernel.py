@@ -40,6 +40,14 @@ def set_result(value):
     {_RESULT_VAR} = value
 
 _bi.{_RESULT_VAR} = None
+
+# 中文字体与绘图环境：matplotlib 默认字体没有中文字形，图里中文会变方框（tofu）。
+# 统一配置一次（缺 matplotlib 时静默跳过），保证 agent 自绘图的中文可读。
+try:
+    from gis_cli.runtime.mpl_setup import configure as _mpl_configure
+    _mpl_configure()
+except Exception:
+    pass
 '''
 
 

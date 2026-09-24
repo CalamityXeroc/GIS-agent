@@ -33,6 +33,23 @@ _CODE_MARKER_RECIPES = (
 )
 
 
+def _stderr_warning_hint(stderr_text: str) -> str:
+    """把成功执行时的 stderr 告警转成修复提示（复用错误记忆规则）。
+
+    典型场景：matplotlib 缺中文字形（图上中文变方框），这类告警只写 stderr，
+    若不回喂模型，交付的图再难也无人发现。无命中时返回空串。
+    """
+    if not stderr_text:
+        return ""
+    try:
+        from ..runtime.error_memory import enrich_hint
+
+        return enrich_hint("", stderr_text)
+    except Exception as exc:  # pragma: no cover - 记忆模块不影响主流程
+        logger.debug("stderr warning hint failed: %s", exc)
+        return ""
+
+
 def _recipe_soft_hint(ctx: EngineContext, description: str, code: str) -> str:
     """代码执行成功，但该操作其实有自带断言的配方时，提一句（不阻断）。"""
     if getattr(ctx, "recipes", None) is None:
@@ -265,13 +282,24 @@ def build_default_registry() -> EngineToolRegistry:
                 if ctx.state is not None:
                     ctx.state.add_artifact(path)
             soft_hint = _recipe_soft_hint(ctx, description, code)
+            data: dict[str, Any] = {"stdout": result.stdout[-4000:], "result": result.result}
+            # 预警也要能看见：matplotlib 缺字形、UserWarning 之类只写 stderr，
+            # 之前成功路径只回传 stdout，导致“中文全变方框”的图一路通过验收。
+            warning_hint = ""
+            stderr_text = str(result.stderr or "").strip()
+            if stderr_text:
+                data["stderr"] = stderr_text[-1500:]
+                warning_hint = _stderr_warning_hint(stderr_text)
+                if warning_hint:
+                    summary += "；⚠️ 有执行告警，见 hint"
+            hint = "\n".join(part for part in (warning_hint, soft_hint) if part)
             return Observation(
                 ok=True,
                 summary=summary,
-                data={"stdout": result.stdout[-4000:], "result": result.result},
+                data=data,
                 artifacts=artifacts,
                 images=result.display_images[:3],
-                hint=soft_hint,
+                hint=hint,
             )
         error = result.error or {"type": "Unknown", "message": "execution failed"}
         hint = "请根据 traceback 修正代码后重试；优先检查字段名/坐标系/路径是否存在。"
@@ -421,6 +449,53 @@ def build_default_registry() -> EngineToolRegistry:
                 "properties": {"query": {"type": "string", "description": "关键词；留空表示全部"}},
             },
             handler=_list_recipes,
+        )
+    )
+
+    # --------------------------------------------------------- view_image
+    def _view_image(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """让模型看一眼产出的图片（地图/统计图）。模型需支持识图。"""
+        from ..runtime.image_input import is_image_path
+
+        raw = str(args.get("path", "") or "").strip()
+        if not raw:
+            return Observation(ok=False, summary="path 为空", error={"type": "BadRequest"})
+        path = Path(raw) if Path(raw).is_absolute() else (ctx.workspace / raw)
+        if not path.exists():
+            return Observation(
+                ok=False, summary=f"图片不存在: {path}", error={"type": "FileNotFound"}
+            )
+        if not is_image_path(path):
+            return Observation(
+                ok=False, summary=f"不是图片文件: {path.name}", error={"type": "NotImage"}
+            )
+        size_kb = path.stat().st_size / 1024
+        return Observation(
+            ok=True,
+            summary=(
+                f"已加载图片供你查看（{path.name}，{size_kb:.0f} KB）。"
+                "请核对图面：图名/图例/比例尺/指北针是否齐全且可读，中文有无方框乱码，"
+                "图幅有无被裁切或大面积空白；有问题则修正后重新导出。"
+            ),
+            data={"path": str(path)},
+            images=[str(path)],
+        )
+
+    registry.register(
+        EngineTool(
+            name="view_image",
+            description=(
+                "查看一张产出图片（地图/统计图/截图），用于核对图面质量：图名/图例/比例尺是否齐全、"
+                "中文是否可读（有无方框）、地图是否被裁切或空白。模型支持识图时才看得见内容。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "图片路径（可相对 workspace）"},
+                },
+                "required": ["path"],
+            },
+            handler=_view_image,
         )
     )
 
@@ -698,14 +773,51 @@ def build_default_registry() -> EngineToolRegistry:
 _QUOTED_PATH = re.compile(r"""["']([A-Za-z]:[\\/][^"'<>|*?\n]+|\.{0,2}[\\/][^"'<>|*?\n]+)["']""")
 
 
+# 不做自动备份的目录名（只读输入数据；备份它既无意义又极占空间）
+_BACKUP_SKIP_DIRS = {"input", "skills", "config", ".git", ".venv"}
+# 单个目录备份体积上限（MB）：超限则跳过并告警，避免 copytree 拖垮磁盘
+_BACKUP_DIR_MAX_MB = 200
+
+
+def _dir_size_mb(path: Path) -> float:
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            if item.is_file():
+                total += item.stat().st_size
+            if total > _BACKUP_DIR_MAX_MB * 1024 * 1024:
+                return total / 1024 / 1024
+    except OSError:
+        return 0.0
+    return total / 1024 / 1024
+
+
 def _referenced_existing_paths(code: str, workspace: Path) -> list[str]:
-    """Best-effort: existing paths referenced by destructive code."""
+    """Best-effort: existing paths referenced by destructive code.
+
+    只备份"可能被改写的结果文件"，不备份只读输入与超大目录：
+    - ``input/``（及 skills/config/.git/.venv）是只读数据，备份无意义
+    - 目录体积超过 ``_BACKUP_DIR_MAX_MB`` 时跳过（实测整目录备份一次 300 MB）
+    """
     found: list[str] = []
     for match in _QUOTED_PATH.finditer(code):
         raw = match.group(1)
         candidate = Path(raw)
         if not candidate.is_absolute():
             candidate = workspace / raw
-        if candidate.exists() and str(candidate) not in found:
-            found.append(str(candidate))
+        if not candidate.exists() or str(candidate) in found:
+            continue
+        if candidate.is_dir():
+            name = candidate.name.lower()
+            if name in _BACKUP_SKIP_DIRS:
+                logger.info("skip backup of read-only dir: %s", candidate)
+                continue
+            size_mb = _dir_size_mb(candidate)
+            if size_mb > _BACKUP_DIR_MAX_MB:
+                logger.warning(
+                    "skip backup of large dir (%.0f MB > %s MB): %s",
+                    size_mb, _BACKUP_DIR_MAX_MB, candidate,
+                )
+                continue
+        found.append(str(candidate))
     return found

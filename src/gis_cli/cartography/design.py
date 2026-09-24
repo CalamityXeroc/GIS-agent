@@ -46,28 +46,39 @@ _MM_PER_PT = 25.4 / 72.0
 # --------------------------------------------------------------------- intent
 
 def normalize_intent(intent: dict[str, Any] | None) -> dict[str, Any]:
-    """规整意图参数（缺省即自动）。"""
+    """规整意图参数（缺省即自动）。
+
+    注意：这里必须**保留调用方传入的自定义键**（如 ``class_bounds`` 统一分级、
+    ``category_names`` 类别显示名）——以前是白名单重建，会把这类键静默丢掉，
+    导致“传了参数却看不出效果”（实测：category_names 没进图例、class_bounds 不生效）。
+    """
     data = dict(intent or {})
-    return {
-        "theme": str(data.get("theme", "") or "").strip(),
-        "purpose": str(data.get("purpose", "分布") or "分布").strip(),
-        "medium": str(data.get("medium", "") or "").strip(),          # print_A4 / screen_16_9 / ""（自动）
-        "orientation": str(data.get("orientation", "auto") or "auto").strip(),
-        "legend_labels": str(data.get("legend_labels", "") or "").strip(),  # range / semantic / both
-        "style_profile": str(data.get("style_profile", "") or "").strip(),
-        "title": str(data.get("title", "") or "").strip(),
-        "region": str(data.get("region", "") or "").strip(),
-        "scale": str(data.get("scale", "") or "").strip(),
-        "map_kind": str(data.get("map_kind", "") or "").strip(),
-        "classification": str(data.get("classification", "") or "").strip(),
-        "field": str(data.get("field", "") or "").strip(),
-        "legend_title": str(data.get("legend_title", "") or "").strip(),
-        "color_ramp": str(data.get("color_ramp", "") or "").strip(),
-        "category_colors": str(data.get("category_colors", "") or "").strip(),
-        "category_order": list(data.get("category_order") or []),
-        "overrides": dict(data.get("overrides") or {}),
-        "note": str(data.get("note", "") or "").strip(),
-    }
+    normalized = dict(data)
+    normalized.update(
+        {
+            "theme": str(data.get("theme", "") or "").strip(),
+            "purpose": str(data.get("purpose", "分布") or "分布").strip(),
+            "medium": str(data.get("medium", "") or "").strip(),          # print_A4 / screen_16_9 / ""（自动）
+            "orientation": str(data.get("orientation", "auto") or "auto").strip(),
+            "legend_labels": str(data.get("legend_labels", "") or "").strip(),  # range / semantic / both
+            "style_profile": str(data.get("style_profile", "") or "").strip(),
+            "title": str(data.get("title", "") or "").strip(),
+            "region": str(data.get("region", "") or "").strip(),
+            "scale": str(data.get("scale", "") or "").strip(),
+            "map_kind": str(data.get("map_kind", "") or "").strip(),
+            "classification": str(data.get("classification", "") or "").strip(),
+            "field": str(data.get("field", "") or "").strip(),
+            "legend_title": str(data.get("legend_title", "") or "").strip(),
+            "color_ramp": str(data.get("color_ramp", "") or "").strip(),
+            "category_colors": str(data.get("category_colors", "") or "").strip(),
+            "category_names": str(data.get("category_names", "") or "").strip(),
+            "class_bounds": data.get("class_bounds") or data.get("explicit_bounds") or "",
+            "category_order": list(data.get("category_order") or []),
+            "overrides": dict(data.get("overrides") or {}),
+            "note": str(data.get("note", "") or "").strip(),
+        }
+    )
+    return normalized
 
 
 # ------------------------------------------------------------------ 长度取整
@@ -186,6 +197,8 @@ def design_layout(
         "north_arrow": {**north_arrow, **geometry["north_arrow_box"]},
         "renderer": renderer,
         "labels": labels,
+        # 叠加层元素（迁移图的箭头/年份标注）：数据坐标，渲染后按实测地图框范围换算像素
+        "overlay": dict(intent.get("overlay") or {}),
         "extent": {"padding": float(profile.get("extent_padding", 0.08)), "data": extent},
         "dpi": int(profile.get("dpi", 250)),
         "title_style": str(intent.get("title_style") or "overlay"),
@@ -488,6 +501,21 @@ def _plan_renderer(
     colors = profile.get("colors", {}) if profile else {}
     palette = list(colors.get("categorical") or [])
     category_colors = intent.get("category_colors") or _auto_category_colors(profile_stats, palette)
+    # 显式分级（统一图例）：多期/多图要能直接对比，必须用同一组分级上界。
+    # DefinedInterval 每张图从各自最小值起算，做不到跨图统一。
+    explicit_bounds = _parse_class_bounds(intent.get("class_bounds") or intent.get("explicit_bounds"))
+    if explicit_bounds:
+        # 语义：给定的是**分级边界**（n 个边界 → n-1 级）。这样 "0,50,100" 读起来自然，
+        # 也避免出现“首级区间倒置”（若把边界当上界，第一级会变成 数据最小值–第一个边界 ✗）。
+        class_count = max(1, len(explicit_bounds) - 1)
+        method = "Manual"
+        interval = None
+        decisions.append({
+            "key": "explicit_bounds",
+            "value": explicit_bounds,
+            "why": f"指定 {class_count} 级显式分级（多图共用同一图例才能横向对比）",
+            "source": "intent",
+        })
     labels_mode = intent.get("legend_labels") or (profile.get("legend", {}) or {}).get("labels_mode", "semantic")
     resolved_mode = "unique" if mode == "unique" else ("graduated" if continuous and not primary_is_raster else mode)
     if primary_is_raster:
@@ -507,14 +535,38 @@ def _plan_renderer(
         "class_count": class_count,
         "classification_method": method,
         "interval_size": interval,
+        "explicit_bounds": explicit_bounds,
         "color_ramp": ramp,
         "category_colors": category_colors,
+        "category_names": intent.get("category_names") or "",
         "category_order": list(intent.get("category_order") or []),
         "labels_mode": labels_mode,
         "nodata_color": colors.get("nodata_color", "#E8E8E8"),
         "field_stats": profile_stats,
         "layer_paths": [l.get("path") for l in layers],
     }
+
+
+def _parse_class_bounds(raw: Any) -> list[float]:
+    """解析显式分级上界（"0,50,100" 或 "[0,50,100]" 或列表）→ 升序去重 float 列表。
+
+    用于“统一图例”：多张图传入同一组上界，图例才能横向对比（核密度多期图实测需求）。
+    """
+    values: list[float] = []
+    if raw is None or raw == "":
+        return values
+    if isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        text = str(raw).strip().strip("[]()")
+        items = [piece for piece in text.replace(";", ",").replace(" ｜ ", ",").split(",") if piece.strip()]
+    for item in items:
+        try:
+            values.append(float(str(item).strip()))
+        except (TypeError, ValueError):
+            continue
+    unique = sorted(set(values))
+    return unique
 
 
 def _pick_ramp(text: str, profile: dict[str, Any]) -> str:

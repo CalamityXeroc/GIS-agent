@@ -27,6 +27,12 @@ params:
     type: string
     default: ""
     description: '值到颜色映射，如 "标杆社区:#1F77B4;需整改社区:#2CA02C"；空则按调色板自动分配'
+  category_names:
+    type: string
+    default: ""
+    description: >-
+      值到显示名的映射（图例用名称而不是编码），如 "1:水域;2:林地;5:耕地;7:建筑区;8:裸地;11:牧场"。
+      类别编码存储时必须传——竞赛/行业规范都要求图例显示规范名称。
   other_color:
     type: string
     default: ""
@@ -78,11 +84,13 @@ code_template: |
   output_path = {{output_path}}
 
   if not arcpy.Exists(input_path):
-      raise ValueError(f"输入数据不存在: {input_path}")
-  fields = [f.name for f in arcpy.ListFields(input_path)]
-  if category_field not in fields:
-      raise ValueError(f"分类字段不存在: {category_field}；可用字段: {fields}")
-
+  # 分类栅格（如土地覆盖编码）没有属性字段，按像元值分类即可；只有矢量才校验字段
+  _desc = arcpy.Describe(input_path)
+  _is_raster = str(getattr(_desc, "dataType", "")).lower().startswith("raster") or bool(getattr(_desc, "isRaster", False))
+  if not _is_raster:
+      fields = [f.name for f in arcpy.ListFields(input_path)]
+      if category_field not in fields:
+          raise ValueError(f"字段不存在: {category_field}；可用字段: {fields}")
   # 未映射的类别落到"其他"颜色
   overrides = dict({{overrides}})
   _other = {{other_color}}
@@ -96,6 +104,7 @@ code_template: |
       "scale": {{scale}},
       "legend_title": {{legend_title}},
       "category_colors": {{category_colors}},
+      "category_names": {{category_names}},
       "style_profile": {{style_profile}},
       "mode": "unique",
       "field": category_field,
@@ -132,7 +141,8 @@ validation:
   - type: result_key_truthy
     key: "aprx_saved"
 pitfalls:
-  - 颜色映射里的值必须与数据里的类别值完全一致（含空格）；写错会整片显示成"其他"浅灰。
+  - 颜色映射里的值必须与数据里的类别值完全一致（含空格）；写错会整片显示成“其他”浅灰。
+  - 类别用编码存储时（如土地覆盖 1/2/5/7/8/11）一定要传 category_names，否则图例只能显示编码。
   - 类别过多（>12）时图例拥挤，建议先归并小类。
   - 图例标题在多图层符号清单场景会自动省略（惯例），需要标题请显式传 legend_title。
   - 工程(.aprx)已 aprx.save() 落盘；想追加到同一工程时传 aprx_path 指向已有工程（会复制再改，不动原文件）。

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -290,8 +291,30 @@ class RecipeLibrary:
                 target, str(raw.get("field", "") or ""), {str(k): int(v) for k, v in expect.items()}
             )
             ok = counts is not None and not bad
-            detail = f"counts={counts}" if ok else f"不符: {bad}；实际={counts}"
+            if counts is None:
+                detail = f"字段读取失败: {getattr(self, '_last_counts_error', '')}"
+            else:
+                detail = f"counts={counts}" if ok else f"不符: {bad}；实际={counts}"
             return ValidationResult(kind, target, ok, detail)
+        if kind == "field_value_counts_between":
+            # 脏数据任务的类别数量常有合理区间（多物种拆行/空值剔除方式不同），用区间断言避免假阴性
+            expect = raw.get("value") or expected or {}
+            if not isinstance(expect, dict) or not expect:
+                return ValidationResult(kind, target, False, "value 需要写成 {类别: [lo,hi]} 映射")
+            field = str(raw.get("field", "") or "")
+            try:
+                bands = {str(k): (int(v[0]), int(v[1])) for k, v in expect.items()}
+            except Exception:
+                return ValidationResult(kind, target, False, f"区间写法错误: {expect}")
+            counts, err = self._field_counts_all(target, field)
+            if counts is None:
+                return ValidationResult(kind, target, False, f"字段读取失败: {err}")
+            bad = [
+                f"{label}: 实际{counts.get(label)}(期望{lo}~{hi})"
+                for label, (lo, hi) in bands.items()
+                if counts.get(label) is None or not (lo <= int(counts[label]) <= hi)
+            ]
+            return ValidationResult(kind, target, not bad, f"counts={counts} 不符={bad}")
         if kind == "field_values_subset":
             allowed = expected if isinstance(expected, list) else [expected]
             allowed_set = {str(a) for a in allowed}
@@ -312,6 +335,26 @@ class RecipeLibrary:
             wkid = self._crs_wkid(target)
             ok = wkid is not None and int(wkid) == int(expected)
             return ValidationResult(kind, target, ok, f"wkid={wkid} expected={expected}")
+        if kind == "crs_wkid_in":
+            # 同一目标坐标系的等价写法可能有多个（如 UTM 10N 的 WGS84=32610 / NAD83=26910）
+            allowed = expected if isinstance(expected, list) else [expected]
+            wkid = self._crs_wkid(target)
+            ok = wkid is not None and int(wkid) in {int(a) for a in allowed}
+            return ValidationResult(kind, target, ok, f"wkid={wkid} allowed={sorted(int(a) for a in allowed)}")
+        if kind == "bbox_between":
+            # 范围框（投影坐标）落在给定区间内，用于「研究区应等于点群包络 ±2km」这类几何判据
+            box = self._bbox(target)
+            expect = raw.get("value") if raw.get("value") is not None else expected
+            try:
+                lo = {k: float(v[0]) for k, v in expect.items()}
+                hi = {k: float(v[1]) for k, v in expect.items()}
+            except Exception:
+                return ValidationResult(kind, target, False, f"value 需要写成 {{xmin:[lo,hi],...}}: {expect}")
+            if box is None:
+                return ValidationResult(kind, target, False, "范围读取失败（要素类不存在或内核不可用）")
+            bad = [k for k in lo if box.get(k) is None or not (lo[k] <= float(box[k]) <= hi[k])]
+            detail = " ".join(f"{k}={box.get(k):.1f}" if box.get(k) is not None else f"{k}=None" for k in ("xmin", "ymin", "xmax", "ymax"))
+            return ValidationResult(kind, target, not bad, f"{detail} out_of_range={bad}")
         if kind == "fields_present":
             fields = self._fields(target)
             required = expected if isinstance(expected, list) else [expected]
@@ -362,6 +405,98 @@ class RecipeLibrary:
             info = self._raster_range(target)
             ok = info is not None and info[0] is not None and info[1] is not None and info[0] != info[1]
             return ValidationResult(kind, target, ok, f"range={info}")
+        if kind == "raster_value_absent":
+            # 土地覆盖云修补类任务：修完后不允许再出现指定类别（如 Clouds=10）
+            wanted = expected if isinstance(expected, list) else [expected]
+            values = [int(v) for v in wanted if v is not None]
+            found, detail = self._raster_find_values(target, values)
+            if found is None:
+                return ValidationResult(kind, target, False, detail)
+            return ValidationResult(kind, target, not found, f"found={found} {detail}")
+        if kind == "shared_legend_bounds":
+            # 统一图例：多张图（如 4 期核密度）必须用完全相同的分级上界才能横向对比。
+            # 比对各 .spec.json 里“实际生效”的 applied_bounds（来自渲染后读回的 classBreaks）。
+            spec_dir = Path(target)
+            pattern = str(raw.get("pattern") or "*.spec.json")
+            cfg_shared = expected if isinstance(expected, dict) else {}
+            if isinstance(raw.get("value"), dict):
+                cfg_shared = raw["value"]
+            min_files = int(cfg_shared.get("min_files") or 2)
+            if not spec_dir.exists():
+                return ValidationResult(kind, target, False, f"目录不存在: {spec_dir}")
+            files = sorted(spec_dir.glob(pattern))
+            # 目录不存在/没图时也要给出明确结论，不静默放行
+            if len(files) < min_files:
+                return ValidationResult(
+                    kind, target, False, f"只找到 {len(files)} 份 spec（{pattern}），少于要求的 {min_files} 份"
+                )
+            bounds_map: dict[str, list] = {}
+            missing: list[str] = []
+            for path in files:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    missing.append(f"{path.name}(解析失败:{str(exc)[:40]})")
+                    continue
+                renderer = (data.get("renderer") or {}) if isinstance(data, dict) else {}
+                bounds = renderer.get("applied_bounds") or renderer.get("explicit_bounds")
+                if not bounds:
+                    missing.append(path.name)
+                    continue
+                bounds_map[path.name] = [float(x) for x in bounds]
+            if missing:
+                return ValidationResult(
+                    kind, target, False, f"这些图没有分级信息（未统一图例）: {'、'.join(missing[:5])}"
+                )
+            unique = {tuple(v) for v in bounds_map.values()}
+            ok = len(unique) == 1
+            detail = f"{len(bounds_map)} 份图共用 {len(unique)} 套分级"
+            if ok:
+                detail += f": {list(unique)[0]}"
+            else:
+                detail += ": " + "; ".join(f"{k}={v}" for k, v in list(bounds_map.items())[:4])
+            return ValidationResult(kind, target, ok, detail)
+
+        if kind == "raster_class_counts_between":
+            # 分类栅格的按值像元数区间（土地覆盖更新类任务：水域/建筑区面积是否落在合理区间）
+            # value 形如 {"1": [lo, hi], "7": [lo, hi]}；支持 count_scale 换算（如 100 m² 像元 → km²）
+            cfg = expected if isinstance(expected, dict) else {}
+            if isinstance(raw.get("value"), dict):
+                cfg = raw["value"]
+            if not cfg:
+                return ValidationResult(kind, target, False, "value 需要写成 {类别: [lo,hi]} 映射")
+            scale = float(raw.get("scale") or 1.0)
+            values = [int(float(k)) for k in cfg]
+            counts, detail = self._raster_find_values(target, values)
+            if counts is None:
+                return ValidationResult(kind, target, False, detail)
+            bad = []
+            report = {}
+            for key, band in cfg.items():
+                count = int(counts.get(str(int(float(key))), 0))
+                scaled = count * scale
+                report[key] = round(scaled, 3)
+                lo, hi = float(band[0]), float(band[1])
+                if not (lo <= scaled <= hi):
+                    bad.append(f"{key}: {scaled:.3f} 不在 [{lo},{hi}]")
+            return ValidationResult(kind, target, not bad, f"values={report} 不符={bad}")
+
+        if kind == "deliverable_hygiene_ok":
+            # 交付卫生：过程库里的**重做残留**（同前缀重复件）与禁止的过程文件。
+            # 实测第 14 届：temp_data.gdb 里 4 份 dem_mosaic*（159 MB），过程数据占交付量 96%，
+            # 而考卷要求“提交时删除非必要数据”。体积比只做警告（DEM 拼接这类天然偏大）。
+            cfg = raw.get("value") if isinstance(raw.get("value"), dict) else (expected if isinstance(expected, dict) else {})
+            max_families = int(cfg.get("max_duplicate_families", 0) or 0)
+            forbid = [str(x).lower() for x in (cfg.get("forbid_suffixes") or [".pkl", ".tmp", ".bak"])]
+            ratio_limit = float(cfg.get("warn_temp_result_ratio", 5) or 0)
+            problems, warnings_out, detail = self._hygiene_report(
+                target, max_duplicate_families=max_families, forbid_suffixes=forbid, ratio_limit=ratio_limit
+            )
+            if detail is None:
+                return ValidationResult(kind, target, False, self._last_hygiene_error or "交付卫生检查失败")
+            ok = not problems
+            note = "；".join(problems + [f"警告: {w}" for w in warnings_out]) or detail
+            return ValidationResult(kind, target, ok, note[:300])
         if kind == "image_not_blank":
             return self._image_check(target)
         if kind == "aprx_map_check":
@@ -396,33 +531,73 @@ class RecipeLibrary:
             return ValidationResult(kind, target, exists, f"{key}={raw_path}")
         return ValidationResult(kind, target, True, "未知断言类型，已跳过")
 
-    def _field_value_counts(
-        self, path: str, field: str, expected: dict[str, int]
-    ) -> tuple[dict[str, int] | None, dict[str, tuple[int, int]]]:
-        """统计字段各取值个数，返回 (实际计数, {取值: (实际, 期望)}) 不符项。"""
+    def _field_counts_all(self, path: str, field: str) -> tuple[dict[str, int] | None, str]:
+        """字段全量取值计数：内核优先，进程内 arcpy 兜底。
+
+        返回 (计数字典 | None, 错误文本)。不得在断言进程内静默吞异常——
+        实测 runner 用非 ArcGIS 解释器启动时进程内 import arcpy 会失败，
+        若不透传错误，detail 只会剩一个空 {}，无法定位（14 届基准实测教训）。
+        """
         if not field:
-            return None, {}
+            return None, "字段名为空"
+        if self.code_runner is not None:
+            lf = chr(10)
+            code = lf.join([
+                "import arcpy",
+                f"_p = {path!r}",
+                f"_f = {field!r}",
+                "_counts = {}",
+                "if arcpy.Exists(_p):",
+                "    _names = {f.name for f in arcpy.ListFields(_p)}",
+                "    if _f in _names:",
+                "        with arcpy.da.SearchCursor(_p, [_f]) as _cur:",
+                "            for _row in _cur:",
+                "                _k = '' if _row[0] is None else str(_row[0])",
+                "                _counts[_k] = _counts.get(_k, 0) + 1",
+                "set_result({'counts': _counts})",
+            ])
+            outcome = self.code_runner.run(code, timeout=300)
+            payload = outcome.result if outcome.ok and isinstance(outcome.result, dict) else None
+            if isinstance(payload, dict) and payload.get("error"):
+                return None, str(payload["error"])
+            if isinstance(payload, dict) and isinstance(payload.get("counts"), dict):
+                return {str(k): int(v) for k, v in payload["counts"].items()}, ""
+            # 内核返回不可用（实测长会话后可能出现 ok=True 但 result=None）→ 落到进程内兜底
         try:
             import arcpy  # type: ignore
 
             if not arcpy.Exists(path):
-                return None, {}
+                return None, f"要素类不存在: {path}"
             fields = {f.name for f in arcpy.ListFields(path)}
             if field not in fields:
-                return None, {}
+                return None, f"字段不存在: {field}（现有 {sorted(fields)[:10]}）"
             counts: dict[str, int] = {}
             with arcpy.da.SearchCursor(path, [field]) as cur:
                 for (value,) in cur:
                     key = "" if value is None else str(value)
                     counts[key] = counts.get(key, 0) + 1
-            bad = {
-                key: (counts.get(key, 0), want)
-                for key, want in expected.items()
-                if counts.get(key, 0) != want
-            }
-            return counts, bad
-        except Exception:
+            return counts, ""
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+    def _field_value_counts(
+        self, path: str, field: str, expected: dict[str, int] | None
+    ) -> tuple[dict[str, int] | None, dict[str, tuple[int, int]]]:
+        """统计字段各取值个数，返回 (实际计数, {取值: (实际, 期望)} 不符项)。
+
+        ``expected=None`` 表示只要全量计数（供区间断言使用）。
+        """
+        counts, err = self._field_counts_all(path, field)
+        if counts is None:
+            self._last_counts_error = err
             return None, {}
+        self._last_counts_error = ""
+        bad = {
+            key: (counts.get(key, 0), want)
+            for key, want in (expected or {}).items()
+            if counts.get(key, 0) != want
+        }
+        return counts, bad
 
     def _field_values(self, path: str, field: str, *, allowed_set: set[str]) -> tuple[set | None, set]:
         """Read all values of a field via the kernel; return (values, unexpected)."""
@@ -448,6 +623,124 @@ class RecipeLibrary:
     def _field_sum(self, path: str, field: str) -> float | None:
         """Sum a numeric field via the kernel."""
         return self._field_stat(path, field, "sum")
+
+    def _raster_find_values(self, path: str, values: list[int]) -> tuple[dict[str, int] | None, str]:
+        """统计栅格中指定取值各有多少像元（用 numpy 全量读取；超大数据拒绝判定）。"""
+        if self.code_runner is None:
+            return None, "无内核"
+        code = (
+            "import arcpy, numpy as np\n"
+            f"_p = {path!r}\n"
+            f"_vals = {values!r}\n"
+            "_d = arcpy.Describe(_p)\n"
+            "_n = int(getattr(_d, 'width', 0)) * int(getattr(_d, 'height', 0))\n"
+            "if _n == 0 or _n > 80000000:\n"
+            "    set_result({'counts': None, 'reason': f'像元数 {_n} 过大或未知，跳过'})\n"
+            "else:\n"
+            "    _arr = arcpy.RasterToNumPyArray(_p)\n"
+            "    set_result({'counts': {str(v): int((_arr == v).sum()) for v in _vals}, 'reason': ''})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=600)
+        payload = outcome.result if outcome.ok and isinstance(outcome.result, dict) else None
+        if not payload or payload.get("counts") is None:
+            counts = self._raster_counts_in_process(path, values)
+            if counts is None:
+                return None, f"栅格取值检查失败: {(payload or {}).get('reason') or outcome.error or '未知'}"
+            found = {k: v for k, v in counts.items() if int(v) > 0}
+            return found, f"counts={counts} (in-process)"
+        counts = payload["counts"]
+        found = {k: v for k, v in counts.items() if int(v) > 0}
+        return found, f"counts={counts}"
+
+    def _field_stat_in_process(self, path: str, field: str, kind: str) -> float | None:
+        """进程内 arcpy 计算字段统计（内核不可用时的兜底）。"""
+        try:
+            import arcpy  # type: ignore
+        except Exception:
+            return None
+        if not field:
+            return None
+        try:
+            if not arcpy.Exists(path):
+                return None
+            vals: list[float] = []
+            n = 0
+            null = 0
+            distinct: set[str] = set()
+            with arcpy.da.SearchCursor(path, [field]) as cur:
+                for row in cur:
+                    n += 1
+                    v = row[0]
+                    if v is None:
+                        null += 1
+                        continue
+                    distinct.add(str(v))
+                    try:
+                        vals.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+            if kind == "sum":
+                return float(sum(vals)) if vals else None
+            if kind == "min":
+                return float(min(vals)) if vals else None
+            if kind == "max":
+                return float(max(vals)) if vals else None
+            if kind == "mean":
+                return float(sum(vals) / len(vals)) if vals else None
+            if kind == "count":
+                return float(n)
+            if kind == "distinct":
+                return float(len(distinct))
+            if kind == "null_rate":
+                return float(null / n) if n else None
+            return None
+        except Exception:
+            return None
+
+    def _raster_counts_in_process(self, path: str, values: list[int]) -> dict[str, int] | None:
+        """进程内 arcpy 统计栅格指定取值像元数（兜底）。"""
+        try:
+            import arcpy  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:
+            return None
+        try:
+            desc = arcpy.Describe(path)
+            n = int(getattr(desc, "width", 0)) * int(getattr(desc, "height", 0))
+            if n == 0 or n > 80000000:
+                return None
+            arr = arcpy.RasterToNumPyArray(path)
+            return {str(v): int((arr == v).sum()) for v in values}
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------- 交付卫生
+    def _hygiene_report(
+        self,
+        target: str,
+        *,
+        max_duplicate_families: int = 0,
+        forbid_suffixes: list[str] | None = None,
+        ratio_limit: float = 0.0,
+    ) -> tuple[list[str], list[str], str | None]:
+        """交付卫生检查（实现在 ``runtime/hygiene.py``，与验收器共用同一套判据）。
+
+        返回 ``(problems, warnings, detail)``；``detail`` 为 None 表示检查本身失败。
+        """
+        from ..runtime.hygiene import dir_inventory, hygiene_report
+
+        inventory, err = dir_inventory(self.code_runner, target)
+        if inventory is None:
+            self._last_hygiene_error = err
+            return [], [], None
+        self._last_hygiene_error = ""
+        problems, warnings_out, detail = hygiene_report(
+            inventory,
+            max_duplicate_families=max_duplicate_families,
+            forbid_suffixes=forbid_suffixes,
+            ratio_limit=ratio_limit,
+        )
+        return problems, warnings_out, detail
 
     def _field_stat(self, path: str, field: str, kind: str) -> float | None:
         """Compute a statistic of a field via the kernel.
@@ -482,7 +775,8 @@ class RecipeLibrary:
         if outcome.ok and isinstance(outcome.result, dict):
             value = outcome.result.get(kind)
             return float(value) if value is not None else None
-        return None
+        # 内核不可用或返回异常（实测长会话后可能 ok=True 但 result=None）→ 进程内兜底
+        return self._field_stat_in_process(path, field, kind)
 
     def _raster_stats(self, path: str) -> dict[str, float] | None:
         """Exact raster statistics (NoData-aware) via the kernel."""
@@ -500,9 +794,41 @@ class RecipeLibrary:
             "            'count': _valid, 'nodata': int(_a.size - _valid)})\n"
         )
         outcome = self.code_runner.run(code, timeout=300)
-        if outcome.ok and isinstance(outcome.result, dict):
+        if outcome.ok and isinstance(outcome.result, dict) and outcome.result:
             return {k: v for k, v in outcome.result.items() if v is not None}
-        return None
+        # 内核返回不可用（实测长会话后 ok=True/result=None）→ 落 Describe 快照
+        # （_describe 有内核+进程内双重兕底，min/max 足以支撑区间断言）
+        return self._raster_stats_in_process(path)
+
+    def _raster_stats_in_process(self, path: str) -> dict[str, float] | None:
+        """栅格统计兕底：先试 describe 快照（含进程内 arcpy），再试进程内 numpy 全量。"""
+        record = self._describe(path)
+        if record and record.get("exists"):
+            lo, hi = record.get("raster_min"), record.get("raster_max")
+            if lo is not None or hi is not None:
+                out: dict[str, float] = {}
+                if lo is not None:
+                    out["min"] = float(lo)
+                if hi is not None:
+                    out["max"] = float(hi)
+                return out or None
+        try:
+            import arcpy  # type: ignore
+            import numpy as np  # type: ignore
+
+            arr = arcpy.RasterToNumPyArray(path, nodata_to_value=np.nan).astype("float64")
+            valid = int(np.count_nonzero(~np.isnan(arr)))
+            if not valid:
+                return None
+            return {
+                "sum": float(np.nansum(arr)),
+                "min": float(np.nanmin(arr)),
+                "max": float(np.nanmax(arr)),
+                "mean": float(np.nanmean(arr)),
+                "count": float(valid),
+            }
+        except Exception:
+            return None
 
     def _extent_within(self, target: str, reference: str) -> tuple[bool, str]:
         """True when target's extent is inside reference's extent (small tolerance)."""
@@ -588,6 +914,19 @@ class RecipeLibrary:
         record = self._describe(path)
         return record.get("feature_count") if record else None
 
+    def _bbox(self, path: str) -> dict[str, float] | None:
+        """要素类/栅格范围框（xmin/ymin/xmax/ymax），取自 Describe 快照。"""
+        record = self._describe(path)
+        if not record or not record.get("exists"):
+            return None
+        box = record.get("extent")
+        if not isinstance(box, dict):
+            return None
+        try:
+            return {k: float(box[k]) for k in ("xmin", "ymin", "xmax", "ymax")}
+        except Exception:
+            return None
+
     def _crs_wkid(self, path: str) -> int | None:
         record = self._describe(path)
         return record.get("wkid") if record else None
@@ -642,6 +981,11 @@ class RecipeLibrary:
             "    except Exception:\n"
             "        _rec['fields'] = []\n"
             "    try:\n"
+            "        _e = _d.extent\n"
+            "        _rec['extent'] = {'xmin': _e.XMin, 'ymin': _e.YMin, 'xmax': _e.XMax, 'ymax': _e.YMax}\n"
+            "    except Exception:\n"
+            "        _rec['extent'] = None\n"
+            "    try:\n"
             "        _rec['raster_min'] = float(arcpy.management.GetRasterProperties(_p, 'MINIMUM').getOutput(0))\n"
             "        _rec['raster_max'] = float(arcpy.management.GetRasterProperties(_p, 'MAXIMUM').getOutput(0))\n"
             "    except Exception:\n"
@@ -680,6 +1024,13 @@ class RecipeLibrary:
                 record["fields"] = [f.name for f in arcpy.ListFields(path)]
             except Exception:
                 record["fields"] = []
+            try:
+                ext = desc.extent
+                record["extent"] = {
+                    "xmin": ext.XMin, "ymin": ext.YMin, "xmax": ext.XMax, "ymax": ext.YMax,
+                }
+            except Exception:
+                record["extent"] = None
             try:
                 record["raster_min"] = float(arcpy.management.GetRasterProperties(path, "MINIMUM").getOutput(0))
                 record["raster_max"] = float(arcpy.management.GetRasterProperties(path, "MAXIMUM").getOutput(0))

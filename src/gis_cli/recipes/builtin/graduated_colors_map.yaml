@@ -52,6 +52,13 @@ params:
     type: string
     default: "auto"
     description: 朝向（auto/portrait/landscape）
+  class_bounds:
+    type: string
+    default: ""
+    description: >-
+      显式分级上界（逗号分隔，如 "0,50,100,200,400"）。多期/多图要共用同一图例时必传
+      （如 4 期核密度图），否则每张图按各自最小值起算、图例无法对比。
+      传了它就用 Manual 分级，级数由上界个数决定，class_count 参数会被忽略。
   legend_labels:
     type: string
     default: ""
@@ -92,11 +99,17 @@ code_template: |
 
   if not arcpy.Exists(input_path):
       raise ValueError(f"输入数据不存在: {input_path}")
-  fields = [f.name for f in arcpy.ListFields(input_path)]
-  if field_name not in fields:
-      raise ValueError(f"字段不存在: {field_name}；可用字段: {fields}")
+  # 栅格输入不需要字段（分类/拉伸都按像元值来）——只有矢量才校验字段存在，
+  # 否则会出现"字段不存在: Value；可用字段: []"把栅格出图卡死（实测任务四a）。
+  _desc = arcpy.Describe(input_path)
+  _is_raster = str(getattr(_desc, "dataType", "")).lower().startswith("raster") or bool(getattr(_desc, "isRaster", False))
+  if not _is_raster:
+      fields = [f.name for f in arcpy.ListFields(input_path)]
+      if field_name not in fields:
+          raise ValueError(f"字段不存在: {field_name}；可用字段: {fields}")
 
   intent = {
+      "class_bounds": {{class_bounds}},
       "theme": {{theme}} or {{title}},
       "title": {{title}},
       "region": {{region}},

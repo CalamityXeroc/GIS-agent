@@ -93,11 +93,17 @@ class Verifier:
         code_runner: Any = None,
         llm_client: Any = None,
         min_image_bytes: int = 8_000,
+        hygiene_mode: str = "warn",
+        vision_mode: str = "warn",
     ):
         self.workspace = Path(workspace)
         self.code_runner = code_runner
         self.llm_client = llm_client
         self.min_image_bytes = min_image_bytes
+        # 交付卫生：warn（默认，仅提醒）| block（重复中间件/过程文件算验收不通过）| off
+        self.hygiene_mode = str(hygiene_mode or "warn").lower()
+        # 图面识图质检：让识图模型看图，判定中文是否可读/图面是否被裁；warn|block|off
+        self.vision_mode = str(vision_mode or "warn").lower()
 
     # ------------------------------------------------------------- structural
     def structural_check(self, artifacts: list[str]) -> list[dict[str, Any]]:
@@ -223,6 +229,88 @@ class Verifier:
         parsed.setdefault("repair_hint", "")
         return parsed
 
+    # -------------------------------------------------------------- hygiene
+    def hygiene_findings(self) -> dict[str, Any]:
+        """交付卫生观察：过程库重做残留、过程文件、体积比。
+
+        默认只提醒（不阻断验收），因为工作过程中出现临时文件是正常的；
+        ``hygiene_mode="block"`` 时把硬指标（重复中间件/过程文件）计入失败。
+        """
+        empty = {"ok": True, "problems": [], "warnings": [], "detail": ""}
+        if self.hygiene_mode == "off":
+            return empty
+        try:
+            from ..runtime.hygiene import dir_inventory, hygiene_report, summarize
+
+            inventory, err = dir_inventory(self.code_runner, str(self.workspace / "output"))
+            if inventory is None:
+                return {**empty, "warnings": [f"卫生检查跳过: {err}"]}
+            problems, warnings_out, detail = hygiene_report(
+                inventory, max_duplicate_families=0, ratio_limit=5.0
+            )
+            return {
+                "ok": not problems,
+                "problems": problems,
+                "warnings": warnings_out,
+                "detail": detail,
+                "summary": summarize(problems, warnings_out),
+            }
+        except Exception as exc:  # pragma: no cover - 卫生检查不能影响验收主流程
+            logger.debug("hygiene check failed: %s", exc)
+            return {**empty, "warnings": [f"卫生检查异常: {str(exc)[:120]}"]}
+
+    # ---------------------------------------------------------------- vision
+    _VISION_PROMPT = (
+        "你是地图/图表质检员。请检查这张图，只输出一个 JSON 对象：\n"
+        '{"text_ok": true/false, "issues": ["..."], "summary": "一句话结论"}\n'
+        "判定要点：标题、图例、比例尺、坐标轴文字是否可读——**中文若显示为方框(口口口)或乱码则 text_ok=false**；"
+        "另外检查：图面是否被裁切、是否大面积空白、图例是否遮挡主体、地图要素是否缺失。"
+        "没有问题时 issues 为空数组、text_ok=true。"
+    )
+
+    def vision_check_image(self, path: Path) -> dict[str, Any]:
+        """用识图模型核对一张产出的图（中文可读性、图面完整性）。
+
+        跳过条件：开关关闭、无 LLM、模型不支持识图、图片读不出来。
+        任何异常都不影响验收主流程。
+        """
+        if self.vision_mode == "off" or self.llm_client is None:
+            return {"ok": True, "skipped": True}
+        if not getattr(getattr(self.llm_client, "config", None), "vision", False):
+            return {"ok": True, "skipped": True, "reason": "模型未开启识图"}
+        try:
+            from ..runtime.image_input import as_data_url
+
+            url = as_data_url(str(path))
+            if not url:
+                return {"ok": True, "skipped": True, "reason": "图片无法读取"}
+            response = self.llm_client.chat(
+                [
+                    {"role": "system", "content": "你只输出 JSON。"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": self._VISION_PROMPT},
+                            {"type": "image_url", "image_url": {"url": url}},
+                        ],
+                    },
+                ],
+                task_type="verify",
+            )
+            parsed = extract_json_object(response.content) or {}
+        except Exception as exc:  # pragma: no cover - 识图失败不影响验收
+            logger.debug("vision check failed: %s", exc)
+            return {"ok": True, "skipped": True, "reason": f"识图调用失败: {str(exc)[:120]}"}
+        text_ok = bool(parsed.get("text_ok", True))
+        issues = [str(item) for item in (parsed.get("issues") or [])][:5]
+        return {
+            "ok": text_ok and not issues,
+            "text_ok": text_ok,
+            "issues": issues,
+            "summary": str(parsed.get("summary", ""))[:200],
+            "model": getattr(response, "model", ""),
+        }
+
     # ----------------------------------------------------------------- verify
     def verify(self, state: Any) -> dict[str, Any]:
         """Full verification of the current state."""
@@ -259,6 +347,28 @@ class Verifier:
                 )
 
         semantic = self.semantic_check(state, structural)
+        hygiene = self.hygiene_findings()
+        if hygiene.get("problems") and self.hygiene_mode == "block":
+            problems.extend(f"交付卫生: {item}" for item in hygiene["problems"])
+
+        # 图面识图质检：中文是否可读、图例/图名是否齐全（模型支持识图时）
+        vision_warnings: list[str] = []
+        for record in structural:
+            if not isinstance(record.get("image"), dict):
+                continue
+            verdict = self.vision_check_image(Path(str(record.get("path", ""))))
+            if verdict.get("skipped"):
+                continue
+            record["vision"] = verdict
+            if not verdict.get("ok"):
+                name = Path(str(record.get("path", ""))).name
+                detail = verdict.get("summary") or "；".join(verdict.get("issues") or [])
+                message = f"图面质检（{name}）: {detail or '模型判定图面有问题'}"
+                if self.vision_mode == "block":
+                    problems.append(message)
+                else:
+                    vision_warnings.append(message)
+
         missing = [str(m) for m in (semantic.get("missing") or [])]
         failed_reqs = [
             item
@@ -274,6 +384,11 @@ class Verifier:
             summary_bits.append("缺失: " + "；".join(missing[:5]))
         if failed_reqs:
             summary_bits.append("未满足需求: " + "；".join(str(r.get("id")) for r in failed_reqs[:5]))
+        if hygiene.get("summary"):
+            prefix = "卫生问题: " if self.hygiene_mode == "block" else "卫生提醒: "
+            summary_bits.append(prefix + str(hygiene["summary"])[:240])
+        if vision_warnings:
+            summary_bits.append("图面提醒: " + "；".join(vision_warnings[:2])[:240])
         summary = "验收通过" if passed else "验收未通过：" + " | ".join(summary_bits)
 
         return {
@@ -281,6 +396,7 @@ class Verifier:
             "summary": summary,
             "structural": structural,
             "semantic": semantic,
+            "hygiene": hygiene,
             "missing": missing,
             "problems": problems,
             "repair_hint": str(semantic.get("repair_hint", "") or "") or (

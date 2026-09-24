@@ -165,3 +165,17 @@ def test_recipe_hint_no_recipes():
 
     assert _recipe_hint(_hint_ctx(None), "制作高亮地图", "exportToJPEG") == ""
     assert _recipe_hint(_hint_ctx(None), "", "x=1") == ""
+
+
+def test_backup_skips_readonly_and_large_dirs(tmp_path):
+    """备份不能把只读输入目录整份复制（实测 input/ 被备份 100 次共 2 GB）。"""
+    from gis_cli.engine.tools import _referenced_existing_paths
+
+    (tmp_path / "input").mkdir()
+    (tmp_path / "input" / "big.tif").write_bytes(b"x" * 1024)
+    (tmp_path / "output").mkdir()
+    (tmp_path / "output" / "result.gdb").mkdir()
+    code = f'p = r"{tmp_path / "input"}"\nq = r"{tmp_path / "output" / "result.gdb"}"\narcpy.management.Delete(q)\n'
+    found = _referenced_existing_paths(code, tmp_path)
+    assert str(tmp_path / "input") not in found  # 只读输入目录跳过
+    assert str(tmp_path / "output" / "result.gdb") in found  # 结果目录仍备份

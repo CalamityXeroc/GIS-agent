@@ -265,6 +265,14 @@ def _build_runner_script() -> str:
         error = None
         status = "success"
 
+        # 中文字体/绘图环境：与持久内核保持一致（matplotlib 默认字体无中文字形，
+        # 自绘图里的中文会变方框）。缺 matplotlib 时静默跳过。
+        try:
+            from gis_cli.runtime.mpl_setup import configure as _mpl_configure
+            _mpl_configure()
+        except Exception:
+            pass
+
         try:
             if require_arcpy:
                 import arcpy

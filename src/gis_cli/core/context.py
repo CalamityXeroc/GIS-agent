@@ -153,7 +153,7 @@ class WorkspaceContext:
         """Scan workspace to build context."""
         ctx = cls()
         ctx.workspace_path = str(workspace)
-        ctx.output_dir = str(workspace / "outputs")
+        ctx.output_dir = str(workspace / "workspace" / "output")
         
         if workspace.exists():
             # Scan for common GIS files

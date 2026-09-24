@@ -115,3 +115,56 @@ def test_loop_stops_gracefully_when_llm_unavailable(tmp_path: Path):
     state = loop.run("测试任务")
     assert state.status == "llm_unavailable"
     assert "不可用" in state.error
+
+
+def test_loop_deadline_disabled_when_nonpositive(tmp_path: Path):
+    """run_deadline_seconds <= 0 视为不启用，正常跑完。"""
+    loop, _ = _make_loop(tmp_path, [_tc("finish", {"summary": "done"})])
+    loop.config.run_deadline_seconds = 0.0
+    state = loop.run("测试任务")
+    assert state.status == "completed"
+
+
+def test_loop_deadline_exceeded_with_past_deadline(tmp_path: Path):
+    """run_deadline_seconds 很小（如 1e-6 秒）时，第二轮循环顶应触发 deadline_exceeded。"""
+    class SlowLLM:
+        class _Cfg:
+            model = "mock"
+        config = _Cfg()
+
+        def chat(self, messages, **kwargs):
+            import time as _t
+
+            _t.sleep(0.05)
+            return _tc("catalog_query", {"query": "x"})
+
+    import time as _t
+
+    loop, _ = _make_loop(tmp_path, [])
+    loop.llm = SlowLLM()
+    loop.codec.client = SlowLLM()
+    loop.config.run_deadline_seconds = 0.05  # 第一轮 LLM 调用后即过期
+    state = loop.run("测试任务")
+    assert state.status == "deadline_exceeded"
+    assert "截止" in state.error
+
+
+def test_sanitize_messages_converts_orphan_tool_messages(tmp_path: Path):
+    """孤立 tool 消息必须降级为 user——严格端点（DeepSeek）否则直接 400。
+
+    实测触发场景：一轮里多个工具调用时，插入的图片 user 消息会把 tool 结果拆开。
+    """
+    loop, _ = _make_loop(tmp_path, [])
+    loop._messages = [
+        {"role": "system", "content": "s"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "结果1"},
+        {"role": "tool", "tool_call_id": "c9", "content": "孤立结果"},
+    ]
+    loop._sanitize_messages()
+    assert [m["role"] for m in loop._messages] == ["system", "assistant", "tool", "user"]
+    assert loop._messages[-1]["content"] == "孤立结果"

@@ -26,6 +26,14 @@ from .executor import ExecutionMode
 from .llm import create_llm_client, LLMConfig
 from .model_adaptation import BAMLBridge
 
+# Make stdout/stderr UTF-8 safe on Windows consoles (GBK) so rich output
+# containing symbols/CJK never raises UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 
 # 创建 CLI 应用
 app = typer.Typer(
@@ -899,26 +907,32 @@ def _run_engine_task(
     refresh_catalog: bool = True,
     max_turns: int = 0,
 ) -> int:
-    """使用新引擎（观察-决策-执行循环 + 代码自修复）执行单个任务。"""
+    """Run one task with the new observe-decide-act engine."""
     from ..engine.runner import build_engine
 
     ws = workspace or Path.cwd()
+    last_event = {"name": ""}
 
     def _on_event(name: str, payload: dict) -> None:
         if name == "tool_call":
+            tool = payload.get("tool", "")
+            desc = ""
             args = payload.get("args") or {}
-            desc = str(args.get("description") or "") if isinstance(args, dict) else ""
-            console.print(f"  [cyan]-> {payload.get('tool', '')}[/cyan] {desc[:80]}")
+            if isinstance(args, dict):
+                desc = str(args.get("description") or "")
+            console.print(f"  [cyan]-> {tool}[/cyan] {desc[:80]}")
         elif name == "tool_result":
-            mark = "[green]OK[/green]" if payload.get("ok") else "[red]X[/red]"
+            ok = payload.get("ok")
+            mark = "[OK]" if ok else "[X]"
             console.print(f"    {mark} {str(payload.get('summary', ''))[:160]}")
         elif name == "repair_attempt":
             console.print(f"    [yellow][repair] 自动修复第 {payload.get('attempt')} 次[/yellow]")
         elif name == "verification":
             mark = "[green]验收通过[/green]" if payload.get("pass") else "[red]验收未通过[/red]"
             console.print(f"  {mark}: {str(payload.get('summary', ''))[:160]}")
+        last_event["name"] = name
 
-    with console.status("[cyan]启动引擎（加载数据目录/内核）..."):
+    with console.status("[cyan]启动引擎（加载数据目录/内核）...") as status:
         try:
             bundle = build_engine(
                 workspace=ws,
@@ -929,6 +943,7 @@ def _run_engine_task(
         except Exception as exc:
             console.print(Panel.fit(str(exc), title="引擎启动失败", border_style="red"))
             return 1
+        status.stop()
 
     if max_turns:
         bundle.loop.config.max_turns = max_turns
@@ -945,8 +960,9 @@ def _run_engine_task(
         state = bundle.loop.run(task)
     except KeyboardInterrupt:
         console.print("\n[yellow]已中断[/yellow]")
-        bundle.close()
         return 130
+    finally:
+        pass
 
     console.print("\n[bold blue]任务清单:[/bold blue]")
     console.print(state.tasklist_digest())

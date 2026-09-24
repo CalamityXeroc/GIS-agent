@@ -328,7 +328,8 @@ def test_new_assertion_kinds_registered_and_fail_gracefully(tmp_path: Path):
     r1 = lib.run_assertions(
         [{"type": "field_value_counts", "path": missing, "field": "类别", "value": {"标杆社区": 32}}]
     )[0]
-    assert r1.ok is False and "实际=None" in r1.detail
+    # 无内核且无 arcpy 时必须透传真实错误（不得静默吞掉只剩空 {}）
+    assert r1.ok is False and "字段读取失败" in r1.detail and "arcpy" in r1.detail
     r2 = lib.run_assertions([{"type": "aprx_map_check", "path": str(tmp_path / "nope.aprx")}])[0]
     assert r2.ok is False and "不存在" in r2.detail
 
@@ -343,3 +344,116 @@ def test_layer_select_rule_does_not_steal_other_timeouts():
     """泛化超时文本不该归因到图层选择规则（否则会给出错误建议）。"""
     keys = [h.key for h in match("Execution exceeded 300.0s and did not stop after interrupt")]
     assert "layer-select-hang" not in keys
+
+
+# ------------------------------------------------------------------ 断言：字段计数走内核
+class _FakeOutcome:
+    def __init__(self, result=None, ok=True, error=""):
+        self.result = result
+        self.ok = ok
+        self.error = error
+
+
+class _FakeCodeRunner:
+    """记录收到的内核代码，返回预设结果（不依赖 arcpy）。"""
+
+    def __init__(self, result=None, ok=True, error=""):
+        self.result = result
+        self.ok = ok
+        self.error = error
+        self.codes: list[str] = []
+
+    def run(self, code, timeout=0):
+        self.codes.append(code)
+        return _FakeOutcome(result=self.result, ok=self.ok, error=self.error)
+
+
+def test_field_counts_all_prefers_kernel(tmp_path):
+    """field_value_counts 必须走 code_runner（内核），不能在断言进程内 import arcpy。"""
+    lib = RecipeLibrary()
+    runner = _FakeCodeRunner(result={"counts": {"标杆社区": 32, "需整改社区": 500, "其他": 1809}})
+    lib.code_runner = runner
+    counts, err = lib._field_counts_all("gdb://fc", "类别")
+    assert err == ""
+    assert counts == {"标杆社区": 32, "需整改社区": 500, "其他": 1809}
+    assert runner.codes and "SearchCursor" in runner.codes[0]
+
+
+def test_field_value_counts_between_surfaces_kernel_error(tmp_path):
+    """内核失败时错误文本必须透传到 detail，不能只剩空 {}（14 届实测教训）。"""
+    lib = RecipeLibrary()
+    lib.code_runner = _FakeCodeRunner(ok=False, error="kernel destroyed")
+    results = lib.run_assertions(
+        [
+            {
+                "type": "field_value_counts_between",
+                "path": "gdb://fc",
+                "field": "NAME",
+                "value": {"Giraffe": [1700, 1850]},
+            }
+        ]
+    )
+    assert results[0].ok is False
+    # 内核失败后落到进程内兕底；无 arcpy 的测试环境里进程内也会失败，但错误必须透传（不能是空 {}）
+    assert results[0].detail.startswith("字段读取失败: ")
+    assert results[0].detail != "字段读取失败: {}"
+    assert "arcpy" in results[0].detail or "kernel destroyed" in results[0].detail
+
+
+def test_field_value_counts_between_band_check(tmp_path):
+    """区间断言：类别计数落在给定区间内通过，越界/缺失判失败。"""
+    lib = RecipeLibrary()
+    lib.code_runner = _FakeCodeRunner(result={"counts": {"Giraffe": 1793, "Gazelle": 1159, "Zebra": 16}})
+    ok_res = lib.run_assertions(
+        [
+            {
+                "type": "field_value_counts_between",
+                "path": "gdb://fc",
+                "field": "NAME",
+                "value": {"Giraffe": [1700, 1850], "Gazelle": [1100, 1220], "Zebra": [10, 40]},
+            }
+        ]
+    )
+    assert ok_res[0].ok is True
+    bad_res = lib.run_assertions(
+        [
+            {
+                "type": "field_value_counts_between",
+                "path": "gdb://fc",
+                "field": "NAME",
+                "value": {"Giraffe": [1800, 1850]},
+            }
+        ]
+    )
+    assert bad_res[0].ok is False
+
+
+class _WarnOutcome:
+    """成功但带 stderr 告警的执行结果（模拟 matplotlib 缺中文字形）。"""
+
+    ok = True
+    stdout = "绘图完成"
+    stderr = "Glyph 20013 (\N{CJK UNIFIED IDEOGRAPH-4E2D}) missing from font(s) DejaVu Sans."
+    result = {"output": "output/图.png"}
+    duration_ms = 12
+    display_images: list = []
+    error = None
+
+
+def test_execute_code_surfaces_stderr_warnings(tmp_path):
+    """成功执行但 stderr 有告警必须回喂模型（否则'中文变方框'的图会一路通过验收）。"""
+    from gis_cli.engine.tools import EngineContext, build_default_registry
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            return _WarnOutcome()
+
+    ctx = EngineContext(workspace=tmp_path)
+    ctx.code_runner = _Runner()
+    registry = build_default_registry()
+    obs = registry.execute(
+        "execute_code", {"code": "import matplotlib.pyplot as plt", "description": "画对比图"}, ctx
+    )
+    assert obs.ok is True
+    assert "stderr" in obs.data, "成功路径也要带上 stderr 告警"
+    assert "mpl-cjk" in obs.hint, obs.hint

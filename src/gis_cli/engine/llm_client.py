@@ -78,8 +78,17 @@ class EngineLLMConfig:
     total_timeout: float = 420.0
     fallback_models: list[str] = field(default_factory=list)
     # 熔断：同一模型连续失败（超时/连不上）达到阈值后冷却一段时间，先走备用模型。
+    # 冷却时长按“连续冷却次数”指数升级（300→600→1200…上限 cooldown_max_seconds）：
+    # 实测网关坏掉的主模型会反复“冷却到期→重试→再挂 420s”，不带升级的话每轮白烧 7~14 分钟。
     model_failure_threshold: int = 2
     model_cooldown_seconds: float = 300.0
+    model_cooldown_max_seconds: float = 3600.0
+    # 已经被冷却过的模型再次被尝试时，用更短的预算——网关卡死时每次尝试要烧满
+    # total_timeout（实测 420s），反复重试会把整个任务预算吃光。
+    reduced_timeout_seconds: float = 120.0
+    # 多模态：模型能识图时，把产出图（地图/统计图）附进对话，让它自己看一眼核对；
+    # 也可用于图面质检（中文是否变方框、图例是否被裁掉）。
+    vision: bool = False
     routing_rules: dict[str, list[str]] = field(default_factory=dict)
     max_concurrency: int = 1
     retry_count: int = 6
@@ -102,6 +111,7 @@ class EngineLLMConfig:
             max_tokens=int(data.get("max_tokens", cls.max_tokens)),
             timeout=float(data.get("timeout", cls.timeout)),
             total_timeout=float(engine.get("request_total_timeout_seconds", data.get("total_timeout", 420.0))),
+            vision=bool(data.get("vision", engine.get("vision", False))),
             fallback_models=[str(m) for m in data.get("fallback_models", []) if str(m).strip()],
             model_failure_threshold=int(engine.get("model_failure_threshold", data.get("model_failure_threshold", 2))),
             model_cooldown_seconds=float(engine.get("model_cooldown_seconds", data.get("model_cooldown_seconds", 300.0))),
@@ -150,6 +160,7 @@ class EngineLLMClient:
         self._consecutive_429 = 0
         self._failures: dict[str, int] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._cooldown_strikes: dict[str, int] = {}
 
     # ------------------------------------------------------------------ setup
     @property
@@ -234,20 +245,30 @@ class EngineLLMClient:
     def _record_success(self, model: str) -> None:
         self._failures.pop(model, None)
         self._cooldown_until.pop(model, None)
+        self._cooldown_strikes.pop(model, None)
 
     def _record_failure(self, model: str, exc: Exception) -> None:
-        """连续超时/连接失败达阈值后冷却该模型（网关卡死时不再白等）。"""
+        """连续超时/连接失败达阈值后冷却该模型（网关卡死时不再白等）。
+
+        冷却时长指数升级：同一模型反复“冷却到期又失败”时，下一次冷却翻倍，
+        避免整个 run 反复在坏模型上白烧 420s/次。
+        """
         if getattr(exc, "status_code", None) not in (None, 429):
             return
         self._failures[model] = self._failures.get(model, 0) + 1
         if self._failures[model] < max(1, self.config.model_failure_threshold):
             return
-        self._cooldown_until[model] = time.monotonic() + self.config.model_cooldown_seconds
+        strikes = self._cooldown_strikes.get(model, 0)
+        self._cooldown_strikes[model] = strikes + 1
+        base = max(1.0, float(self.config.model_cooldown_seconds))
+        cooldown = min(base * (2 ** strikes), max(base, float(self.config.model_cooldown_max_seconds)))
+        self._cooldown_until[model] = time.monotonic() + cooldown
         logger.warning(
-            "模型 %s 连续失败 %s 次，冷却 %.0f 秒",
+            "模型 %s 连续失败 %s 次（第 %s 次冷却），冷却 %.0f 秒",
             model,
             self._failures[model],
-            self.config.model_cooldown_seconds,
+            strikes + 1,
+            cooldown,
         )
 
     def _chat_once(
@@ -275,7 +296,11 @@ class EngineLLMClient:
 
         last_error: Exception | None = None
         conn_failures = 0
-        deadline = time.monotonic() + self.config.total_timeout
+        budget = float(self.config.total_timeout)
+        if self._cooldown_strikes.get(model):
+            # 该模型本回合已经超时/断连过 → 缩短单次尝试预算，快速失败换下一个模型
+            budget = min(budget, float(self.config.reduced_timeout_seconds or budget))
+        deadline = time.monotonic() + budget
         budget_exhausted = False
         for attempt in range(1, self.config.retry_count + 1):
             remaining_budget = deadline - time.monotonic()
@@ -318,7 +343,7 @@ class EngineLLMClient:
                         break
                     time.sleep(delay)
         reason = (
-            f"超过全局超时 {self.config.total_timeout}s" if budget_exhausted
+            f"超过全局超时 {budget:.0f}s" if budget_exhausted
             else f"{self.config.retry_count} 次尝试"
         )
         raise LLMError(

@@ -53,14 +53,63 @@ facts（采集数据事实） → design（规则引擎出 LayoutSpec） → ren
   "theme": "老年人口", "region": "郑州市", "scale": "社区尺度",   // 图名素材
   "purpose": "分布", "medium": "print_A4", "orientation": "auto",
   "legend_labels": "semantic",                                     // semantic / range / both
+  "category_colors": "1:#1F77B4;2:#2CA02C",                        // 值→颜色（分类图）
+  "category_names": "1:水域;2:林地;5:耕地;7:建筑区;8:裸地;11:牧场", // 值→显示名（图例用名称而非编码）
   "style_profile": "competition_standard",
+  "class_bounds": "0,50,100,200,400",                              // 显式分级边界（多图统一图例）
   "overrides": {"legend.outside": true, "title.height_pt": 18}      // 点路径强制
 }
 ```
 
+> **统一图例（多期图可对比）**：`class_bounds` 传的是**分级边界**（n 个边界 → n−1 级），
+> 例如 `"0,50,100,200,400"` 得到 4 级：0–50 / 50–100 / 100–200 / 200–400。
+> 传了它就用 Manual 分级，`class_count` 被忽略；每张图的实际分级会写入 spec 的
+> `renderer.applied_bounds`，用断言 `shared_legend_bounds` 可校验多张图是否真的共用同一套图例。
+> **栅格与矢量两条路径都支持**（实测：4 期核密度这类栅格成果图必须走栅格分类渲染）。
+
+> `category_names` 是给**编码存储**的类别用的：竞赛与行业规范都要求图例显示规范名称
+> （如土地覆盖 1=水域 2=林地 5=耕地 7=建筑区 8=裸地 9=雪/冰 11=牧场），而不是 1/2/5/7。
+> 它同时作用于工程内图例（CIM label）与导出图上的叠加图例。
+
 Agent 侧工具：`map_design`（只出设计说明与 spec，先"读设计"再出图）、`check_map_project`（核验工程渲染器/配色/四要素）。
 
+## 三点五、迁移图：箭头与年份标注（叠加层）
+
+多期分布中心的迁移图需要"有方向性 + 标年份"，走叠加层（PIL）而不是 CIM 线符号箭头
+（后者在 CIM 里极难调），接口：
+
+```python
+intent["overlay"] = {
+    "arrows": [{"from": [x, y], "to": [x, y], "label": "1992"}],   # 数据坐标
+    "labels": [{"at": [x, y], "text": "1982"}],                    # 数据坐标
+    "arrow_color": "#B2182B", "label_size_pt": 9,
+}
+```
+
+要点：
+
+- 数据坐标 → 像素的换算用**渲染后实测**的地图框范围（`spec["render_frame_extent"]`，
+  由 `map_frame.camera.getExtent()` 读回），不能用设计值——相机会按图框纵横比微调，
+  用设计值会让箭头整体偏移。
+- 换算纯函数 `image_overlay.map_to_px()` 可离线单测（含 y 翻转与 mm→px）。
+- 年份标注**二选一**：给箭头带 `label` 或给中心点带 `labels`，两个都传会出现重复年份。
+- 迁移图的图例应说明箭头含义（否则读者不知道红线代表什么——识图质检实测会指出这一点）。
+
 ## 四、ArcGIS 制图 API 踩坑（实测，重要）
+
+0. **分级（classBreaks）只能走 CIM，且栅格/矢量挂的位置不同**：
+   - 矢量：CIM 在 ``layer.getDefinition("V3").renderer.breaks``（**不是** `classBreaks`）；
+     `classificationMethod` 也必须在 CIM 上设（元素 API 上赋值会被忽略，仍是 StandardDeviation）。
+   - 栅格：栅格 symbology **没有** `updateRenderer`，必须整只替换 `definition.colorizer`
+     为 `cim.CIMRasterClassifyColorizer`（其 `classBreaks[i].upperBound` 才是分级），
+     顺带可给每个 break 设 `color`（CIMRGBColor）实现确定配色。
+   - 读回验证要按同样路径读（栅格读 `colorizer.classBreaks`、矢量读 `renderer.breaks`），
+     否则会误判成“没生效”。
+   - `_hex_to_rgb()` 返回 `[r,g,b,alpha]` 四元组，别 unpack 成三个。
+   - 栅格分类渲染**不要**给单波段栅格设 `colorizer.field`（没有 `Value` 字段，设了图面空白）；
+     需要指定波段时用 `renderer.raster_field` 显式表示。
+   - 分类 colorizer 必须逐级给颜色（没色带名时也会兜底 YlOrRd），否则出图看不到栅格。
+   - `MapFrame` **没有** `getExtent()`：范围在 `camera` 上（`map_frame.camera.getExtent()`）。
 
 1. **图名/文本字号**：`layout` 没有 `createTextElement`，只能用 CIM；字号属性是 `CIMTextSymbol.height`（`fontSize` 会被静默忽略）。
    段落文本要用 `CIMParagraphTextGraphic` + `CIMParagraphTextSymbol`；**配 `CIMTextSymbol` 会被忽略**——所以本实现用单行 `CIMTextGraphic` + `CIMTextSymbol`，多行拆成多个元素。

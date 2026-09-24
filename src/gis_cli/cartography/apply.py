@@ -316,15 +316,59 @@ def _apply_graduated(layer: Any, spec: dict[str, Any], project: Any, notes: list
             notes.append(f"color_ramp 设置失败: {str(exc)[:60]}")
     layer.symbology = sym
 
+    # 显式分级（统一图例）：把给定上界写进 CIM classBreaks.upperBound。
+    # 为什么必须走 CIM：元素 API 的 upperBound 写不进去；而 DefinedInterval 会让每张图
+    # 从各自最小值起算，多期图无法共用图例（4 期核密度图对比的硬需求）。
+    explicit = sorted(float(value) for value in (renderer_spec.get("explicit_bounds") or []))
+    if explicit:
+        # 语义：给定分级边界（n 个边界 → n-1 级），所以只把 boundaries[1:] 写成各级上界
+        upper_bounds = explicit[1:]
+        try:
+            layer_def_bounds = layer.getDefinition("V3")
+            cim_renderer = getattr(layer_def_bounds, "renderer", None)
+            # 实测（探针 probe_vector_bounds2）：矢量 graduated 的 CIM 分级挂在
+            # ``renderer.breaks`` 上；``classificationMethod`` 也必须走 CIM 才生效
+            # （元素 API 上赋值会被忽略，仍是 StandardDeviation）。老版本用 classBreaks 命名。
+            cim_breaks = getattr(cim_renderer, "breaks", None)
+            if cim_breaks is None:
+                cim_breaks = getattr(cim_renderer, "classBreaks", None)
+            cim_breaks = list(cim_breaks or [])
+            if upper_bounds and len(cim_breaks) == len(upper_bounds):
+                try:
+                    cim_renderer.classificationMethod = "Manual"
+                except Exception:
+                    pass
+                for brk, upper in zip(cim_breaks, upper_bounds):
+                    brk.upperBound = float(upper)
+                layer.setDefinition(layer_def_bounds)
+                notes.append(f"explicit_bounds(统一图例): 边界={explicit} 上界={upper_bounds}")
+            else:
+                notes.append(
+                    f"explicit_bounds 给 {len(explicit)} 个边界（{len(upper_bounds)} 级），"
+                    f"但渲染器有 {len(cim_breaks)} 级，已忽略"
+                )
+        except Exception as exc:  # pragma: no cover
+            notes.append(f"explicit_bounds 写入失败: {str(exc)[:80]}")
+
     # 用实际断点重写分级标签（语义化 / 取整区间）。必须走 CIM：元素 API 上设了图例不认。
     try:
+        layer_def = layer.getDefinition("V3")
+        cim_renderer = getattr(layer_def, "renderer", None)
+        cim_breaks = getattr(cim_renderer, "breaks", None)
+        if cim_breaks is None:
+            cim_breaks = getattr(cim_renderer, "classBreaks", None)
+        cim_breaks = list(cim_breaks or [])
+        bound_source = [float(brk.upperBound) for brk in cim_breaks]
+        if not bound_source:
+            bound_source = [float(brk.upperBound) for brk in (layer.symbology.renderer.classBreaks or [])]
         bounds: list[tuple[float, float]] = []
-        breaks = layer.symbology.renderer.classBreaks
         low = float(renderer_spec.get("field_stats", {}).get("min") or 0.0)
-        for brk in breaks:
-            upper = float(brk.upperBound)
+        for upper in bound_source:
             bounds.append((low, upper))
             low = upper
+        if bound_source:
+            # 回写“实际生效”的分级上界：断言（如 shared_legend_bounds）应比对实测值而非假设值
+            spec["renderer"]["applied_bounds"] = bound_source
         labels = design_mod.format_class_labels(bounds, str(renderer_spec.get("labels_mode") or "semantic"))
         layer_def = layer.getDefinition("V3")
         cim_breaks = getattr(getattr(layer_def, "renderer", None), "classBreaks", None) or []
@@ -372,6 +416,26 @@ def _apply_graduated(layer: Any, spec: dict[str, Any], project: Any, notes: list
         notes.append(f"class_labels 设置失败: {str(exc)[:80]}")
 
 
+def _parse_name_map(raw: Any) -> dict[str, str]:
+    """解析“值→显示名”映射，支持 "1:水域;2:林地" 字符串或 {"1": "水域"} 字典。
+
+    用途：竞赛/行业规范里类别往往用编码存储（如土地覆盖 1=水域 2=林地 5=耕地），
+    图例必须显示名称而不是编码。
+    """
+    mapping: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            mapping[str(key).strip()] = str(value).strip()
+        return mapping
+    for pair in str(raw or "").split(";"):
+        if ":" in pair or "=" in pair:
+            sep = ":" if ":" in pair else "="
+            key, value = pair.split(sep, 1)
+            if key.strip():
+                mapping[key.strip()] = value.strip()
+    return mapping
+
+
 def _apply_unique(layer: Any, spec: dict[str, Any], notes: list[str]) -> None:
     renderer_spec = spec["renderer"]
     sym = layer.symbology
@@ -383,6 +447,7 @@ def _apply_unique(layer: Any, spec: dict[str, Any], notes: list[str]) -> None:
         except Exception as exc:  # pragma: no cover
             notes.append(f"unique.fields 设置失败: {str(exc)[:60]}")
     color_map = _parse_color_map(renderer_spec.get("category_colors") or "")
+    name_map = _parse_name_map(renderer_spec.get("category_names") or "")
     applied: dict[str, str] = {}
     for group in sym.renderer.groups:
         for item in getattr(group, "items", []) or []:
@@ -396,17 +461,114 @@ def _apply_unique(layer: Any, spec: dict[str, Any], notes: list[str]) -> None:
                 item.symbol.color = {"RGB": _hex_to_rgb(hex_color)}  # type: ignore[assignment]
             except Exception:
                 pass
+            display = name_map.get(key, key)
             try:
-                item.label = key or str(getattr(item, "label", ""))
+                item.label = display or str(getattr(item, "label", ""))
             except Exception:
                 pass
             applied[key] = hex_color
     layer.symbology = sym
     if applied:
         notes.append(f"unique_colors: {applied}")
+        if name_map:
+            notes.append(f"category_names: {name_map}")
         spec["renderer"]["legend_entries"] = [
-            {"label": key, "color": color} for key, color in applied.items()
+            {"label": name_map.get(key, key), "color": color} for key, color in applied.items()
         ]
+
+
+def _apply_raster_classify(layer: Any, spec: dict[str, Any], project: Any, notes: list[str]) -> bool:
+    """栅格分类渲染 + 显式分级（统一图例的栅格路径）。
+
+    为什么必须有这条路径：核密度这类成果图是**栅格**，多期图要能横向对比就必须共用
+    同一套分级。实测：栅格图层的 ``symbology`` **没有** ``updateRenderer``，色带外的
+    分级完全改不动；只能走 CIM，把 colorizer 换成 ``CIMRasterClassifyColorizer`` 并写
+    ``classBreaks.upperBound``（探针确认的属性：classBreaks/classificationMethod/
+    colorRamp/field/minimumBreak）。
+
+    返回是否成功；失败时调用方退回拉伸渲染并如实记录（绝不因样式让整张图失败）。
+    """
+    renderer_spec = spec["renderer"]
+    bounds = sorted(float(value) for value in (renderer_spec.get("explicit_bounds") or []))
+    if not bounds:
+        return False
+    try:
+        from arcpy import cim  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        notes.append(f"raster_classify: 无法导入 CIM({str(exc)[:40]})")
+        return False
+
+    labels_mode = str(renderer_spec.get("labels_mode") or "range")
+    # 给定的是分级边界（n 个边界 → n-1 级）：第一个边界即首级下界
+    low = float(bounds[0])
+    upper_bounds = bounds[1:]
+    if not upper_bounds:
+        return False
+    labels = design_mod.format_class_labels(_bounds_pairs(upper_bounds, low), labels_mode)
+    ramp_colors = _ramp_colors(str(renderer_spec.get("color_ramp") or ""), len(upper_bounds))
+    if not ramp_colors:
+        # 兜底色带：没有色带名时也必须给每级颜色，否则分类栅格会渲染成空白
+        # （实测：不设 color 的 CIMRasterClassifyColorizer 出图后看不到栅格）
+        ramp_colors = _ramp_colors("YlOrRd", len(upper_bounds)) or [
+            "#FFFFCC", "#FFEDA0", "#FEB24C", "#F03B20", "#BD0026",
+        ]
+    try:
+        definition = layer.getDefinition("V3")
+        colorizer = cim.CIMRasterClassifyColorizer()
+        colorizer.classificationMethod = "Manual"
+        colorizer.minimumBreak = low
+        # 字段：**默认不设**。单波段栅格（核密度/高程这类）没有 "Value" 字段，
+        # 设了会让分类渲染失效、出图后图面空白（实测）。只有多波段/带属性表的栅格
+        # 才需要显式指定 raster_field。
+        field = str(renderer_spec.get("raster_field") or "")
+        if field:
+            colorizer.field = field
+        breaks = []
+        for index, upper in enumerate(upper_bounds):
+            brk = cim.CIMRasterClassBreak()
+            brk.upperBound = float(upper)
+            brk.label = labels[index] if index < len(labels) else str(upper)
+            if ramp_colors:
+                # 注意 _hex_to_rgb 返回 [r, g, b, alpha]，不能直接 unpack 成 3 个
+                rgb = _hex_to_rgb(ramp_colors[index % len(ramp_colors)])
+                color = cim.CIMRGBColor()
+                color.red, color.green, color.blue = rgb[0], rgb[1], rgb[2]
+                brk.color = color
+            breaks.append(brk)
+        colorizer.classBreaks = breaks
+        definition.colorizer = colorizer
+        layer.setDefinition(definition)
+
+        # 读回实测值（断言比对的是实测分级，不是我们以为的分级）
+        back = layer.getDefinition("V3").colorizer
+        applied = [float(brk.upperBound) for brk in (getattr(back, "classBreaks", None) or [])]
+        if not applied:
+            notes.append("raster_classify: 写完后读不到 classBreaks，视为失败")
+            return False
+        spec["renderer"]["applied_bounds"] = applied
+        entries = []
+        for index, brk in enumerate(getattr(back, "classBreaks", None) or []):
+            hex_color = _symbol_hex(getattr(brk, "color", None)) or (
+                ramp_colors[index % len(ramp_colors)] if ramp_colors else "#CCCCCC"
+            )
+            label = str(getattr(brk, "label", "") or (labels[index] if index < len(labels) else ""))
+            entries.append({"label": label, "color": hex_color})
+        if entries:
+            spec["renderer"]["legend_entries"] = entries
+        notes.append(f"raster_classify(统一图例): {applied}")
+        return True
+    except Exception as exc:  # pragma: no cover
+        notes.append(f"raster_classify 失败: {str(exc)[:90]}")
+        return False
+
+
+def _bounds_pairs(bounds: list[float], low: float) -> list[tuple[float, float]]:
+    """把上界列表转成 (下界, 上界) 区间列表（供标签格式化）。"""
+    pairs: list[tuple[float, float]] = []
+    for upper in bounds:
+        pairs.append((low, float(upper)))
+        low = float(upper)
+    return pairs
 
 
 def _apply_raster_stretch(layer: Any, spec: dict[str, Any], project: Any, notes: list[str]) -> None:
@@ -697,6 +859,12 @@ def render(
         _apply_unique(primary, spec, notes)
     elif mode == "raster_stretch":
         _apply_raster_stretch(primary, spec, project, notes)
+        # 统一图例：栅格也要能共用分级（核密度多期对比）——显式分级存在时改用分类渲染
+        if spec["renderer"].get("explicit_bounds"):
+            if _apply_raster_classify(primary, spec, project, notes):
+                pass
+            else:
+                notes.append("栅格显式分级未生效，已退拉伸渲染（统一图例可能不成立）")
     elif mode == "single":
         _apply_single(primary, spec, notes)
 
@@ -725,6 +893,29 @@ def render(
         )
     else:
         map_frame.camera.setExtent(map_frame.getLayerExtent(primary))
+
+    # 回写**实测**的地图框范围：叠加层（箭头/标注）要用它做数据坐标→像素换算。
+    # 用设计值会有偏差（相机 setExtent 后会按屏幕纵横比微调），这类偏差会直接体现为箭头错位。
+    try:
+        # 实测：ArcGIS Pro 3.6 的 MapFrame **没有** getExtent()，范围挂在 camera 上
+        # （与已知坑“Map 无 .camera”同源：这个版本的 API 与文档不一致）。
+        camera = getattr(map_frame, "camera", None)
+        frame_extent = camera.getExtent() if camera is not None else map_frame.getExtent()
+        spec["render_frame_extent"] = {
+            "xmin": float(frame_extent.XMin),
+            "ymin": float(frame_extent.YMin),
+            "xmax": float(frame_extent.XMax),
+            "ymax": float(frame_extent.YMax),
+            "width": float(frame_extent.XMax - frame_extent.XMin),
+            "height": float(frame_extent.YMax - frame_extent.YMin),
+        }
+        notes.append(
+            "render_frame_extent: "
+            f"({spec['render_frame_extent']['xmin']:.0f},{spec['render_frame_extent']['ymin']:.0f})~"
+            f"({spec['render_frame_extent']['xmax']:.0f},{spec['render_frame_extent']['ymax']:.0f})"
+        )
+    except Exception as exc:  # pragma: no cover
+        notes.append(f"render_frame_extent 读取失败: {str(exc)[:60]}")
 
     if spec["legend"].get("needed"):
         legend_style = _style_item(project, catalog, "LEGEND", [], notes)
@@ -858,6 +1049,47 @@ def render(
             )
             notes.append("scale_bar(单位叠加): " + ("已换为「" + unit_text + "」" if unit_result.get("ok")
                                                    else f"失败（{unit_result.get('detail')}）"))
+
+        # 叠加层箭头与年份标注（迁移图）：数据坐标 → 像素用**实测**地图框范围换算
+        overlay_cfg = spec.get("overlay") or {}
+        frame_extent = spec.get("render_frame_extent") or {}
+        frame_box = spec.get("map_frame") or {}
+        if overlay_cfg and frame_extent and frame_box:
+            box_mm = (float(frame_box["x"]), float(frame_box["y"]), float(frame_box["w"]), float(frame_box["h"]))
+            page_h = float(spec["page"]["height_mm"])
+            dpi_value = float(spec.get("dpi") or 250)
+            if overlay_cfg.get("arrows"):
+                from .image_overlay import stamp_arrows
+
+                arrow_result = stamp_arrows(
+                    produced,
+                    list(overlay_cfg["arrows"]),
+                    extent=frame_extent,
+                    box_mm=box_mm,
+                    page_height_mm=page_h,
+                    dpi=dpi_value,
+                    color=str(overlay_cfg.get("arrow_color") or "#B2182B"),
+                    label_size_pt=float(overlay_cfg.get("label_size_pt") or 9.0),
+                )
+                notes.append("overlay_arrows: " + ("已绘制 %s 条" % arrow_result.get("drawn")
+                                                   if arrow_result.get("ok") else f"失败（{arrow_result.get('detail')}）"))
+            if overlay_cfg.get("labels"):
+                from .image_overlay import stamp_point_labels
+
+                label_result = stamp_point_labels(
+                    produced,
+                    list(overlay_cfg["labels"]),
+                    extent=frame_extent,
+                    box_mm=box_mm,
+                    page_height_mm=page_h,
+                    dpi=dpi_value,
+                    color=str(overlay_cfg.get("label_color") or "#333333"),
+                    size_pt=float(overlay_cfg.get("label_size_pt") or 9.0),
+                )
+                notes.append("overlay_labels: " + ("已标注 %s 个" % label_result.get("drawn")
+                                                   if label_result.get("ok") else f"失败（{label_result.get('detail')}）"))
+        elif overlay_cfg:
+            notes.append("overlay: 缺少实测地图框范围/图框，跳过箭头与标注（请在渲染后再叠加）")
 
         # 图例：按我们的格式重绘（ArcGIS 分级标签固定 6 位小数、且不能自定义文字）
         entries = (spec.get("renderer") or {}).get("legend_entries") or []

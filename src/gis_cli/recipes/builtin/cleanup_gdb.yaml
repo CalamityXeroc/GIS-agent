@@ -44,7 +44,13 @@ code_template: |
       raise ValueError("keep 不能为空：必须显式列出要保留的结果图层")
 
   arcpy.env.workspace = gdb_path
-  items = (arcpy.ListFeatureClasses() or []) + (arcpy.ListTables() or [])
+  # 注意：必须同时列栅格——过程库里最常见的就是重做残留的中间栅格
+  # （实测：4 份 dem_mosaic* 拼接件共 159 MB，只列要素类/表根本清不掉）
+  items = (
+      (arcpy.ListFeatureClasses() or [])
+      + (arcpy.ListRasters() or [])
+      + (arcpy.ListTables() or [])
+  )
   keep_set = set(keep)
   missing_keep = [k for k in keep if k not in items]
   if missing_keep:
@@ -64,7 +70,11 @@ code_template: |
           arcpy.management.Delete(os.path.join(gdb_path, name))
           dropped.append(name)
 
-  remaining = (arcpy.ListFeatureClasses() or []) + (arcpy.ListTables() or [])
+  remaining = (
+      (arcpy.ListFeatureClasses() or [])
+      + (arcpy.ListRasters() or [])
+      + (arcpy.ListTables() or [])
+  )
   set_result({
       "output": gdb_path,
       "dry_run": dry_run,
@@ -80,6 +90,7 @@ validation:
 pitfalls:
   - 默认 dry_run=true，只看不删；确认清单正确后再传 false。
   - 删除是不可恢复的：执行前确认 keep 列表覆盖全部结果层（含供复查的中间结果）。
+  - 同时覆盖要素类/栅格/表；同名前缀的多个条目（如 dem_mosaic*）多半是重做残留，应当删。
   - 只按名称匹配，不分析依赖关系；被其它图层引用的层不会被识别。
 examples:
   - "交付前只保留 result_data.gdb 里的最终成果图层"

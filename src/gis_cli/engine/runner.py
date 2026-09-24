@@ -67,8 +67,13 @@ def build_engine(
     refresh_catalog: bool = True,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     verbose: bool = False,
+    engine_overrides: dict[str, Any] | None = None,
 ) -> EngineBundle:
-    """Assemble the engine and optionally warm the catalog."""
+    """Assemble the engine and optionally warm the catalog.
+
+    ``engine_overrides`` 允许调用方（如 benchmark runner）按任务覆盖 engine 段配置，
+    例如用任务 YAML 的 ``timeout_seconds`` 覆盖 ``run_deadline_seconds``。
+    """
     from ..datacatalog.scanner import refresh_catalog as do_refresh
     from ..datacatalog.store import Catalog
     from ..recipes.store import RecipeLibrary
@@ -79,6 +84,8 @@ def build_engine(
     state_dir.mkdir(parents=True, exist_ok=True)
 
     llm_config, engine_cfg = load_engine_config(ws, config_path)
+    if engine_overrides:
+        engine_cfg = {**engine_cfg, **{k: v for k, v in engine_overrides.items() if v is not None}}
     llm = EngineLLMClient(llm_config)
 
     catalog = Catalog(state_dir / "catalog.db")
@@ -94,7 +101,13 @@ def build_engine(
         catalog=catalog,
     )
     recipes.load()
-    verifier = Verifier(workspace=ws, code_runner=code_runner, llm_client=llm)
+    verifier = Verifier(
+        workspace=ws,
+        code_runner=code_runner,
+        llm_client=llm,
+        hygiene_mode=str(engine_cfg.get("hygiene_check", "warn")),
+        vision_mode=str(engine_cfg.get("vision_check", "warn")),
+    )
     registry = build_default_registry()
 
     context = EngineContext(
@@ -117,6 +130,7 @@ def build_engine(
         context_soft_limit_tokens=int(engine_cfg.get("context_soft_limit_tokens", 120_000)),
         max_diagnosis_turns=int(engine_cfg.get("exploration_turn_budget", 3)),
         escalate_after_failures=int(engine_cfg.get("escalate_after_failures", 2)),
+        run_deadline_seconds=float(engine_cfg.get("run_deadline_seconds", 7200)),
         verbose=verbose,
     )
 

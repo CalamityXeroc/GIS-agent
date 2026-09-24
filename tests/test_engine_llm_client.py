@@ -102,3 +102,78 @@ def test_model_circuit_breaker_ignores_non_retryable():
     )
     client._record_failure("m", LLMError("bad request", status_code=400))
     assert client._cooldown_until == {}
+
+
+def test_model_cooldown_escalates_on_repeat_failures():
+    """反复失败的模型冷却时间应指数升级（实测网关坏掉的主模型每轮白烧 420s 的修复）。"""
+    from gis_cli.engine.llm_client import LLMError
+
+    client = EngineLLMClient(
+        EngineLLMConfig(
+            model="m",
+            fallback_models=["b"],
+            model_failure_threshold=1,
+            model_cooldown_seconds=100.0,
+            model_cooldown_max_seconds=1000.0,
+        )
+    )
+    import time as _t
+
+    client._record_failure("m", LLMError("conn", status_code=None))
+    first = client._cooldown_until["m"] - _t.monotonic()
+    client._record_failure("m", LLMError("conn", status_code=None))
+    second = client._cooldown_until["m"] - _t.monotonic()
+    assert 90 <= first <= 115, first   # 首次冷却 ≈ 100s
+    assert second >= first * 1.5, (first, second)  # 升级到 ≈ 200s
+    for _ in range(10):
+        client._record_failure("m", LLMError("conn", status_code=None))
+    cap = client._cooldown_until["m"] - _t.monotonic()
+    assert cap <= 1000.0, cap
+    client._record_success("m")
+    assert client._cooldown_until == {} and client._cooldown_strikes == {}
+
+
+def test_repeat_offender_gets_reduced_attempt_budget(monkeypatch):
+    """已被冷却过的模型再次被尝试时，单次预算应缩短（避免反复烧满 420s）。"""
+    from gis_cli.engine.llm_client import EngineLLMClient, EngineLLMConfig, LLMError
+
+    client = EngineLLMClient(
+        EngineLLMConfig(
+            model="m",
+            api_key="test-key",
+            api_base="http://127.0.0.1:9/v1",
+            model_failure_threshold=1,
+            total_timeout=420.0,
+            reduced_timeout_seconds=60.0,
+        )
+    )
+    seen: dict[str, float] = {}
+
+    def fake_create(**kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise TimeoutError("Request timed out")
+
+    monkeypatch.setattr(client.client.chat.completions, "create", fake_create)
+
+    # 首次：没有失败史 → 用满 total_timeout（但至少 30s）
+    try:
+        client._chat_once(
+            [{"role": "user", "content": "hi"}],
+            model="m", tools=None, tool_choice=None, temperature=0, max_tokens=None, response_format=None,
+        )
+    except Exception:
+        pass
+    first = seen.get("timeout")
+    client._record_failure("m", LLMError("conn", status_code=None))
+
+    # 有失败史后：预算被压到 reduced_timeout_seconds
+    try:
+        client._chat_once(
+            [{"role": "user", "content": "hi"}],
+            model="m", tools=None, tool_choice=None, temperature=0, max_tokens=None, response_format=None,
+        )
+    except Exception:
+        pass
+    second = seen.get("timeout")
+    assert first and second and second < first, (first, second)
+    assert second <= 60.0, second
