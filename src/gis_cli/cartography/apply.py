@@ -100,6 +100,12 @@ def _symbol_hex(symbol: Any) -> str:
     if rgb is None and isinstance(color, dict):
         rgb = color.get("RGB")
     if not rgb:
+        # CIM 颜色（cim.CIMRGBColor）把分量放在 ``values``，没有 ``RGB``；
+        # 不读这里图例色块会取不到颜色（实测）。
+        vals = getattr(color, "values", None)
+        if vals:
+            rgb = vals
+    if not rgb:
         return ""
     try:
         return "#{:02X}{:02X}{:02X}".format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
@@ -187,7 +193,7 @@ def _hide_frame_border(map_frame: Any, notes: list[str]) -> None:
         stroke = cim.CIMSolidStroke()
         stroke.width = 0.5
         stroke.color = cim.CIMRGBColor()
-        stroke.color.red, stroke.color.green, stroke.color.blue = 0, 0, 0
+        stroke.color.values = [0, 0, 0, 100]
         reference.symbol = stroke
         graphic_frame.borderSymbol = reference
         map_frame.setDefinition(definition)
@@ -243,7 +249,7 @@ def _add_text(layout: Any, box: dict[str, float], text: str, *, font: str, heigh
         symbol.horizontalAlignment = align
         symbol.verticalAlignment = "Center"
         symbol.color = cim.CIMRGBColor()
-        symbol.color.red, symbol.color.green, symbol.color.blue = 0, 0, 0
+        symbol.color.values = [0, 0, 0, 100]
         graphic.symbol = symbol
         top = float(box["y"]) + float(box["h"]) - (index + 1) * line_h
         graphic.shape = arcpy.Polygon(arcpy.Array([
@@ -270,7 +276,7 @@ def _add_neatline(layout: Any, box: dict[str, float]) -> None:
     symbol = cim.CIMPolygonSymbol()
     stroke = cim.CIMSolidStroke()
     stroke.color = cim.CIMRGBColor()
-    stroke.color.red, stroke.color.green, stroke.color.blue = 0, 0, 0
+    stroke.color.values = [0, 0, 0, 100]
     stroke.width = float(box.get("line_width", 0.5))
     symbol.symbolLayers = [stroke]
     graphic.symbol = symbol
@@ -532,7 +538,7 @@ def _apply_raster_classify(layer: Any, spec: dict[str, Any], project: Any, notes
                 # 注意 _hex_to_rgb 返回 [r, g, b, alpha]，不能直接 unpack 成 3 个
                 rgb = _hex_to_rgb(ramp_colors[index % len(ramp_colors)])
                 color = cim.CIMRGBColor()
-                color.red, color.green, color.blue = rgb[0], rgb[1], rgb[2]
+                color.values = [int(rgb[0]), int(rgb[1]), int(rgb[2]), 100]
                 brk.color = color
             breaks.append(brk)
         colorizer.classBreaks = breaks
@@ -722,8 +728,14 @@ def _configure_scale_bar(scale_bar: Any, spec: dict[str, Any], notes: list[str])
     # 实测：比例尺地面长度 ≈ 元素宽度 × 地图比例尺；所以元素宽度直接取"计划条长"（不带留白），
     # 这样 ArcGIS 按元素宽度自适出来的总长就是计划中的整数长度（刻度才能是整数）。
     width = max(25.0, min(float(spec["scale_bar"].get("w") or 60.0), bar_mm))
+    _divisions = int(cfg.get("divisions") or 4)
+    _min_w = max(45.0, 10.0 * (_divisions + 1))   # 每个刻度标签至少 ~10mm 才不重叠
     if cfg.get("element_width_mm"):
-        width = float(cfg["element_width_mm"])   # 修复轮给出的校正宽度（把刻度拉到整数）
+        # 修复轮给出的校正宽度（把刻度拉到整数）：必须夹在合理区间。
+        # 实测：>90mm 会撑出 A4 图框；过窄会把千米刻度数字挤成一团（14 届四a 识图质检实测）。
+        width = max(_min_w, min(float(cfg["element_width_mm"]), 90.0))
+    # 无论走哪条路径，最终宽度都不允许窄于"标签放得下"的下限（否则刻度数字会叠在一起）。
+    width = max(_min_w, min(width, 90.0))
     # 先把 CIM 里的单位/字号设好，再用元素 API 收尾（反过来会被 setDefinition 重置）
     try:
         definition = scale_bar.getDefinition("V3")

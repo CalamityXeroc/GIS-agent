@@ -508,7 +508,7 @@ class RecipeLibrary:
 
                 verdict = _qc.check_layout(
                     target,
-                    spec=raw.get("spec") or None,
+                    spec=raw.get("spec") or self._load_sibling_spec(target, raw.get("image")),
                     image_path=str(raw.get("image") or ""),
                     min_font_pt=float(raw.get("min_font_pt") or 7.0),
                 )
@@ -530,6 +530,30 @@ class RecipeLibrary:
             exists = bool(raw_path) and Path(str(raw_path)).exists()
             return ValidationResult(kind, target, exists, f"{key}={raw_path}")
         return ValidationResult(kind, target, True, "未知断言类型，已跳过")
+
+    @staticmethod
+    def _load_sibling_spec(target: str, image: Any = "") -> dict[str, Any] | None:
+        """加载与工程/成图同名的 ``.spec.json``（设计规格）。
+
+        版面体检里有些判据依赖设计决策（例如"图例刻意放在图框外"是允许的），
+        不传 spec 会把刻意设计误报成越界（14 届四a-2 实测）。
+        """
+        import json as _json
+
+        candidates: list[Path] = []
+        for raw_path in (target, image):
+            if not raw_path:
+                continue
+            path = Path(str(raw_path))
+            candidates.append(path.with_suffix(".spec.json"))
+            candidates.append(path.with_suffix(path.suffix + ".spec.json"))
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return _json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+        return None
 
     def _field_counts_all(self, path: str, field: str) -> tuple[dict[str, int] | None, str]:
         """字段全量取值计数：内核优先，进程内 arcpy 兜底。

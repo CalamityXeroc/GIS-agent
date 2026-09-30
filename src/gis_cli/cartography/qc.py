@@ -149,6 +149,30 @@ def _image_density(image_path: str, box_px: tuple[int, int, int, int] | None = N
         return None
 
 
+def _image_flatness(image_path: str, box_px: tuple[int, int, int, int] | None = None) -> tuple[float, float] | None:
+    """返回 (非白像素占比, 灰度标准差)。
+
+    实测（14 届四a 密度图）：淡色系（如 Purples 最浅一级 #F2F0F7）会把整幅有效图面
+    判成"空白"——所以判空白不能只看非白占比，还要看画面是否有层次（标准差）。
+    """
+    try:
+        from PIL import Image  # type: ignore
+        import numpy as np  # type: ignore
+
+        with Image.open(image_path) as img:
+            array = np.asarray(img.convert("RGB"))
+        if box_px:
+            left, top, right, bottom = box_px
+            array = array[max(0, top):max(0, bottom), max(0, left):max(0, right)]
+        if array.size == 0:
+            return None
+        gray = array.mean(axis=2)
+        return float((gray < 240).mean()), float(gray.std())
+    except Exception as exc:  # pragma: no cover
+        logger.warning("图片量测失败: %s", exc)
+        return None
+
+
 def check_layout(
     aprx_path: str,
     *,
@@ -372,11 +396,31 @@ def check_layout(
             problems.append(f"右越界 {lx + lw - (fx + fw - margin):.1f}mm")
         if ly + lh > fy + fh - margin + 0.6:
             problems.append(f"上越界 {ly + lh - (fy + fh - margin):.1f}mm")
-        checks.append({
-            "name": "legend_outside_frame", "ok": not problems,
-            "detail": ("图例完全在图框内（留 %.1fmm 边距）" % margin) if not problems
-                      else "图例压出图框：" + "、".join(problems),
-        })
+        # 完全在图框内（留边距）
+        fully_inside = (
+            lx >= fx + margin - 0.6 and ly >= fy + margin - 0.6
+            and lx + lw <= fx + fw - margin + 0.6 and ly + lh <= fy + fh - margin + 0.6
+        )
+        # 与图框边界相交（压线）——这才是真正要报的版面缺陷
+        crosses_frame_edge = not (
+            lx + lw <= fx + 0.6 or lx >= fx + fw - 0.6
+            or ly + lh <= fy + 0.6 or ly >= fy + fh - 0.6
+        )
+        if fully_inside:
+            checks.append({
+                "name": "legend_outside_frame", "ok": True,
+                "detail": "图例完全在图框内（留 %.1fmm 边距）" % margin,
+            })
+        elif not crosses_frame_edge:
+            checks.append({
+                "name": "legend_outside_frame", "ok": True,
+                "detail": "图例整体在地图框外（设计选择：图面较密时避免压数据）；是否越出版面由 element_outside_neatline 判定",
+            })
+        else:
+            checks.append({
+                "name": "legend_outside_frame", "ok": False,
+                "detail": "图例与图框压线（半进半出）：" + "、".join(problems) if problems else "图例与图框压线",
+            })
 
     # 3.8) 单层边框：只看图（ArcGIS 保存时会重新套用地图框样式，CIM 里的 borderSymbol 不可作为判据）
     if image_path and Path(image_path).exists() and frame and neatline:
@@ -441,13 +485,16 @@ def check_layout(
         page_h = float((spec or {}).get("page", {}).get("height_mm") or 297.0)
         mm2px = dpi / 25.4
         fx, fy, fw, fh = frame
-        density = _image_density(image_path, (
+        stats = _image_flatness(image_path, (
             int(fx * mm2px), int((page_h - (fy + fh)) * mm2px),
             int((fx + fw) * mm2px), int((page_h - fy) * mm2px),
         ))
-        if density is not None:
-            checks.append({"name": "map_frame_blank", "ok": density >= 0.15,
-                           "detail": f"地图框内非白像素占比 {density:.2f}（<0.15 接近空白）"})
+        if stats is not None:
+            density, spread = stats
+            blank = density < 0.15 and spread < 3.0
+            checks.append({"name": "map_frame_blank", "ok": not blank,
+                           "detail": f"地图框内非白像素占比 {density:.2f}、灰度标准差 {spread:.1f}"
+                                     f"（两者都低才算接近空白）"})
 
     ok_all = all(bool(check.get("ok")) for check in checks)
     return {"ok": ok_all, "checks": checks, "aprx": str(target)}

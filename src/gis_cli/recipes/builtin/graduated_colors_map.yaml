@@ -128,13 +128,26 @@ code_template: |
                       aprx_path={{aprx_path}}, field=field_name)
 
   # 分级字段空值不上色：必须显式统计并报告，否则"未分析"与"值为 0"在图上无法区分
+  # 栅格没有属性表：arcpy.da.SearchCursor 打不开栅格（实测报 cannot open <raster>），
+  # 故按数据类型分流——矢量走 SearchCursor，栅格按 NoData 统计（栅格输入不再中断出图）。
   total = 0
   nulls = 0
-  with arcpy.da.SearchCursor(input_path, [field_name]) as cur:
-      for (value,) in cur:
-          total += 1
-          if value is None:
-              nulls += 1
+  if _is_raster:
+      try:
+          _nd = getattr(arcpy.Raster(input_path), "noDataValue", None)
+          _nd = -9999.0 if _nd is None else float(_nd)
+          _arr = arcpy.RasterToNumPyArray(input_path, None, None, None, _nd)
+          total = int(_arr.size)
+          nulls = int((_arr == _nd).sum())
+          print("栅格空值统计：NoData=" + str(_nd) + "，共 " + str(total) + " 像元，其中 NoData " + str(nulls))
+      except Exception as _exc:
+          print("栅格空值统计失败（忽略，不影响出图）: " + str(_exc)[:80])
+  else:
+      with arcpy.da.SearchCursor(input_path, [field_name]) as cur:
+          for (value,) in cur:
+              total += 1
+              if value is None:
+                  nulls += 1
   null_rate = round(nulls / total, 4) if total else 0.0
   if nulls:
       print(f"注意：分级字段 {field_name} 有 {nulls}/{total} 个空值（{null_rate:.1%}）不上色，"
