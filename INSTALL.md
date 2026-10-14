@@ -30,9 +30,13 @@ pip install -e .
 |---|---|---|
 | `openai` | 调用大模型接口 | 无法运行 |
 | `PyYAML` | 解析 GIS 配方（recipes） | 无法运行 |
-| `jupyter-client` | ArcPy 持久内核（一次导入、跨步保持状态） | 自动降级为一次性子进程执行（较慢） |
-| `Pillow` | 图片类验收断言（判断出图是否空白） | 图片断言跳过 |
+| `jupyter-client` | ArcPy 持久内核（一次导入、跨步保持状态） | 自动降级为一次性子进程执行：每步重导 arcpy（约 15 秒）且丢掉跨步变量 |
+| `Pillow` + `numpy` | 图片类验收断言（判断出图是否空白）、版面体检、制图叠加层 | 图片断言直接报“缺少依赖”而**不会**静默通过 |
+| `psutil` | 出图前检测 ArcGIS Pro 是否开着（同时跑 GP 会互相干扰） | 跳过该检测 |
 | `python-docx` / `pypdf` | 读取任务书 docx/pdf | 文档解析类任务不可用 |
+
+> 小提示：装依赖时请认准**跑 agent 的那个解释器**。典型坑是内核报 “jupyter_client is required”
+> 但 ArcGIS 环境里明明有——真正缺包的是另一个 venv。
 
 ## 3. 初始化配置
 

@@ -19,10 +19,27 @@ from .state import Observation
 
 logger = logging.getLogger(__name__)
 
+#: 产出文件的扩展名（统一一处，避免 tools 与 verifier 各写一份而漏格式）。
+#: 实测坑：以前两份都只列 GIS/图像格式，**没有 .docx/.xlsx/.pptx**，
+#: 于是“写个 Word 文档”这类非 GIS 产出无法被登记也无法被发现，
+#: 验收永远报“没有任何产出文件”。
 GIS_OUTPUT_EXT = {
-    ".shp", ".gdb", ".pdf", ".png", ".tif", ".tiff", ".csv", ".xlsx",
-    ".dbf", ".gpkg", ".lyrx", ".mapx", ".jpg", ".jpeg", ".bmp", ".svg", ".aprx",
+    # 矢量 / 栅格 / 表格
+    ".shp", ".gdb", ".tif", ".tiff", ".img", ".dbf", ".gpkg", ".csv", ".xlsx", ".xls",
+    # 地图与工程
+    ".lyrx", ".mapx", ".aprx", ".mxd",
+    # 图片
+    ".png", ".jpg", ".jpeg", ".bmp", ".svg", ".gif", ".webp",
+    # 文档（技能产出：写报告 / Word / PDF / PPT）
+    ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".md", ".txt", ".html",
+    # 制图设计规格（graduated_colors_map 等配方回写，验收要读它核对分级一致）；
+    # 以前漏了 .json，4 份 .spec.json 明明落在 output/成果图/ 下却从未进产物清单，
+    # 语义验收看不到就说“缺失 .spec.json”，把 agent 逼到反复重做（14 届 4a-1 实测）。
+    ".json",
 }
+
+#: 归档/中间产物后缀：即使名字里带上面某个扩展名也不算产出
+_NON_OUTPUT_EXT = {".tmp", ".bak", ".log", ".pkl", ".pyc"}
 
 
 #: 自写代码标志 → 可闭环该操作的已验证配方（代码反复失败时的引导）
@@ -104,10 +121,31 @@ def _recipe_hint(ctx: EngineContext, description: str, code: str) -> str:
 
 
 def extract_outputs(value: Any, workspace: str | Path, *, limit: int = 30) -> list[str]:
-    """Walk a set_result payload and collect GIS output paths."""
-    workspace_path = Path(workspace)
+    """Walk a set_result payload and collect GIS output paths.
+
+    只收**产物**：workspace 之外的路径、以及 ``input/`` ``temp/`` 里的路径都不算。
+
+    实测两个坑：
+    1. 模型习惯把读过的输入也写进 set_result，若当成产物登记，验收会报
+       “产出不在 output 目录内”而判定失败（benchmark 的 4b 就栽在这）。
+    2. 模型会把工具回参里的**外部**工程当成产物，例如
+       ``E:\\ArcGISPro3.6\\...\\Blank.aprx``、用户 Documents 下的 MyProject.aprx。
+       这些是 ArcGIS 自带的模板工程，一登记就让验收永远报“产出不在 output 目录内”，
+       把 agent 逼到 130 轮上限（14 届 4a-1 实测：断言 7/7 全过却 status=max_turns）。
+       产物必须在 workspace 内，所以这里直接以 workspace 为界拒掉外部路径。
+    """
+    workspace_path = Path(workspace).resolve()
     outputs: list[str] = []
     seen: set[str] = set()
+
+    def _is_input_path(rel: str) -> bool:
+        """workspace 相对路径是否落在输入/中间目录里。
+
+        只看目录段（不看文件名）：input/animal_points.shp 是输入，而
+        output/animal_points.shp 是产物。
+        """
+        dirs = [seg for seg in rel.split("/") if seg][:-1]  # 去掉文件名
+        return any(seg in ("input", "temp") for seg in dirs)
 
     def _add(candidate: str) -> None:
         text = candidate.strip()
@@ -119,8 +157,25 @@ def extract_outputs(value: Any, workspace: str | Path, *, limit: int = 30) -> li
             is_gis = True
         if not is_gis:
             return
+        # 产物必须落在 workspace 内：外部路径（ArcGIS 模板、用户工程）不是本次产出。
+        #
+        # 注意：模型给的常常是**相对路径**（如 output\result_data.gdb\kde_1982_1986），
+        # 而 Path.resolve() 会把相对路径按**当前工作目录**展开——不是 workspace，
+        # 于是 relative_to 抛异常、产物被当成外部路径丢掉。实测（14 届 4a-1）：
+        # finish 里列的 4 个 GDB 栅格就是这么没的，验收只能说“缺失栅格元数据”，
+        # agent 空转到轮次上限。所以相对路径先拼 workspace 再解析。
+        raw_path = Path(text)
+        absolute = raw_path if raw_path.is_absolute() else workspace_path / raw_path
+        try:
+            rel = str(absolute.resolve().relative_to(workspace_path)).lower()
+        except Exception:
+            return
+        rel = rel.replace("\\", "/")
+        if _is_input_path(rel):
+            return
+        # 登记绝对路径：后面验收（可能跑在别的进程/内核里）拿到相对路径会解析错目录。
         seen.add(text)
-        outputs.append(text)
+        outputs.append(str(absolute))
 
     def _walk(node: Any) -> None:
         if len(outputs) >= limit:
@@ -216,6 +271,61 @@ class EngineContext:
 
 
 # --------------------------------------------------------------------- tools
+def _resolve_path(ctx: Any, raw: str) -> tuple[Path | None, list[Path]]:
+    """把模型给的路径解析成真实文件（返回 (命中路径, 尝试过的候选)）。
+
+    实测坑：模型常把工作区名写进路径（如 ``workspace/input/x.pdf``），
+    旧的 ``ctx.workspace / path`` 会拼成 ``workspace/workspace/input/x.pdf``，
+    于是报"文档不存在"，并把错误路径回喂给模型，越修越偏。
+
+    策略：绝对路径优先；相对路径依次尝试
+    ① 工作区下 ② 当前目录 ③ 工作区父目录下（覆盖"已含工作区名"）
+    ④ 去掉开头的工作区目录名后再拼工作区。
+    """
+    text = str(raw or "").strip().strip('"').strip("'").replace("\\", "/")
+    if not text:
+        return None, []
+    ws = Path(getattr(ctx, "workspace", Path.cwd()))
+    first = Path(text)
+    candidates: list[Path] = []
+    if first.is_absolute():
+        candidates.append(first)
+    else:
+        parts = list(first.parts)
+        starts_with_ws_name = bool(parts) and parts[0] == ws.name and len(parts) > 1
+        if starts_with_ws_name:
+            # 路径里已带工作区名：直接拼父目录 / 去掉该目录名，避免产出 workspace/workspace/...
+            candidates.append(ws.parent / text)
+            candidates.append(ws / Path(*parts[1:]))
+        else:
+            candidates.append(ws / text)
+        try:
+            candidates.append(Path.cwd() / text)
+        except Exception:
+            pass
+        if not starts_with_ws_name:
+            candidates.append(ws.parent / text)
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate, candidates
+        except OSError:
+            continue
+    return None, candidates
+
+
+def _missing_path_message(raw: str, tried: list[Path]) -> str:
+    """把"到底找了哪些位置"讲清楚，避免模型在错误路径上反复试。"""
+    unique: list[str] = []
+    for item in tried:
+        text = str(item)
+        if text not in unique:
+            unique.append(text)
+    head = unique[0] if unique else str(raw)
+    rest = "；".join(unique[1:4])
+    return f"路径不存在: {head}" + (f"（也已尝试: {rest}）" if rest else "")
+
+
 def build_default_registry() -> EngineToolRegistry:
     registry = EngineToolRegistry()
 
@@ -266,7 +376,7 @@ def build_default_registry() -> EngineToolRegistry:
         timeout = float(args.get("timeout_seconds", ctx.exec_timeout) or ctx.exec_timeout)
 
         if ctx.auto_backup and looks_destructive(code):
-            candidates = _referenced_existing_paths(code, ctx.workspace)
+            candidates = _referenced_existing_paths(code, ctx.workspace, ctx)
             if candidates:
                 created = backup_paths(candidates, ctx.backup_dir)
                 if created:
@@ -344,14 +454,13 @@ def build_default_registry() -> EngineToolRegistry:
 
         path = str(args.get("path", "") or "")
         max_chars = int(args.get("max_chars", 20000) or 20000)
-        target = Path(path)
-        if not target.is_absolute():
-            target = ctx.workspace / path
-        if not target.exists():
+        target, tried = _resolve_path(ctx, path)
+        if target is None:
+            message = _missing_path_message(path, tried)
             return Observation(
                 ok=False,
-                summary=f"文档不存在: {target}",
-                error={"type": "FileNotFound", "message": str(target)},
+                summary=f"文档不存在: {message}",
+                error={"type": "FileNotFound", "message": message},
             )
         try:
             text = read_document_text(target, max_chars)
@@ -380,6 +489,115 @@ def build_default_registry() -> EngineToolRegistry:
                 "required": ["path"],
             },
             handler=_read_document,
+        )
+    )
+
+    # ---------------------------------------------------------------- read_file
+    def _read_file(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """读任意文本文件（技能正文、脚本、配置等）。
+
+        技能（``SKILL.md``）和它自带的脚本都是普通文本，而 ``read_document``
+        只认 docx/pdf/txt——没有这个工具，即便告诉模型“有 skill 可用”，它也读不到。
+        """
+        path = str(args.get("path", "") or "")
+        max_chars = int(args.get("max_chars", 40000) or 40000)
+        target, tried = _resolve_path(ctx, path)
+        if target is None or not target.is_file():
+            return Observation(
+                ok=False,
+                summary=f"文件不存在: {_missing_path_message(path, tried)}",
+                error={"type": "FileNotFound"},
+            )
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return Observation(
+                ok=False,
+                summary=f"读取失败: {exc}",
+                error={"type": type(exc).__name__, "message": str(exc)},
+            )
+        total = len(text)
+        truncated = total > max_chars
+        if truncated:
+            text = text[:max_chars] + f"\n\n…（已截断，原文 {total} 字符）"
+        return Observation(
+            ok=True,
+            summary=f"已读取 {target.name}（{total} 字符{'，已截断' if truncated else ''}）",
+            data={"path": str(target), "text": text, "total_chars": total, "truncated": truncated},
+        )
+
+    registry.register(
+        EngineTool(
+            name="read_file",
+            description=(
+                "读取任意文本文件（.md/.txt/.py/.json 等），用于查看技能正文（SKILL.md）、"
+                "技能自带脚本、配置或说明文档。二进制文档（docx/pdf）改用 read_document。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径（可相对 workspace）"},
+                    "max_chars": {"type": "integer", "description": "最多返回字符数，默认 40000"},
+                },
+                "required": ["path"],
+            },
+            handler=_read_file,
+        )
+    )
+
+    # ---------------------------------------------------------------- run_skill
+    def _run_skill(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """把一个技能的 SKILL.md 全文读进对话（progressive disclosure 的第二步）。
+
+        常驻上下文里只有技能名+描述（便宜）；真正要用时才把全文拉进来。
+        """
+        from ..skills.catalog import discover_skills, read_skill_text
+
+        name = str(args.get("name", "") or "").strip()
+        if not name:
+            return Observation(ok=False, summary="必须给技能名", error={"type": "BadArgs"})
+        skills = discover_skills(ctx.workspace)
+        chosen = None
+        for item in skills:
+            if item.name.lower() == name.lower().lstrip("/"):
+                chosen = item
+                break
+        if chosen is None:
+            available = ", ".join(item.name for item in skills[:20]) or "（无）"
+            return Observation(
+                ok=False,
+                summary=f"没找到技能 {name}；可用技能：{available}",
+                error={"type": "SkillNotFound"},
+            )
+        text = read_skill_text(chosen)
+        return Observation(
+            ok=True,
+            summary=f"已加载技能 {chosen.name}（{len(text)} 字符，脚本目录 {chosen.root}）",
+            data={
+                "name": chosen.name,
+                "description": chosen.description,
+                "root": str(chosen.root),
+                "skill_file": str(chosen.skill_file),
+                "text": text,
+            },
+        )
+
+    registry.register(
+        EngineTool(
+            name="run_skill",
+            description=(
+                "加载某个技能的完整说明（SKILL.md 正文）。当任务与“可用技能”列表中某个技能的"
+                "描述吻合时（例如用户要写 Word 文档 / 读 PDF / 做幻灯片），必须先调用它读到全文，"
+                "再严格按其中的步骤执行；技能自带的脚本用 execute_code 运行。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名（与技能列表一致）"},
+                },
+                "required": ["name"],
+            },
+            handler=_run_skill,
         )
     )
 
@@ -418,6 +636,166 @@ def build_default_registry() -> EngineToolRegistry:
                 "required": ["recipe_id", "params"],
             },
             handler=_run_recipe,
+        )
+    )
+
+    # -------------------------------------------------------------- create_map
+    def _create_map(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """直接调制图引擎出图（不需要写代码，也不要去读 cartography 源码）。
+
+        实测（14 届 4a-2）：任务要求“迁移方向箭头 + 年份标注”，模型找不到
+        overlay 的用法，只好反复用 execute_code 读我们自己的源码（80+ 轮），
+        而 `overlay` 本来就支持——只是没有工具面把它暴露出来。
+        """
+        output_path = str(args.get("output_path", "") or "").strip()
+        if not output_path:
+            return Observation(ok=False, summary="缺少 output_path", error={"type": "BadArgs"})
+        layers = [str(item) for item in (args.get("layers") or []) if str(item).strip()]
+        if not layers:
+            return Observation(ok=False, summary="缺少 layers（至少一个图层路径）", error={"type": "BadArgs"})
+        # 相对路径先按 workspace 解析成**绝对路径**：内核的 cwd 不一定是 workspace，
+        # 而 addDataFromPath 碰到相对路径会把本地数据当成 Web 服务去解析，报
+        # “AUTOMATIC 失败…web_service_type”（已复现）。create_map 内部也会再解析一次，
+        # 这里做是为了不依赖内核 cwd。
+        layers = [str(_resolve_path(ctx, item)[0] or (Path(ctx.workspace) / item)) for item in layers]
+
+        intent: dict[str, Any] = {}
+        for key in (
+            "title", "theme", "region", "scale", "purpose", "medium", "orientation",
+            "legend_labels", "style_profile", "field", "name",
+            # 渲染与分级：以前这些只存在于“直接写代码”的路径里，调 create_map 的人
+            # 只能去读 cartography 源码猜（实测 214 次读源码里最多的就是这几类）。
+            "mode", "explicit_bounds", "class_bounds", "classification", "color_ramp",
+            "category_names", "category_colors", "category_order", "legend_title",
+            "map_kind", "note",
+        ):
+            if args.get(key):
+                intent[key] = args[key]
+        if isinstance(args.get("overlay"), dict):
+            intent["overlay"] = args["overlay"]
+        if isinstance(args.get("overrides"), dict):
+            intent["overrides"] = args["overrides"]
+        if args.get("fields"):
+            intent["fields"] = args["fields"]
+
+        aprx_path = str(args.get("aprx_path", "") or "")
+        code = (
+            "from gis_cli.cartography import create_map\n"
+            f"_r = create_map({layers!r}, {intent!r}, output_path={output_path!r}, "
+            f"aprx_path={aprx_path!r}, code_runner=None)\n"
+            "set_result(_r)\n"
+        )
+        # 制图引擎自己要在 ArcGIS 解释器（内核）里跑，所以固定走 code_runner；
+        # 不要在这里直接用 create_map（benchmark/CLI 的 venv 没有 arcpy）。
+        result = ctx.code_runner.run(code, timeout=float(args.get("timeout_seconds") or 900), workspace=str(ctx.workspace))
+        if not result.ok:
+            detail = ""
+            if isinstance(result.error, dict):
+                detail = str(result.error.get("message") or result.error.get("type") or "")
+            return Observation(
+                ok=False,
+                summary=f"出图失败: {detail[:300]}",
+                error=result.error,
+                data={"stdout": result.stdout[-2000:], "stderr": result.stderr[-1500:]},
+                hint="看 traceback 修正参数；overlay 的坐标系必须与图层一致（数据坐标，不是像素）。",
+            )
+        payload = result.result if isinstance(result.result, dict) else {}
+        artifacts = extract_outputs(
+            [output_path, aprx_path, payload.get("spec"), payload.get("output"), payload.get("aprx")],
+            ctx.workspace,
+        )
+        if ctx.state is not None:
+            for path in artifacts:
+                ctx.state.add_artifact(path)
+        qc_ok = payload.get("qc_ok")
+        summary = f"出图完成：{output_path}"
+        if qc_ok is not None:
+            summary += f"（版面体检 {'通过' if qc_ok else '未通过'}）"
+        return Observation(
+            ok=True,
+            summary=summary,
+            data=payload,
+            artifacts=artifacts,
+            hint="" if qc_ok is not False else f"版面问题：{str(payload.get('qc_summary'))[:220]}",
+        )
+
+    registry.register(
+        EngineTool(
+            name="create_map",
+            description=(
+                "出地图（含版面自修复）：直接传图层与设计意图，就能得到 JPG + 同名可编辑 .aprx。"
+                "版面（图名/图例/比例尺/指北针）由规则引擎自动决定，不传也能出图。\n"
+                "**这些参数就是全部接口，不要去读 cartography 源码找别的开关。**\n"
+                "【分级渲染】用 field 指定字段；mode 强制渲染器（graduated 分级 / unique 分类 / "
+                "raster_stretch 栅格拉伸 / single 单色）；explicit_bounds 或 class_bounds 给**显式分级上界**"
+                '（如 "0,2,4,6,8"），多张图传同一串就能共用一套图例；classification 选分级方法'
+                "（quantile/natural/interval）；color_ramp 指定色带名（如 Purples/Reds/Greens）。\n"
+                "【叠加层】迁移图这类需要“方向箭头/年份标注”的用 overlay 参数，"
+                "**不要**自己用 PIL 画（坐标系易错）。坐标用**图层的数据坐标系**（不是像素）：\n"
+                '{"arrows": [{"from": [起点X, 起点Y], "to": [终点X, 终点Y], "label": "1982→1983"}], '
+                '"labels": [{"at": [X, Y], "text": "1982"}]}\n'
+                "（from/to 也可写成 x0/y0/x1/y1，两种写法都认）\n"
+                "arrows 画带箭头的迁移线，labels 在点位旁标文字；两者不要重复标同一信息。\n"
+                "【版式微调】要覆盖自动设计（如比例尺长度）用 overrides，点路径写法："
+                '{"scale_bar.element_width_mm": 55}；出图后看 qc_summary 的提示即可。'
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "layers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "图层路径，按绘制顺序（先画的在下层）",
+                    },
+                    "output_path": {"type": "string", "description": "输出 JPG 路径"},
+                    "aprx_path": {"type": "string", "description": "可选：输出 .aprx 路径（默认同名）"},
+                    "title": {"type": "string", "description": "图名"},
+                    "theme": {"type": "string", "description": "图主题材（写进图例标题）"},
+                    "region": {"type": "string", "description": "区域名"},
+                    "scale": {"type": "string", "description": "尺度词（如 1982-2001 年）"},
+                    "purpose": {"type": "string", "description": "用途：distribution/evaluation/competition"},
+                    "field": {"type": "string", "description": "分级/分类字段"},
+                    "legend_labels": {"type": "string", "description": "图例标签：semantic/range/both"},
+                    "style_profile": {"type": "string", "description": "风格档位：competition_standard/screen_report/dense_raster"},
+                    "mode": {
+                        "type": "string",
+                        "description": "渲染器：graduated 分级 / unique 分类 / raster_stretch 栅格拉伸 / single 单色（不传则自动判断）",
+                    },
+                    "explicit_bounds": {
+                        "type": "string",
+                        "description": "显式分级上界，逗号分隔（如 0,2,4,6,8）。多图共用一套图例时传同一个值",
+                    },
+                    "class_bounds": {"type": "string", "description": "explicit_bounds 的别名"},
+                    "classification": {
+                        "type": "string",
+                        "description": "自动分级方法：quantile/natural/interval（未给显式分级时生效）",
+                    },
+                    "color_ramp": {"type": "string", "description": "色带名（如 Purples/Reds/Greens/Blues）"},
+                    "category_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "unique 模式的类别名（按代码顺序）",
+                    },
+                    "category_colors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "unique 模式的类别配色 #RRGGBB（与 category_names 对应）",
+                    },
+                    "map_kind": {"type": "string", "description": "图种词，拼进图名（如 分布图/评价图）"},
+                    "note": {"type": "string", "description": "附注，写进设计记录"},
+                    "overlay": {
+                        "type": "object",
+                        "description": (
+                            '叠加层：{"arrows":[{"from":[x,y],"to":[x,y],"label":"1982→1983"}], '
+                            '"labels":[{"at":[x,y],"text":"1982"}]}，坐标为数据坐标'
+                        ),
+                    },
+                    "overrides": {"type": "object", "description": "强制覆盖设计（点路径，如 scale_bar.element_width_mm）"},
+                    "timeout_seconds": {"type": "number", "description": "可选：执行超时秒数"},
+                },
+                "required": ["layers", "output_path"],
+            },
+            handler=_create_map,
         )
     )
 
@@ -460,7 +838,8 @@ def build_default_registry() -> EngineToolRegistry:
         raw = str(args.get("path", "") or "").strip()
         if not raw:
             return Observation(ok=False, summary="path 为空", error={"type": "BadRequest"})
-        path = Path(raw) if Path(raw).is_absolute() else (ctx.workspace / raw)
+        resolved, _tried = _resolve_path(ctx, raw)
+        path = resolved if resolved is not None else (Path(raw) if Path(raw).is_absolute() else (ctx.workspace / raw))
         if not path.exists():
             return Observation(
                 ok=False, summary=f"图片不存在: {path}", error={"type": "FileNotFound"}
@@ -736,7 +1115,15 @@ def build_default_registry() -> EngineToolRegistry:
             ctx.state.final_summary = summary
             ctx.state.methodology = methodology
             for path in artifacts:
-                ctx.state.add_artifact(str(path))
+                text = str(path).strip()
+                # finish 传的路径要过与 set_result 同一套“是不是产物”的判据：
+                # 模型会把自己的工程/模板 aprx、以及读过的 input/*.shp 一并写上，
+                # 登记进去会让验收永远报“产出不在 output 目录内”（详见 extract_outputs）。
+                if not text:
+                    continue
+                if not extract_outputs([text], ctx.workspace):
+                    continue
+                ctx.state.add_artifact(text)
         return Observation(
             ok=True,
             summary=f"准备交付：{summary[:200]}",
@@ -792,19 +1179,25 @@ def _dir_size_mb(path: Path) -> float:
     return total / 1024 / 1024
 
 
-def _referenced_existing_paths(code: str, workspace: Path) -> list[str]:
+def _referenced_existing_paths(code: str, workspace: Path, ctx: Any = None) -> list[str]:
     """Best-effort: existing paths referenced by destructive code.
 
     只备份"可能被改写的结果文件"，不备份只读输入与超大目录：
     - ``input/``（及 skills/config/.git/.venv）是只读数据，备份无意义
     - 目录体积超过 ``_BACKUP_DIR_MAX_MB`` 时跳过（实测整目录备份一次 300 MB）
+
+    ``ctx`` 可选：有的话走 :func:`_resolve_path`（能处理“路径里多写了工作区名”
+    的情况）；没有就按 workspace 拼。注意 **不能**直接引用 ``ctx.workspace``——
+    本函数签名只有 (code, workspace)，之前那样写会在破坏性代码路径上抛
+    NameError（14 届 4a-1 实测），而备份失败会直接中断整个 execute_code。
     """
     found: list[str] = []
     for match in _QUOTED_PATH.finditer(code):
         raw = match.group(1)
         candidate = Path(raw)
         if not candidate.is_absolute():
-            candidate = workspace / raw
+            resolved = _resolve_path(ctx, raw)[0] if ctx is not None else None
+            candidate = resolved or (workspace / raw)
         if not candidate.exists() or str(candidate) in found:
             continue
         if candidate.is_dir():

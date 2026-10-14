@@ -17,12 +17,44 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 #: 交付目录里不该出现的过程文件后缀
 DEFAULT_FORBID_SUFFIXES: tuple[str, ...] = (".pkl", ".tmp", ".bak")
+
+#: 名字里带这些词的产出，基本是模型拿去“试水”的探查件，不是正式交付物。
+#: 实测（14 届 4a-2）：模型为验证 create_map 能不能用，在成果目录里建了
+#: ``_test.jpg`` / ``_test1.jpg`` / ``_test2.jpg``，出完图就忘了删。
+#: 考卷明确要求“提交时删除非必要过程数据”，所以这类要提醒。
+_PROBE_WORDS: tuple[str, ...] = ("test", "tmp", "probe", "debug", "scratch", "draft")
+
+
+def _looks_like_probe(name: str) -> bool:
+    """名字像“试一下”的探查产物。
+
+    只认两种很硬的信号（宁漏勿误）：
+
+    1. **下划线前缀**：``_test.jpg`` / ``_test1.jpg`` / ``_draft.gdb``——
+       模型习惯用前导下划线标记“临时/试水”，实测的 4a-2 就是这三个名字。
+    2. **探查词开头且后面直接结束或跟数字**：``test.shp`` / ``test1.jpg`` / ``TMP3.tif``。
+
+    这样 ``test_area.shp``、``attest.shp``、``tmp_out.shp`` 都**不**算——
+    它们可能是真数据，而把真数据当过程文件误报，比漏报一个探查件危险得多。
+    """
+    lowered = name.lower()
+    stem = lowered.rsplit(".", 1)[0] if "." in lowered else lowered
+    if stem.startswith("_") and _looks_like_probe(stem.lstrip("_")):
+        return True
+    for word in _PROBE_WORDS:
+        if not stem.startswith(word):
+            continue
+        rest = stem[len(word):]
+        if not rest or rest[0].isdigit():
+            return True
+    return False
 
 
 def dir_inventory(code_runner: Any, target: str) -> tuple[dict | None, str]:
@@ -131,6 +163,14 @@ def hygiene_report(
         hit = [f for f in files if f.lower().endswith(str(suffix).lower())]
         if hit:
             problems.append(f"交付目录存在过程文件 {'、'.join(hit[:4])}（建议删除或移入过程库）")
+
+    # 探查件（模型试水用的一次性输出）也算非必要过程数据
+    probes = sorted({Path(f).name for f in files if _looks_like_probe(Path(f).name)})
+    if probes:
+        warnings_out.append(
+            f"交付目录存在像探查/测试产出的文件 {'、'.join(probes[:4])}"
+            "（考卷要求提交时删除非必要过程数据）"
+        )
 
     dup_families = 0
     dup_messages: list[str] = []

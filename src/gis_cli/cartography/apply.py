@@ -831,6 +831,21 @@ def _detect_arcgis_pro(notes: list[str]) -> None:
         notes.append("警告：检测到 ArcGIS Pro 正在运行，与我们出图会互相干扰，建议先完全退出 Pro")
 
 
+def _as_absolute(path: Any) -> str:
+    """把图层路径解析成绝对路径（addDataFromPath 不吃相对路径）。
+
+    实测：传相对路径时 ArcGIS 把它当 Web 服务，报
+    “AUTOMATIC 失败，可能需要提供更具体的 web_service_type”。
+    """
+    text = str(path or "").strip()
+    if not text:
+        return text
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve()
+    return str(candidate)
+
+
 def render(
     spec: dict[str, Any],
     output_path: str,
@@ -860,7 +875,9 @@ def render(
     for existing in list(map_obj.listLayers()):
         map_obj.removeLayer(existing)
     layer_paths = [p for p in (spec["renderer"].get("layer_paths") or []) if p]
-    layers = [map_obj.addDataFromPath(path) for path in layer_paths]
+    # 必须传**绝对路径**：实测传相对路径时 ArcGIS 会把本地 shp 当成 Web 服务去解析，
+    # 报 “AUTOMATIC 失败，可能需要提供更具体的 web_service_type”（14 届 4a-2 实测）。
+    layers = [map_obj.addDataFromPath(_as_absolute(path)) for path in layer_paths]
     if not layers:
         raise RuntimeError("spec 里没有图层路径，无法出图")
     primary = layers[0]

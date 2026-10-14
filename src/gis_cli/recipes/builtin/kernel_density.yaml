@@ -98,7 +98,9 @@ code_template: |
   for tag, clause in periods:
       fc = os.path.join(gdb, f"pts_{tag.replace('-', '_').replace(' ', '')}")
       where_bits = [bit for bit in (where, clause) if bit]
-      arcpy.management.FeatureClassToFeatureClass(points, gdb, os.path.basename(fc), " AND ".join(where_bits) or None)
+      # 注意：FeatureClassToFeatureClass 在 arcpy.conversion 下，不在 arcpy.management
+      # （实测 management 没有这个属性，之前这条配方一跑就报 AttributeError）。
+      arcpy.conversion.FeatureClassToFeatureClass(points, gdb, os.path.basename(fc), " AND ".join(where_bits) or None)
       count = int(arcpy.management.GetCount(fc)[0])
       if count == 0:
           continue

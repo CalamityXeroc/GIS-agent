@@ -369,6 +369,35 @@ def _draw_arrow(draw: Any, start: tuple[float, float], end: tuple[float, float],
     draw.polygon([tip, left, right], fill=color)
 
 
+def _arrow_points(item: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    """从一条箭头配置里取 (起点, 终点)。
+
+    同时接受两种写法，因为两边都有人写：
+    - ``{"from": [x, y], "to": [x, y]}``（image_overlay 自己的文档）
+    - ``{"x0": ..., "y0": ..., "x1": ..., "y1": ...}``（任务提示词与
+      create_map 工具描述里给的例子）
+
+    实测（14 届 4a-2）：只认 from/to 时，模型按提示词的 x0/y0/x1/y1 写，
+    get("from") 取不到就默认 [0, 0]，19 条箭头全画到原点（drawn 还报 19），
+    图上看不见箭头，模型只好反复改去猜。
+    """
+    start = item.get("from")
+    end = item.get("to")
+    if start is None and item.get("x0") is not None:
+        start = [item.get("x0"), item.get("y0")]
+    if end is None and item.get("x1") is not None:
+        end = [item.get("x1"), item.get("y1")]
+    return tuple(start or [0, 0]), tuple(end or [0, 0])
+
+
+def _label_point(item: dict) -> tuple[float, float]:
+    """从一条标注配置里取坐标（同时接受 ``{"x":..,"y":..}`` 与 ``{"at":[x,y]}``）。"""
+    at = item.get("at")
+    if at is not None:
+        return tuple(at)
+    return (item.get("x", 0), item.get("y", 0))
+
+
 def stamp_arrows(
     image_path: str,
     arrows: list[dict],
@@ -386,7 +415,8 @@ def stamp_arrows(
 ) -> dict:
     """在导出图上画**方向箭头 + 年份标注**（分布中心迁移图用）。
 
-    ``arrows`` 每项：``{"from": [x, y], "to": [x, y], "label": "1995"}``（数据坐标）。
+    ``arrows`` 每项：``{"from": [x, y], "to": [x, y], "label": "1995"}``
+    或 ``{"x0": .., "y0": .., "x1": .., "y1": .., "label": ..}``（数据坐标）。
     标签默认画在终点外侧；带白色描边光晕，压在深色底图上也能看清。
     """
     try:
@@ -400,7 +430,19 @@ def stamp_arrows(
     if not target.exists():
         return {"ok": False, "detail": f"图片不存在: {target}"}
 
-    pairs = [(item.get("from") or [0, 0], item.get("to") or [0, 0]) for item in arrows]
+    pairs = [_arrow_points(item) for item in arrows]
+    # 一条都用不了时不要假装成功：历史上 from/to 取不到就默认 [0,0]，
+    # 19 条箭头全画到原点（drawn 还报 19），图上什么也看不见。
+    usable = [pair for pair in pairs if pair[0] != (0, 0) or pair[1] != (0, 0)]
+    if not usable:
+        return {
+            "ok": False,
+            "drawn": 0,
+            "detail": (
+                "箭头坐标全是空的：每项需要 from/to（[[x,y],[x,y]]）"
+                "或 x0/y0/x1/y1（数据坐标）"
+            ),
+        }
     flat = [tuple(point) for pair in pairs for point in pair]
     pixels = map_to_px(flat, extent, box_mm, page_height_mm=page_height_mm, dpi=dpi)
     font_file = resolve_font(font_name, desired_bold=False)
@@ -451,7 +493,8 @@ def stamp_point_labels(
 ) -> dict:
     """在导出图上的给定数据坐标处写文字（逐年分布中心标年份用）。
 
-    ``labels`` 每项：``{"at": [x, y], "text": "1995", "color": "#..."}``（数据坐标，可选覆盖颜色）。
+    ``labels`` 每项：``{"at": [x, y], "text": "1995", "color": "#..."}``（数据坐标，可选覆盖颜色），
+    也接受 ``{"x": .., "y": .., "text": ..}`` 的写法。
     """
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
@@ -463,7 +506,7 @@ def stamp_point_labels(
     if not target.exists():
         return {"ok": False, "detail": f"图片不存在: {target}"}
 
-    points = [tuple(item.get("at") or [0, 0]) for item in labels]
+    points = [_label_point(item) for item in labels]
     pixels = map_to_px(points, extent, box_mm, page_height_mm=page_height_mm, dpi=dpi)
     font_file = resolve_font(font_name, desired_bold=False)
     size_px = max(8, int(round(float(size_pt) * (float(dpi) / 25.4) / (72.0 / 25.4))))

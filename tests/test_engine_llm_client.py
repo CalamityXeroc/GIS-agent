@@ -72,6 +72,190 @@ def test_total_timeout_caps_gateway_stall(monkeypatch):
         assert elapsed < 5.0, f"took {elapsed:.1f}s"
 
 
+def test_reasoning_effort_is_sent_via_extra_body():
+    """思考档位必须传到 body 的 reasoning_effort 里。
+
+    实测：部分推理模型默认不返回 reasoning_content，不显式传 reasoning_effort
+    就完全没有思考内容（界面只剩“模型自述”占位）。
+    """
+    seen: dict = {}
+
+    class _StubCompletions:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return _FakeResponse()
+
+    class _StubClient:
+        class chat:
+            completions = _StubCompletions()
+
+    cfg = EngineLLMConfig(
+        model="test-model", api_key="x", reasoning_effort="medium"
+    )
+    client = EngineLLMClient(cfg)
+    client._client = _StubClient()
+    client.chat([{"role": "user", "content": "hi"}])
+
+    assert seen.get("extra_body") == {"reasoning_effort": "medium"}, seen.get("extra_body")
+    # 不能塞到顶层：OpenAI SDK 对未知顶层字段会直接拒绝
+    assert "reasoning_effort" not in seen
+
+
+def test_image_rejection_strips_images_and_retries():
+    """回归：上游拒图时摘掉图片重试，而不是把整个任务判死。
+
+    实测（14 届 4a-1）：识图本是可选增强，但上游对图片回
+    400 "Please start a new conversation, replace the image, and try again"，
+    以前直接抛 LLMError → 整轮 run 判 llm_unavailable，只跑了 7 轮就死，
+    而栅格产物其实已经做完了。
+    """
+    from gis_cli.engine.llm_client import EngineLLMClient, EngineLLMConfig
+
+    calls: list[dict] = []
+
+    class _Err400(Exception):
+        status_code = 400
+        body = '{"message": "upstream 400: replace the image"}'
+
+    class _StubCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if _has_image_in(kwargs["messages"]):
+                raise _Err400("replace the image")
+            return _FakeResponse()
+
+    class _StubClient:
+        class chat:
+            completions = _StubCompletions()
+
+    cfg = EngineLLMConfig(model="test-model", api_key="x", retry_count=3)
+    client = EngineLLMClient(cfg)
+    client._client = _StubClient()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "看这张图"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+            ],
+        }
+    ]
+    response = client.chat(messages)  # 不应抛异常
+    assert response is not None
+    assert len(calls) == 2, f"应先失败一次再摘图重试，实际 {len(calls)} 次"
+    assert not _has_image_in(calls[-1]["messages"]), "重试时应该已经摘掉图片"
+    assert "已因上游不支持而省略" in str(calls[-1]["messages"]), calls[-1]["messages"]
+    assert client.vision_rejected is True
+
+
+def _has_image_in(messages) -> bool:
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "image_url" for p in content
+        ):
+            return True
+    return False
+
+
+def test_vision_disabled_after_rejection(monkeypatch, tmp_path):
+    """上游拒过图后不再附图（省下每轮的无效 400）。"""
+    from gis_cli.engine.loop import AgentLoop
+    from gis_cli.engine.tools import EngineContext, build_default_registry
+
+    class _LLM:
+        class config:
+            vision = True
+
+        vision_rejected = True
+
+    loop = AgentLoop(
+        workspace=tmp_path,
+        llm_client=_LLM(),
+        registry=build_default_registry(),
+        context=EngineContext(workspace=tmp_path),
+    )
+    assert loop._vision_enabled() is False
+
+
+def test_reasoning_effort_omitted_when_unset():
+    """没配就不传该字段（兼容不认它的网关）。"""
+    seen: dict = {}
+
+    class _StubCompletions:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return _FakeResponse()
+
+    class _StubClient:
+        class chat:
+            completions = _StubCompletions()
+
+    client = EngineLLMClient(EngineLLMConfig(model="m", api_key="x"))
+    client._client = _StubClient()
+    client.chat([{"role": "user", "content": "hi"}])
+    assert "extra_body" not in seen
+
+
+def test_reasoning_content_is_surfaced():
+    """reasoning_content 要落到 LLMResponse.reasoning，否则界面没有思考可显示。"""
+
+    class _StubCompletions:
+        def create(self, **_kwargs):
+            return _FakeResponse(reasoning="先看数据目录，再统计分组。")
+
+    class _StubClient:
+        class chat:
+            completions = _StubCompletions()
+
+    client = EngineLLMClient(EngineLLMConfig(model="m", api_key="x"))
+    client._client = _StubClient()
+    resp = client.chat([{"role": "user", "content": "hi"}])
+    assert resp.reasoning == "先看数据目录，再统计分组。"
+
+
+def test_config_reads_reasoning_effort_from_engine_section(tmp_path):
+    import json
+
+    path = tmp_path / "llm_config.json"
+    path.write_text(
+        json.dumps({"model": "m", "api_key": "k", "engine": {"reasoning_effort": "high"}}),
+        encoding="utf-8",
+    )
+    assert EngineLLMConfig.from_file(path).reasoning_effort == "high"
+
+    # 根段也认，且留空/缺失时为""
+    path.write_text(json.dumps({"model": "m", "api_key": "k"}), encoding="utf-8")
+    assert EngineLLMConfig.from_file(path).reasoning_effort == ""
+
+
+def _FakeResponse(reasoning: str = "") -> object:
+    """最小可用的 chat completion 响应（仿 OpenAI SDK 的对象形状）。"""
+
+    class _Msg:
+        def __init__(self):
+            self.content = "ok"
+            self.reasoning_content = reasoning
+            self.tool_calls = None
+
+    class _Choice:
+        def __init__(self):
+            self.message = _Msg()
+            self.finish_reason = "stop"
+
+    class _Usage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+
+    class _Resp:
+        def __init__(self):
+            self.choices = [_Choice()]
+            self.usage = _Usage()
+
+    return _Resp()
+
+
 def test_model_circuit_breaker_skips_stalled_primary():
     """主模型超时达阈值后进入冷却，下一次直接先走备用模型（不再白等）。"""
     from gis_cli.engine.llm_client import LLMError

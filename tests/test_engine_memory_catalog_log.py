@@ -285,6 +285,164 @@ def test_verifier_prunes_deleted_artifacts(tmp_path: Path):
     assert not any("不在 output 目录内" in str(p) for p in verdict.get("problems", []))
 
 
+def test_verifier_drops_artifacts_outside_workspace(tmp_path):
+    """回归：外部路径不能当成 blocked 问题（14 届 4a-1 空转到轮次上限）。
+
+    ArcGIS 模板工程与用户 Documents 下的工程被登记后，验收每轮都报
+    “产出不在 output 目录内”，断言 7/7 全过却永远完成不了。
+    """
+    from gis_cli.engine.state import TaskState
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output" / "成果图"
+    out.mkdir(parents=True)
+    good = out / "密度_1982_1986.jpg"
+    good.write_bytes(b"\xff\xd8\xff" + b"0" * 20_000)  # 假 JPG（足够长，避开空白判定）
+
+    state = TaskState(run_id="r", goal="g", workspace=str(tmp_path))
+    state.artifacts = [
+        str(good),
+        r"E:\ArcGISPro3.6\Resources\ArcToolBox\Services\routingservices\data\Blank.aprx",
+        r"C:\Users\<user>\Documents\ArcGIS\Projects\MyProject\MyProject.aprx",
+    ]
+
+    verifier = Verifier(workspace=tmp_path)
+    verdict = verifier.verify(state)
+    assert not any("不在 output 目录内" in str(p) for p in verdict.get("problems", [])), verdict
+    assert not any("Blank.aprx" in str(p) or "MyProject" in str(p) for p in state.artifacts), state.artifacts
+    assert any("密度_1982_1986.jpg" in str(p) for p in state.artifacts), state.artifacts
+
+
+def test_finish_ignores_artifacts_outside_workspace(tmp_path):
+    """finish 传的 artifacts 若在 workspace 外，不能登记进产物清单。"""
+    from gis_cli.engine.state import TaskState
+    from gis_cli.engine.tools import EngineContext, build_default_registry
+
+    state = TaskState(run_id="r", goal="g", workspace=str(tmp_path))
+    ctx = EngineContext(workspace=tmp_path, state=state)
+    registry = build_default_registry()
+    good = tmp_path / "output" / "a.gdb"
+    good.mkdir(parents=True)
+    input_shp = tmp_path / "input" / "animal_points.shp"
+    input_shp.parent.mkdir(parents=True)
+    input_shp.write_text("x", encoding="utf-8")
+    registry.execute(
+        "finish",
+        {
+            "summary": "done",
+            "artifacts": [
+                str(good),
+                str(input_shp),
+                r"C:\Users\<user>\Documents\ArcGIS\Projects\MyProject\MyProject.aprx",
+            ],
+        },
+        ctx,
+    )
+    assert not any("MyProject" in str(p) for p in state.artifacts), state.artifacts
+    assert not any("animal_points" in str(p) for p in state.artifacts), state.artifacts
+    assert any("a.gdb" in str(p) for p in state.artifacts), state.artifacts
+
+
+def test_finish_keeps_spec_json_and_gdb_members(tmp_path):
+    """回归：finish 里的 .spec.json 与 GDB 内要素不能被过滤掉。
+
+    实测（14 届 4a-1）：模型在 finish 里正确列了 16 个产物（含 4 份 .spec.json、
+    4 个 GDB 内栅格），但登记时的过滤把它们全丢了——GIS_OUTPUT_EXT 没有 .json，
+    而 GDB 内要素本来就没扩展名。结果语义验收看不到证据，反复说“缺失 .spec.json”，
+    agent 空转到轮次上限。
+    """
+    from gis_cli.engine.state import TaskState
+    from gis_cli.engine.tools import EngineContext, build_default_registry
+
+    state = TaskState(run_id="r", goal="g", workspace=str(tmp_path))
+    ctx = EngineContext(workspace=tmp_path, state=state)
+    registry = build_default_registry()
+
+    (tmp_path / "output" / "成果图").mkdir(parents=True)
+    (tmp_path / "output" / "result_data.gdb").mkdir(parents=True)
+    for name in ("密度_1982_1986.spec.json", "密度_1982_1986.jpg"):
+        (tmp_path / "output" / "成果图" / name).write_text("x", encoding="utf-8")
+    # GDB 内要素在文件系统上不存在，但路径本身是合法的产物
+    gdb_member = str(tmp_path / "output" / "result_data.gdb" / "kde_1982_1986")
+
+    registry.execute(
+        "finish",
+        {
+            "summary": "done",
+            "artifacts": [
+                gdb_member,
+                str(tmp_path / "output" / "成果图" / "密度_1982_1986.spec.json"),
+                str(tmp_path / "output" / "成果图" / "密度_1982_1986.jpg"),
+            ],
+        },
+        ctx,
+    )
+    assert any("kde_1982_1986" in str(p) for p in state.artifacts), state.artifacts
+    assert any("spec.json" in str(p) for p in state.artifacts), state.artifacts
+    assert any(str(p).endswith(".jpg") for p in state.artifacts), state.artifacts
+
+
+def test_semantic_check_includes_spec_contents(tmp_path):
+    """回归：语义验收必须看到 .spec.json 的**实际内容**（而不只是路径）。
+
+    实测（14 届 4a-1）：以前只把 structural（路径+存在性）给模型，模型看不到
+    class_bounds 的实际值，于是无论 agent 做什么都回“无法确认四图分级是否一致”，
+    agent 空转到轮次上限（验收 problems 明明是空的）。
+    """
+    from gis_cli.engine.state import Requirement, TaskState
+    from gis_cli.engine.verifier import Verifier
+
+    spec_dir = tmp_path / "output" / "成果图"
+    spec_dir.mkdir(parents=True)
+    (spec_dir / "a.spec.json").write_text(
+        json.dumps(
+            {"decisions": [{"key": "explicit_bounds", "value": [0, 2, 4, 6, 8]}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict = {}
+
+    class _LLM:
+        def chat(self, messages, **kwargs):
+            seen["prompt"] = str(messages[-1]["content"])
+
+            class _R:
+                content = '{"pass": true, "per_requirement": [], "missing": []}'
+
+            return _R()
+
+    state = TaskState(run_id="r", goal="g", workspace=str(tmp_path))
+    state.requirements = [Requirement(id="r1", text="四图共用同一图例")]
+
+    verdict = Verifier(workspace=tmp_path, llm_client=_LLM()).semantic_check(state, [])
+    assert verdict.get("pass") is True, verdict
+    assert "explicit_bounds" in seen["prompt"], "spec.json 的实际内容必须进 prompt"
+    assert "a.spec.json" in seen["prompt"], seen["prompt"][:400]
+
+
+def test_artifact_exists_keeps_gdb_members_without_arcpy(tmp_path):
+    """回归：没有 arcpy 时不能把 GDB 内要素判成“不存在”。
+
+    实测（14 届 4a-1）：Verifier 跑在 benchmark 的 venv 里，venv 没装 arcpy，
+    arcpy.Exists 抛 ModuleNotFoundError → 旧实现返回 False → 四个 kde_* 栅格
+    被当成“已删除的产物”全部剔除，验收只能说“缺失栅格元数据”，agent 空转。
+    现在判不了就当作存在，交给后面跑在内核里的 structural_check 去实测。
+    """
+    from gis_cli.engine.verifier import _artifact_exists
+
+    # GDB 内成员：文件系统不存在，但不应被剔除
+    assert _artifact_exists(str(tmp_path / "output" / "a.gdb" / "kde_1982_1986")) is True
+    # 普通文件：确实不存在就该是 False
+    assert _artifact_exists(str(tmp_path / "output" / "nope.jpg")) is False
+    # 真实存在的普通文件：True
+    real = tmp_path / "output" / "real.jpg"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"x")
+    assert _artifact_exists(str(real)) is True
+
+
 def test_soft_recipe_hint_on_successful_code():
     """代码成功但操作有对应配方时，给一句不阻断的提示（提高可复现性）。"""
     from gis_cli.engine.tools import EngineContext, _recipe_soft_hint

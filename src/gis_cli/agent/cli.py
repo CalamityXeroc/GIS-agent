@@ -16,6 +16,7 @@ try:
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.text import Text
 except ImportError:
     print("缺少必要的依赖包。请运行: pip install typer rich")
     sys.exit(1)
@@ -26,13 +27,19 @@ from .executor import ExecutionMode
 from .llm import create_llm_client, LLMConfig
 from .model_adaptation import BAMLBridge
 
-# Make stdout/stderr UTF-8 safe on Windows consoles (GBK) so rich output
-# containing symbols/CJK never raises UnicodeEncodeError.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    except Exception:
-        pass
+# 控制台自适应：把代码页尽量切到 UTF-8，并让 Python 流与控制台实际编码一致。
+# 踩过的坑：无条件强制 stdout=UTF-8 时，GBK 控制台会把 UTF-8 字节按 GBK 解码 → 整屏乱码。
+try:
+    from ..ui.console_env import configure_stdio as _configure_stdio
+
+    _CONSOLE_INFO = _configure_stdio()
+except Exception:  # pragma: no cover - 极端环境兜底
+    _CONSOLE_INFO = {}
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 
 # 创建 CLI 应用
@@ -205,6 +212,36 @@ def _run_baml_preflight(
 
 @app.command()
 def chat(
+    message: str = typer.Argument(None, help="首条任务（可省略，进入后再输入）"),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="工作空间目录"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="llm_config.json 路径"),
+    theme: str = typer.Option("system", "--theme", help="配色：system（跟随终端）/ dark / light"),
+    no_color: bool = typer.Option(False, "--no-color", help="纯文本模式：不输出颜色（默认在老终端就是纯文本）"),
+    color: bool = typer.Option(False, "--color", help="强制上色（确认终端支持 ANSI 时用）"),
+    max_turns: int = typer.Option(0, "--max-turns", help="单任务最大轮次（0 表示用配置默认值）"),
+    refresh_catalog: bool = typer.Option(True, "--refresh-catalog/--no-refresh-catalog", help="启动前增量刷新数据目录"),
+    continue_last: bool = typer.Option(False, "--continue/--no-continue", help="接续上一次会话"),
+    resume: str = typer.Option("", "--resume", help="接续指定会话 id"),
+):
+    """交互式对话（新引擎）：工具动作/结果实时呈现，运行中可纠偏，Esc 中断。"""
+    from .interactive import InteractiveChat
+
+    chat_session = InteractiveChat(
+        workspace=workspace,
+        config=config,
+        theme_mode=theme,
+        no_color=no_color,
+        color=color,
+        max_turns=max_turns,
+        refresh_catalog=refresh_catalog,
+        resume_id=resume,
+        continue_last=continue_last,
+    )
+    raise typer.Exit(code=chat_session.run(message or ""))
+
+
+@app.command("chat-legacy")
+def chat_legacy(
     message: str = typer.Argument(None, help="发送给 Agent 的初始消息"),
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="工作空间目录"),
     execute: bool = typer.Option(False, "--execute", "-x", help="执行模式（默认为预览模式）"),
@@ -213,7 +250,7 @@ def chat(
     baml_strict: bool = typer.Option(False, "--baml-strict", help="BAML 预检严格模式（失败即阻断）"),
     baml_require: str = typer.Option("", "--baml-require", help="BAML 必需能力列表（逗号分隔）"),
 ):
-    """启动与 GIS Agent 的交互式对话。"""
+    """[旧版] 与内置 GISAgent（plan-then-execute）对话。新版请用 gis-agent chat。"""
     require_caps = [item.strip() for item in baml_require.split(",") if item.strip()] or None
     try:
         agent = create_agent(
@@ -900,39 +937,59 @@ def status(
     ))
 
 
+def _engine_version() -> str:
+    """版本号（与交互界面一致，见 ui.theme.engine_version）。"""
+    try:
+        from ..ui.theme import engine_version
+
+        return engine_version()
+    except Exception:
+        return ""
+
+
 def _run_engine_task(
     task: str,
     workspace: Optional[Path],
     config: Optional[Path],
     refresh_catalog: bool = True,
     max_turns: int = 0,
+    theme_mode: str = "system",
+    no_color: bool = False,
+    color: bool = False,
 ) -> int:
-    """Run one task with the new observe-decide-act engine."""
-    from ..engine.runner import build_engine
+    """Run one task with the new observe-decide-act engine.
 
+    渲染统一走 :mod:`gis_cli.ui`：启动横幅 → 工具动作/结果（可折叠）→ 验收 → 结果卡片 + 状态行。
+    """
+    from ..engine.runner import build_engine
+    from ..ui import events as ui_events
+    from ..ui import render as ui_render
+    from ..ui import theme as ui_theme
+
+    ui_console = ui_theme.make_console(theme_mode, no_color=no_color, color=True if color else None)
     ws = workspace or Path.cwd()
-    last_event = {"name": ""}
+    # 引擎内部日志写文件，不再直接刷到终端（实测：网关报错会把整段 JSON 打屏）
+    ui_logging = __import__("gis_cli.ui.logging_setup", fromlist=["setup_engine_logging"])
+    ui_logging.setup_engine_logging(ws)
+    tracker = ui_events.StatusTracker(workspace=str(ws))
+    store = ui_render.ToolOutputStore()
+    interrupt = {"requested": False}
 
     def _on_event(name: str, payload: dict) -> None:
-        if name == "tool_call":
-            tool = payload.get("tool", "")
-            desc = ""
-            args = payload.get("args") or {}
-            if isinstance(args, dict):
-                desc = str(args.get("description") or "")
-            console.print(f"  [cyan]-> {tool}[/cyan] {desc[:80]}")
-        elif name == "tool_result":
-            ok = payload.get("ok")
-            mark = "[OK]" if ok else "[X]"
-            console.print(f"    {mark} {str(payload.get('summary', ''))[:160]}")
-        elif name == "repair_attempt":
-            console.print(f"    [yellow][repair] 自动修复第 {payload.get('attempt')} 次[/yellow]")
-        elif name == "verification":
-            mark = "[green]验收通过[/green]" if payload.get("pass") else "[red]验收未通过[/red]"
-            console.print(f"  {mark}: {str(payload.get('summary', ''))[:160]}")
-        last_event["name"] = name
+        tracker.apply(name, payload)
+        if name == "tool_result":
+            summary = str((payload or {}).get("summary", ""))
+            if len(summary) > 200:
+                store.add(str((payload or {}).get("tool", "")), summary)
+        unit = ui_events.to_unit(name, payload)
+        if unit is None:
+            return
+        if unit.kind == "final":
+            return  # 由结果卡片统一呈现
+        elapsed = tracker.action_elapsed if name == "tool_result" else None
+        ui_console.print(ui_render.render_unit(unit, elapsed=elapsed))
 
-    with console.status("[cyan]启动引擎（加载数据目录/内核）...") as status:
+    with ui_console.status("[gis.dim]启动引擎（加载数据目录/内核）…[/]"):
         try:
             bundle = build_engine(
                 workspace=ws,
@@ -941,44 +998,69 @@ def _run_engine_task(
                 on_event=_on_event,
             )
         except Exception as exc:
-            console.print(Panel.fit(str(exc), title="引擎启动失败", border_style="red"))
+            ui_console.print(Panel.fit(str(exc), title="引擎启动失败", border_style="red"))
             return 1
-        status.stop()
 
     if max_turns:
         bundle.loop.config.max_turns = max_turns
 
-    console.print(Panel.fit(
-        f"[bold]任务:[/bold] {task}\n"
-        f"[bold]工作区:[/bold] {ws}\n"
-        f"[bold]模型:[/bold] {bundle.llm.config.model}\n"
-        f"[dim]数据目录: {bundle.catalog.counts() or '空'}[/dim]",
-        title="GIS Agent (engine loop)",
-    ))
+    counts = {}
+    try:
+        counts = bundle.catalog.counts() or {}
+    except Exception:
+        counts = {}
+    catalog_text = "、".join(f"{kind} {n}" for kind, n in counts.items()) or "空"
+    try:
+        recipes_count = len(bundle.recipes.all())
+    except Exception:
+        recipes_count = 0
+
+    tracker.model = getattr(bundle.llm.config, "model", "") or ""
+    tracker.provider = getattr(bundle.llm.config, "api_base", "") or ""
+    tracker.status = "running"
+
+    ui_console.print(
+        ui_render.banner(
+            model=tracker.model,
+            api_base=tracker.provider,
+            workspace=str(ws),
+            catalog=catalog_text,
+            recipes=recipes_count,
+            session_id=str(getattr(bundle.loop.state, "run_id", "") or ""),
+            kernel="ready" if getattr(bundle, "code_runner", None) is not None else "-",
+            version=_engine_version(),
+        )
+    )
 
     try:
         state = bundle.loop.run(task)
     except KeyboardInterrupt:
-        console.print("\n[yellow]已中断[/yellow]")
+        ui_console.print("[gis.warn]已中断（Ctrl+C）[/]")
+        try:
+            bundle.close()
+        except Exception:
+            pass
         return 130
-    finally:
-        pass
 
-    console.print("\n[bold blue]任务清单:[/bold blue]")
-    console.print(state.tasklist_digest())
-    if state.artifacts:
-        console.print("\n[bold blue]产出:[/bold blue]")
-        for path in state.artifacts:
-            console.print(f"  - {path}")
-    if state.methodology:
-        console.print("\n[bold blue]方法论:[/bold blue]")
-        console.print(state.methodology)
-    console.print("\n[bold blue]结果:[/bold blue]")
-    console.print(state.final_summary or state.error or "（无说明）")
-    console.print(f"\n[dim]状态: {state.status} | 轮次: {state.turn} | 追踪: {bundle.loop.recorder.jsonl_path}[/dim]")
+    payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
+    # 状态行兜底：即便 run_end 没发出（异常/中断路径），也以最终 state 为准
+    tracker.turn = int(getattr(state, "turn", tracker.turn) or tracker.turn)
+    tracker.status = str(getattr(state, "status", tracker.status) or tracker.status)
+    tracker.current_action = ""
+    if not tracker.finished_at:
+        import time as _time
 
-    if state.status == "awaiting_user" and state.tasklist:
-        console.print("[yellow]引擎在等待你的回答，请重新运行并补充信息。[/yellow]")
+        tracker.finished_at = _time.monotonic()
+    ui_console.print()
+    ui_console.print(ui_render.result_card(payload))
+
+    trace_path = getattr(getattr(bundle.loop, "recorder", None), "jsonl_path", "")
+    if trace_path:
+        ui_console.print(Text(f"追踪 {trace_path}", style="gis.dim"))
+    if state.status == "awaiting_user":
+        ui_console.print(Text("引擎在等待你的回答：补充信息后再次运行，或在对话模式里直接回复。", style="gis.warn"))
+    ui_console.print(ui_render.footer_text(tracker, width=ui_console.width))
+
     bundle.close()
     return 0 if state.status == "completed" else 1
 
@@ -990,9 +1072,13 @@ def loop(
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="llm_config.json 路径"),
     refresh_catalog: bool = typer.Option(True, "--refresh-catalog/--no-refresh-catalog", help="执行前增量刷新数据目录"),
     max_turns: int = typer.Option(0, "--max-turns", help="最大轮次（0 表示用配置默认值）"),
+    theme: str = typer.Option("system", "--theme", help="配色：system（跟随终端）/ dark / light"),
+    no_color: bool = typer.Option(False, "--no-color", help="关闭颜色（老终端或重定向到文件时用）"),
 ):
     """使用新引擎（观察-决策-执行循环 + 代码自修复）执行 GIS 任务。"""
-    raise typer.Exit(code=_run_engine_task(task, workspace, config, refresh_catalog, max_turns))
+    raise typer.Exit(
+        code=_run_engine_task(task, workspace, config, refresh_catalog, max_turns, theme, no_color)
+    )
 
 
 def main():

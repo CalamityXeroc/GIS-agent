@@ -46,6 +46,32 @@ def design_only(
     return {"spec": spec, "facts": data_facts, "summary": describe_spec(spec)}
 
 
+def _absolute_layers(layers: list[Any]) -> list[Any]:
+    """把图层路径统一成绝对路径。
+
+    实测（14 届 4a-2）：``addDataFromPath("input/study_area.shp")`` 传**相对路径**
+    时，ArcGIS 不把它当本地文件，而当成 Web 服务去解析，直接报
+
+        RuntimeError: AUTOMATIC 失败，可能需要提供更具体的 web_service_type。
+
+    绝对路径就正常。模型习惯写相对路径（基准工作区文档就这么写的），
+    所以入口处先解析成绝对路径；非字符串（已经是的 Layer 对象等）原样保留。
+    """
+    resolved: list[Any] = []
+    for item in layers or []:
+        if isinstance(item, (str, Path)):
+            raw = str(item).strip()
+            if not raw:
+                continue
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = (Path.cwd() / candidate).resolve()
+            resolved.append(str(candidate))
+        else:
+            resolved.append(item)
+    return resolved
+
+
 def create_map(
     layers: list[Any],
     intent: dict[str, Any] | None = None,
@@ -61,6 +87,7 @@ def create_map(
     from . import apply as _apply
     from . import qc as _qc
 
+    layers = _absolute_layers(list(layers or []))
     normalized = normalize_intent(intent)
     if field and not normalized.get("field"):
         normalized["field"] = field

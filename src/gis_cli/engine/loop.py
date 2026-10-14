@@ -203,7 +203,15 @@ class AgentLoop:
                     "content": response.content[:2000],
                 },
             )
-            self._emit("llm_result", {"model": response.model, "actions": [a.to_dict() for a in actions]})
+            self._emit(
+                "llm_result",
+                {
+                    "model": response.model,
+                    "actions": [a.to_dict() for a in actions],
+                    # UI 状态行要显示 token 用量：这里必须带上（trace 里早就有，事件里之前漏了）
+                    "usage": getattr(response, "usage", None) or {},
+                },
+            )
 
             if not actions:
                 self._append_assistant(response.content, [])
@@ -390,6 +398,13 @@ class AgentLoop:
     def _handle_finish(self, action: Action) -> tuple[Observation, bool]:
         observation = self.registry.execute("finish", action.args, self.context)
         self._finish_summary = str(observation.summary or "")
+        # finish 是提前返回的：这里显式补一条 tool_result 事件，界面才能把答复
+        # 渲染成独立的 "● Agent" 块（否则答复只存在于 final_summary 里，用户看不到）。
+        self.recorder.record(
+            "tool_result",
+            {"tool": "finish", "ok": observation.ok, "summary": observation.summary, "artifacts": observation.artifacts},
+        )
+        self._emit("tool_result", {"tool": "finish", "ok": observation.ok, "summary": observation.summary})
         verdict = self.verifier.verify(self.state) if self.verifier is not None else {"pass": True, "summary": "未配置验证器"}
         self.recorder.record("verification", verdict)
         self._emit("verification", verdict)
@@ -492,10 +507,19 @@ class AgentLoop:
             "2. **可见计划**：开始任务先用 update_tasklist 建立 3-8 条任务清单，之后每完成一步更新状态。\n"
             "3. **代码即行动**：具体 GIS 操作通过 execute_code 完成。代码失败时系统会自动修复；你应关注错误是否属于需求理解偏差。\n"
             "4. **投影正确**：距离/面积/密度分析必须先投影到合适的投影坐标系（全国用 Albers，局部用高斯-克吕格/UTM）；仅展示可用 Web Mercator。\n"
-            "5. **制图完整**：专题图必须包含图名、图例、比例尺、指北针，并确保地图框已绑定数据图层。\n"
+            "5. **制图完整**：专题图必须包含图名、图例、比例尺、指北针，并确保地图框已绑定数据图层。"
+            "出图优先用 `create_map`（一次性传图层 + 意图，自动做版面与体检并回写可编辑 .aprx）；"
+            "多张图要共用一套图例时，每张都传**同一个** explicit_bounds。\n"
             "6. **自检交付**：交付前调用 verify_outputs；确认产物满足需求后再调用 finish。\n"
             "7. **少问多做**：能从数据目录/文档推断的信息不要问用户；只在关键信息确实缺失时用 ask_user。\n"
             "8. **中文输出**：与用户交流、任务清单、方法论说明全部用中文。\n\n"
+            "## 关于工具边界（省时间用）\n"
+            "- 每个工具的 description 就是它的全部参数说明。**不要去读 gis_cli 的源码**来猜开关——"
+            "实测有任务为此白跑了 200+ 次调用。工具里没写的参数，就是没有。\n"
+            "- 需要“看效果再调”时：catalog_query 看数据字段/坐标系；view_image 看自己出的图；"
+            "check_map_project 看 .aprx 里的渲染器与版面要素；这些都比读源码直接。\n"
+            "- 制图相关的一律走 `create_map` / `graduated_colors_map` / `category_map` 这类入口，"
+            "不要在 execute_code 里自己拼 arcpy.mp 代码（易错且不会自动体检）。\n\n"
             "## 方法论纪律（常驻，违反会导致返工）\n"
             "- **先看后算**：任何计算前先确认真实字段名/几何类型/坐标系/要素数；名字一律从 catalog_query 或"
             "`arcpy.ListFields` 拿，禁止凭常识猜（中文名会被 DBF 截断）。\n"
@@ -518,7 +542,28 @@ class AgentLoop:
             f"## 操作目录（可用配方，共 {len(self.recipes.all()) if self.recipes is not None else 0} 个；"
             "优先用配方，配方不适用再用 execute_code）\n"
             f"{self._recipe_catalog()}"
+            + self._skills_section()
         )
+
+    def _skills_section(self) -> str:
+        """技能的 system prompt 段（只放名字+描述；真用时才读全文）。
+
+        这是“自然语言触发技能”的关键：描述常驻上下文，模型才能判断
+        “用户说要写 Word 文档”→ 该用 docx 技能 → 调 run_skill 读全文。
+        只放描述是刻意的（见 pi/Claude 的 progressive disclosure），
+        111 个技能如果全文常驻会直接爆上下文。
+        """
+        try:
+            from ..skills.catalog import discover_skills, skills_prompt_section
+
+            found = discover_skills(self.workspace)
+            if not found:
+                return ""
+            logger.info("已发现 %s 个技能", len(found))
+            return "\n\n" + skills_prompt_section(found)
+        except Exception as exc:  # pragma: no cover - 技能扫描失败不影响主流程
+            logger.warning("技能发现失败: %s", exc)
+            return ""
 
     def _initial_user_message(self, goal: str, doc_paths: list[str] | None) -> str:
         text = ""
@@ -609,6 +654,41 @@ class AgentLoop:
     def _append_user(self, content: str) -> None:
         self._messages.append({"role": "user", "content": content})
 
+    def inject_user_message(self, text: str) -> bool:
+        """运行中注入一条用户消息（交互界面的"纠偏/补充"）。
+
+        由 UI 线程调用，工作线程在下一轮开始时自然读到；返回是否已注入。
+        运行已结束（或文本为空）时返回 ``False``，由调用方决定改成排队或新开轮次。
+        """
+        content = (text or "").strip()
+        if not content:
+            return False
+        if self.state.status not in ("running", "awaiting_user"):
+            return False
+        self._append_user(content)
+        try:
+            self.recorder.record("user_injection", {"text": content[:2000]})
+        except Exception:
+            pass
+        self._emit("user_injection", {"text": content[:400]})
+        return True
+
+    def request_stop(self, reason: str = "用户中断") -> bool:
+        """请求尽快停止：把状态从 running 改掉，工作线程在下一个检查点退出。
+
+        引擎每轮开头都会判断 ``status == "running"``，所以不需要信号/异步机制。
+        """
+        if self.state.status != "running":
+            return False
+        self.state.status = "stopped"
+        self.state.error = reason
+        try:
+            self.recorder.record("stop_requested", {"reason": reason})
+        except Exception:
+            pass
+        self._emit("stop_requested", {"reason": reason})
+        return True
+
     def _append_observation(self, observation: Observation, action: Action) -> None:
         protocol = self.codec.protocol_for(self.llm.config.model)
         payload = observation.to_message()
@@ -624,7 +704,13 @@ class AgentLoop:
     def _vision_enabled(self) -> bool:
         """配置里开了识图、且客户端声明支持时才附图。"""
         try:
-            return bool(getattr(self.llm.config, "vision", False))
+            if not bool(getattr(self.llm.config, "vision", False)):
+                return False
+            # 上游拒过图（如 400 "replace the image"）就不要再附：每轮白碰一次
+            # 400 不仅浪费时间，还会把当轮对话搞脏。
+            if getattr(self.llm, "vision_rejected", False):
+                return False
+            return True
         except Exception:  # pragma: no cover - 配置对象异常不影响主流程
             return False
 

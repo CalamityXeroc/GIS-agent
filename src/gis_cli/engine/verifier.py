@@ -69,18 +69,29 @@ set_result({"records": records})
 
 
 def _artifact_exists(path: str) -> bool:
-    """已删除的产物不该再算产物（文件系统或 GDB 语义都试一下）。"""
+    """已删除的产物不该再算产物（文件系统或 GDB 语义都试一下）。
+
+    注意：本函数可能跑在**没有 arcpy 的解释器**里（benchmark/CLI 的 venv）。
+    GDB 内的要素类/栅格在文件系统上根本不存在，只有 arcpy 能判——此时
+    “判不了”不能当成“不存在”，否则会把合法产物剔除（14 届 4a-1 实测：
+    finish 里列的 4 个 kde_* 栅格全被剔除，验收只说“缺失栅格元数据”，
+    agent 空转到轮次上限）。所以无法用 arcpy 时，把 GDB 内路径当作存在，
+    交给后面跑在内核里的 structural_check 去实测。
+    """
     try:
         if Path(path).exists():
             return True
     except Exception:
         pass
+    normalized = str(path).lower().replace("\\", "/")
+    in_gdb = ".gdb/" in normalized
     try:
         import arcpy  # type: ignore
 
         return bool(arcpy.Exists(path))
     except Exception:
-        return False
+        # 没有 arcpy：GDB 内要素判不了，不要当不存在（见 docstring）
+        return in_gdb
 
 
 class Verifier:
@@ -139,7 +150,13 @@ class Verifier:
         return results
 
     def _discover_outputs(self, *, limit: int = 50) -> list[str]:
-        """Best-effort discovery of GIS outputs under workspace/output."""
+        """Best-effort discovery of produced files under workspace/output.
+
+        扩展名清单与 tools 共用一份（以前两边各写一份，都漏了 Office 格式，
+        导致 Word/PPT 产出发现不了）。
+        """
+        from .tools import GIS_OUTPUT_EXT, _NON_OUTPUT_EXT
+
         found: list[str] = []
         out_root = self.workspace / "output"
         if not out_root.exists():
@@ -148,11 +165,12 @@ class Verifier:
             if len(found) >= limit:
                 break
             name = item.name.lower()
+            suffix = item.suffix.lower()
+            if suffix in _NON_OUTPUT_EXT or name.startswith("~$"):
+                continue  # 中间产物与 Office 临时文件
             if item.is_dir() and name.endswith(".gdb"):
                 found.append(str(item))
-            elif item.is_file() and item.suffix.lower() in {
-                ".shp", ".tif", ".tiff", ".img", ".csv", ".jpg", ".jpeg", ".png", ".pdf", ".dbf", ".gpkg"
-            }:
+            elif item.is_file() and suffix in GIS_OUTPUT_EXT:
                 found.append(str(item))
         return found
 
@@ -199,6 +217,12 @@ class Verifier:
             "final_summary": getattr(state, "final_summary", ""),
             "artifacts": structural,
             "tasklist": [t.to_dict() for t in getattr(state, "tasklist", [])],
+            # 设计规格（.spec.json）的**实际内容**。
+            # 实测坑：以前只把 structural（路径+存在性）给模型，模型看不到
+            # class_bounds 之类的实际值，于是无论 agent 做什么都回“无法确认四图
+            # 分级是否一致”/“缺失 .spec.json”，把 agent 逼到反复重做直至轮次上限
+            # （14 届 4a-1 实测：验收 problems 明明是空的）。
+            "spec_contents": self._read_spec_contents(),
         }
         prompt = (
             "你是 GIS 成果验收专家。请对照需求清单逐条验收下面的产出。\n"
@@ -228,6 +252,43 @@ class Verifier:
         parsed.setdefault("missing", [])
         parsed.setdefault("repair_hint", "")
         return parsed
+
+    def _read_spec_contents(self, *, limit: int = 6, max_chars: int = 1200) -> list[dict[str, Any]]:
+        """读出产出目录下 ``*.spec.json`` 的关键内容，供语义验收核对。
+
+        只取**判据相关**的字段（分级边界/渲染器决策），不把整份设计文档塞进 prompt：
+        ``.spec.json`` 可达 8 KB，整份塞进去会挤掉其它证据。
+        """
+        out: list[dict[str, Any]] = []
+        out_root = self.workspace / "output"
+        if not out_root.exists():
+            return out
+        for path in sorted(out_root.rglob("*.spec.json")):
+            if len(out) >= limit:
+                break
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            keys = (
+                "class_bounds", "bounds", "break_values", "class_breaks",
+                "legend_class_bounds", "explicit_bounds", "renderer", "decisions",
+                "title", "theme", "region", "scale", "purpose",
+            )
+            picked = {k: raw[k] for k in keys if k in raw}
+            if not picked:
+                picked = {"keys": sorted(raw.keys())[:20]}
+            out.append(
+                {
+                    "path": str(path.relative_to(self.workspace)).replace("\\", "/"),
+                    "content": json.loads(
+                        json.dumps(picked, ensure_ascii=False, default=str)[:max_chars]
+                    ),
+                }
+            )
+        return out
 
     # -------------------------------------------------------------- hygiene
     def hygiene_findings(self) -> dict[str, Any]:
@@ -326,15 +387,28 @@ class Verifier:
             if artifacts and state is not None:
                 for path in artifacts:
                     state.add_artifact(path)
-        structural = self.structural_check(artifacts)
-
         problems: list[str] = []
+        out_root = str((self.workspace / "output").resolve()).lower()
+        ws_root = str(self.workspace.resolve()).lower()
+        # workspace 之外的路径根本不是本次产出（ArcGIS 自带模板 aprx、用户 Documents 下的
+        # 工程），是模型把工具回参当产物登记进来的。这种直接剔除，不要当成 blocked 问题——
+        # 否则验收每次都不通过，agent 会空转到轮次上限（14 届 4a-1 实测：断言 7/7 全过
+        # 却 status=max_turns）。真正该报的只是“在 workspace 内、但不在 output/ 下”。
+        inside: list[str] = []
+        for path in artifacts:
+            resolved = str(Path(path).resolve()).lower()
+            if not resolved.startswith(ws_root):
+                continue
+            inside.append(path)
+            if not resolved.startswith(out_root):
+                problems.append(f"产出不在 output 目录内: {path}")
+        if state is not None and hasattr(state, "artifacts"):
+            state.artifacts = inside
+        artifacts = inside
         if not artifacts:
             problems.append("没有任何产出文件")
-        out_root = str((self.workspace / "output").resolve()).lower()
-        for path in artifacts:
-            if not str(Path(path).resolve()).lower().startswith(out_root):
-                problems.append(f"产出不在 output 目录内: {path}")
+        # 结构体检要在剔除外部路径**之后**做，否则会去读 Blank.aprx 之类的无关文件。
+        structural = self.structural_check(artifacts)
         for record in structural:
             if not record.get("exists"):
                 problems.append(f"产出不存在: {record.get('path')}")

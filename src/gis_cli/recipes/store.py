@@ -438,8 +438,7 @@ class RecipeLibrary:
                 except Exception as exc:
                     missing.append(f"{path.name}(解析失败:{str(exc)[:40]})")
                     continue
-                renderer = (data.get("renderer") or {}) if isinstance(data, dict) else {}
-                bounds = renderer.get("applied_bounds") or renderer.get("explicit_bounds")
+                bounds = self._spec_bounds(data if isinstance(data, dict) else {})
                 if not bounds:
                     missing.append(path.name)
                     continue
@@ -503,14 +502,25 @@ class RecipeLibrary:
             return self._aprx_map_check(target, raw)
         if kind == "map_layout_ok":
             # 版面体检：图名居中/图例不压数据/比例尺整数刻度/元素不越界（制图交付的硬指标）
+            spec = raw.get("spec") or self._load_sibling_spec(target, raw.get("image"))
+            image_path = str(raw.get("image") or "")
+            min_font_pt = float(raw.get("min_font_pt") or 7.0)
+            # 版面体检要读 .aprx，只有 arcpy 能读。benchmark/CLI 跑在 venv 里
+            # （没装 arcpy），直接 import 会报 “No module named 'arcpy'” 而判失败——
+            # 实测 14 届 4a-1 就报 “版面体检失败: ...”。有 code_runner（内核/子进程）
+            # 时改让它在 ArcGIS 解释器里体检，把结果回传。
+            if self.code_runner is not None:
+                return self._map_layout_via_runner(
+                    kind, target, spec=spec, image_path=image_path, min_font_pt=min_font_pt
+                )
             try:
                 from ..cartography import qc as _qc
 
                 verdict = _qc.check_layout(
                     target,
-                    spec=raw.get("spec") or self._load_sibling_spec(target, raw.get("image")),
-                    image_path=str(raw.get("image") or ""),
-                    min_font_pt=float(raw.get("min_font_pt") or 7.0),
+                    spec=spec,
+                    image_path=image_path,
+                    min_font_pt=min_font_pt,
                 )
                 return ValidationResult(kind, target, bool(verdict.get("ok")), _qc.summarize(verdict))
             except Exception as exc:  # pragma: no cover - 依赖 arcpy
@@ -530,6 +540,46 @@ class RecipeLibrary:
             exists = bool(raw_path) and Path(str(raw_path)).exists()
             return ValidationResult(kind, target, exists, f"{key}={raw_path}")
         return ValidationResult(kind, target, True, "未知断言类型，已跳过")
+
+    @staticmethod
+    def _spec_bounds(data: dict[str, Any]) -> list | None:
+        """从一份 .spec.json 里找出实际生效的分级边界。
+
+        实测（14 届 4a-1）：制图配方写出的 spec 顶层**没有** ``renderer`` 键，
+        分级藏在 ``decisions``（``explicit_bounds=[0,2,4,6,8]``）与 ``notes``
+        （``raster_classify(统一图例): [2.0, 4.0, 6.0, 8.0]``）里。只认
+        renderer.applied_bounds 会误判“这些图没有分级信息”，而图其实是好的。
+
+        按可信度依次找：renderer 内的键 → 顶层同名键 → decisions 条目 → notes 文本。
+        """
+        renderer = data.get("renderer")
+        if isinstance(renderer, dict):
+            for key in ("applied_bounds", "explicit_bounds", "class_bounds"):
+                if renderer.get(key):
+                    return list(renderer[key])
+        for key in ("applied_bounds", "explicit_bounds", "class_bounds"):
+            if data.get(key):
+                return list(data[key])
+        for item in data.get("decisions") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("key", "")).lower() in (
+                "explicit_bounds",
+                "applied_bounds",
+                "class_bounds",
+            ) and item.get("value"):
+                return list(item["value"])
+        # 最后从 notes 文本里抽（形如 "raster_classify(统一图例): [2.0, 4.0, 6.0, 8.0]"）
+        for note in data.get("notes") or []:
+            match = re.search(r"\[\s*([\d.,\s]+?)\s*\]", str(note))
+            if match:
+                try:
+                    values = [float(x) for x in match.group(1).split(",") if x.strip()]
+                except Exception:
+                    continue
+                if values:
+                    return values
+        return None
 
     @staticmethod
     def _load_sibling_spec(target: str, image: Any = "") -> dict[str, Any] | None:
@@ -960,10 +1010,25 @@ class RecipeLibrary:
         return list(record.get("fields") or []) if record else []
 
     def _raster_range(self, path: str) -> tuple[float | None, float | None] | None:
+        """栅格 (min, max)。
+
+        Describe 的 MINIMUM/MAXIMUM 取不到时，**退到 _raster_stats** 再试一次。
+        实测（14 届 4a-1 回归）：同一个栅格，``raster_not_constant`` 拿到 range=None
+        而紧随其后的 ``raster_stat_between`` 拿到了 max=6.012——前者走 Describe
+        （曾经一个 try 包住 MIN/MAX，MIN 抛异常就把 MAX 也置 None），后者走
+        _raster_stats。两条路径差异会给同一条产物两个矛盾的结论，所以这里收紧。
+        """
         record = self._describe(path)
-        if not record:
-            return None
-        return record.get("raster_min"), record.get("raster_max")
+        if record:
+            low, high = record.get("raster_min"), record.get("raster_max")
+            if low is not None and high is not None:
+                return low, high
+        stats = self._raster_stats(path)
+        if stats:
+            low, high = stats.get("min"), stats.get("max")
+            if low is not None and high is not None:
+                return float(low), float(high)
+        return None
 
     def _describe(self, path: str, *, attempts: int = 2) -> dict[str, Any] | None:
         """Describe one path via the kernel (best effort)，失败再退到进程内 arcpy。
@@ -1011,9 +1076,11 @@ class RecipeLibrary:
             "        _rec['extent'] = None\n"
             "    try:\n"
             "        _rec['raster_min'] = float(arcpy.management.GetRasterProperties(_p, 'MINIMUM').getOutput(0))\n"
-            "        _rec['raster_max'] = float(arcpy.management.GetRasterProperties(_p, 'MAXIMUM').getOutput(0))\n"
             "    except Exception:\n"
             "        _rec['raster_min'] = None\n"
+            "    try:\n"
+            "        _rec['raster_max'] = float(arcpy.management.GetRasterProperties(_p, 'MAXIMUM').getOutput(0))\n"
+            "    except Exception:\n"
             "        _rec['raster_max'] = None\n"
             "set_result(_rec)\n"
         )
@@ -1148,15 +1215,59 @@ class RecipeLibrary:
         try:
             from PIL import Image  # type: ignore
             import numpy as np  # type: ignore
-
+        except Exception as exc:
+            # 缺依赖时**不能**静默回“通过”：那样图面检查等于没做，
+            # 而 benchmark 会拿它当证据（实测曾报 “std No module named 'numpy'"
+            # 却标记 OK）。现在直接说清楚是环境缺包。
+            return ValidationResult(
+                "image_not_blank", path, False, f"缺少依赖无法判定（请安装 pillow+numpy）: {exc}"
+            )
+        try:
             with Image.open(target) as img:
                 arr = np.asarray(img.convert("L"), dtype="float32")
             std = float(arr.std())
             return ValidationResult("image_not_blank", path, std > 3.0, f"std={std:.2f}")
         except Exception as exc:
-            return ValidationResult("image_not_blank", path, True, f"跳过: {exc}")
+            return ValidationResult("image_not_blank", path, False, f"读图失败: {str(exc)[:120]}")
 
     # ------------------------------------------------------------------- save
+    def _map_layout_via_runner(
+        self,
+        kind: str,
+        target: str,
+        *,
+        spec: dict[str, Any] | None,
+        image_path: str,
+        min_font_pt: float,
+    ) -> ValidationResult:
+        """在 ArcGIS 解释器（内核/子进程）里跑版面体检，把结论回传。
+
+        venue 里没有 arcpy，而 check_layout 必须读 .aprx，所以这段固定要让
+        code_runner 去跑。spec 也一并传过去（它决定“图例放图框外”这类刻意设计
+        是否算越界）。
+        """
+        code = (
+            "import json as _json\n"
+            "from gis_cli.cartography import qc as _qc\n"
+            f"_spec = _json.loads({json.dumps(json.dumps(spec or {}, ensure_ascii=False))})\n"
+            f"_r = _qc.check_layout({target!r}, spec=_spec, "
+            f"image_path={image_path!r}, min_font_pt={min_font_pt!r})\n"
+            "set_result({'verdict': _r, 'summary': _qc.summarize(_r)})\n"
+        )
+        try:
+            outcome = self.code_runner.run(code, timeout=300)
+        except Exception as exc:  # pragma: no cover - 内核不可用
+            return ValidationResult(kind, target, False, f"版面体检失败（内核异常）: {str(exc)[:120]}")
+        if not outcome.ok:
+            detail = ""
+            if isinstance(outcome.error, dict):
+                detail = str(outcome.error.get("message") or outcome.error.get("type") or "")
+            return ValidationResult(kind, target, False, f"版面体检失败: {detail[:160]}")
+        payload = outcome.result if isinstance(outcome.result, dict) else {}
+        verdict = payload.get("verdict") or {}
+        summary = str(payload.get("summary") or "")
+        return ValidationResult(kind, target, bool(verdict.get("ok")), summary)
+
     def save(self, recipe: Recipe, *, user: bool = True) -> str:
         """Persist a recipe (distillation target)."""
         directory = self.user_dir if user and self.user_dir else self.builtin_dir

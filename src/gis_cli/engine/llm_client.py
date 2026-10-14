@@ -94,6 +94,12 @@ class EngineLLMConfig:
     retry_count: int = 6
     backoff_seconds: float = 8.0
     max_backoff_seconds: float = 90.0
+    # 抗网关抖动：部分网关的负载均衡会把长连接踩到坏后端，表现为成串 504；
+    # 关掉 keep-alive 让每次请求重新建连（默认 True，保持原行为）。
+    http_keepalive: bool = True
+    # 思考档位（reasoning_effort）。实测部分推理模型默认**不返回** reasoning_content，
+    # 必须显式传该字段才有思考内容；空串 = 不传（兼容不支持它的网关）。
+    reasoning_effort: str = ""
 
     @classmethod
     def from_file(cls, path: str | Path) -> "EngineLLMConfig":
@@ -112,6 +118,10 @@ class EngineLLMConfig:
             timeout=float(data.get("timeout", cls.timeout)),
             total_timeout=float(engine.get("request_total_timeout_seconds", data.get("total_timeout", 420.0))),
             vision=bool(data.get("vision", engine.get("vision", False))),
+            reasoning_effort=str(
+                engine.get("reasoning_effort", data.get("reasoning_effort", "")) or ""
+            ).strip(),
+            http_keepalive=bool(data.get("http_keepalive", engine.get("http_keepalive", True))),
             fallback_models=[str(m) for m in data.get("fallback_models", []) if str(m).strip()],
             model_failure_threshold=int(engine.get("model_failure_threshold", data.get("model_failure_threshold", 2))),
             model_cooldown_seconds=float(engine.get("model_cooldown_seconds", data.get("model_cooldown_seconds", 300.0))),
@@ -158,6 +168,8 @@ class EngineLLMClient:
         self._lock = threading.Lock()
         self._semaphore = threading.BoundedSemaphore(max(1, config.max_concurrency))
         self._consecutive_429 = 0
+        #: 上游拒过图（400）后置位：调用方据此不再附图，省下每轮的无效请求
+        self.vision_rejected = False
         self._failures: dict[str, int] = {}
         self._cooldown_until: dict[str, float] = {}
         self._cooldown_strikes: dict[str, int] = {}
@@ -170,11 +182,24 @@ class EngineLLMClient:
                 from openai import OpenAI
             except ImportError as exc:  # pragma: no cover - dependency guard
                 raise LLMError("openai package is required for EngineLLMClient") from exc
+            kwargs: dict[str, Any] = {}
+            if not bool(getattr(self.config, "http_keepalive", True)):
+                # 抗网关抖动：禁用长连接复用，避免连接池粘在被 LB 判死的后端上
+                try:
+                    import httpx
+
+                    kwargs["http_client"] = httpx.Client(
+                        timeout=self.config.timeout,
+                        limits=httpx.Limits(max_keepalive_connections=0, keepalive_expiry=0.0),
+                    )
+                except Exception:
+                    pass
             self._client = OpenAI(
                 api_key=self.config.api_key,
                 base_url=self.config.api_base or None,
                 timeout=self.config.timeout,
                 max_retries=0,  # we own retries
+                **kwargs,
             )
         return self._client
 
@@ -293,6 +318,10 @@ class EngineLLMClient:
             payload["tool_choice"] = tool_choice or "auto"
         if response_format:
             payload["response_format"] = response_format
+        if self.config.reasoning_effort:
+            # 走 extra_body 而不是顶层：OpenAI SDK 对未知顶层字段会直接拒绝，
+            # 而各家 OpenAI 兼容网关都从 body 里读这个字段。
+            payload["extra_body"] = {"reasoning_effort": self.config.reasoning_effort}
 
         last_error: Exception | None = None
         conn_failures = 0
@@ -302,6 +331,7 @@ class EngineLLMClient:
             budget = min(budget, float(self.config.reduced_timeout_seconds or budget))
         deadline = time.monotonic() + budget
         budget_exhausted = False
+        vision_stripped = False
         for attempt in range(1, self.config.retry_count + 1):
             remaining_budget = deadline - time.monotonic()
             if remaining_budget <= 0:
@@ -319,6 +349,20 @@ class EngineLLMClient:
                     body = _error_body(exc)
                     retryable = status is None or status in _RETRYABLE_STATUS
                     if not retryable:
+                        # 识图是**可选增强**，不能让附图把整个任务拖死。实测上游会拒图：
+                        # 400 "Please start a new conversation, replace the image, and try again"，
+                        # 以前直接抛 LLMError → 整轮 run 判 llm_unavailable（14 届 4a-1 实测，
+                        # 只跑了 7 轮就死，而栅格产物其实已经做完了）。
+                        # 这里把图摘掉重试一次：文字与统计数据还在，任务可以继续。
+                        if not vision_stripped and _has_images(payload["messages"]):
+                            payload["messages"] = _strip_images(payload["messages"])
+                            vision_stripped = True
+                            # 记住“上游不吃图”：否则每轮附图都要白碰一次 400。
+                            self.vision_rejected = True
+                            logger.warning(
+                                "上游拒绝图片（%s），已摘掉图片重试：%s", status, (body or "")[:160]
+                            )
+                            continue
                         raise LLMError(
                             f"Non-retryable LLM error ({status}): {body or exc}",
                             status_code=status,
@@ -421,6 +465,44 @@ def _parse_arguments(raw: str) -> tuple[dict[str, Any], str]:
         return {"value": parsed}, ""
     except Exception as exc:
         return {}, f"argument JSON parse failed: {exc}"
+
+
+def _has_images(messages: list[dict[str, Any]]) -> bool:
+    """对话里有没有多模态图片块。"""
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == "image_url" for part in content
+        ):
+            return True
+    return False
+
+
+def _strip_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把对话里的图片块换成一行文字说明，保留其余文本。
+
+    上游拒图时用：摘掉图片后对话仍然完整（文字、工具结果、统计数据都在），
+    只是模型看不到图。比让整个 run 判 llm_unavailable 强得多。
+    """
+    stripped: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            stripped.append(message)
+            continue
+        texts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        image_count = sum(
+            1 for part in content if isinstance(part, dict) and part.get("type") == "image_url"
+        )
+        if image_count:
+            texts.append(f"（{image_count} 张图片已因上游不支持而省略，请依据文本与统计结果判断）")
+        merged = "\n".join(t for t in texts if t).strip()
+        stripped.append({**message, "content": merged or "（图片已省略）"})
+    return stripped
 
 
 def _status_code(exc: Exception | None) -> int | None:

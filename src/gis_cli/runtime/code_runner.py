@@ -161,6 +161,18 @@ def looks_destructive(code: str) -> bool:
     return any(marker in code for marker in _DESTRUCTIVE_MARKERS)
 
 
+def _is_volatile(name: str) -> bool:
+    """ArcGIS 的瞬时锁文件（还在写时会创建，写完/进程退出后消失）。
+
+    实测：备份一个 result_data.gdb 时，copytree 会把 ``*.sr.lock`` / ``*.rd.lock``
+    也列进去，但它们很快就被 ArcGIS 删掉，于是复制到一半报
+    ``[WinError 2] 系统找不到指定的文件``，一整排警告刷屏（还白写了一个
+    半成品的备份目录）。这些锁文件本身没有备份价值。
+    """
+    lowered = name.lower()
+    return lowered.endswith((".sr.lock", ".rd.lock", ".lock", ".lockfile"))
+
+
 def backup_paths(paths: list[str], backup_root: str | Path) -> list[str]:
     """Copy existing files/dirs into a timestamped backup folder.
 
@@ -179,8 +191,13 @@ def backup_paths(paths: list[str], backup_root: str | Path) -> list[str]:
             if src.is_dir():
                 if dest.exists():
                     shutil.rmtree(dest, ignore_errors=True)
-                shutil.copytree(src, dest)
+                # 跳过瞬时锁文件：复制到一半它们就没了，只会刷一堆 WinError 2
+                shutil.copytree(
+                    src, dest, ignore=shutil.ignore_patterns("*.lock", "*.lockfile")
+                )
             else:
+                if _is_volatile(src.name):
+                    continue
                 shutil.copy2(src, dest)
             created.append(str(dest))
         except Exception as exc:  # pragma: no cover - best effort

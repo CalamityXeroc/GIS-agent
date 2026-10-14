@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
@@ -177,9 +178,14 @@ class ArcpyKernel:
         try:
             from jupyter_client.manager import KernelManager
         except ImportError as exc:  # pragma: no cover
+            # 这里是**跑 agent 的那个解释器**缺包，不是内核解释器缺包。
+            # 以前的文案写“Install it in the ArcGIS Pro Python environment”会把人
+            # 带去错的地方：ArcGIS 环境本来就有，缺的往往是 venv。
             raise KernelError(
-                "jupyter_client is required for the persistent kernel. "
-                "Install it in the ArcGIS Pro Python environment."
+                "persistent kernel needs jupyter_client in the interpreter running the "
+                f"agent ({sys.executable}); install it there (pip install jupyter-client). "
+                "Without it every step falls back to a fresh subprocess that re-imports "
+                "arcpy (~15s) and loses cross-step variables."
             ) from exc
 
         self._km = KernelManager(kernel_name=self.kernel_name)
@@ -234,6 +240,15 @@ class ArcpyKernel:
         self._run_prelude()
 
     def shutdown(self) -> None:
+        """Shut down the kernel.
+
+        **先让 ArcGIS 把数据刷盘，再杀内核**。实测（14 届 4a-1）：直接
+        ``shutdown_kernel(now=True)`` 硬杀时，GDB 里刚写完的栅格还没落盘，
+        内核一死文件就跟着没了，目录里只剩 ``*.sr.lock``；模型上一轮明明
+        用 ``arcpy.ListRasters()`` 确认过四个 kde_* 都在，交付时却报“缺失”。
+        所以先给内核一点时间收尾。
+        """
+        self._flush_arcpy_writes()
         try:
             if self._kc is not None:
                 self._kc.stop_channels()
@@ -247,6 +262,29 @@ class ArcpyKernel:
         self._km = None
         self._kc = None
         self._started = False
+
+    def _flush_arcpy_writes(self) -> None:
+        """Best-effort: let ArcGIS finish writing before the kernel is killed.
+
+        实测（14 届 4a-1）：``shutdown_kernel(now=True)`` 硬杀时，GDB 里刚写完的
+        栅格尚未落盘，内核一死数据就丢了，只留下 ``*.sr.lock``——模型上一轮
+        还用 ``arcpy.ListRasters()`` 确认过四个 kde_* 都在，交付时却报“缺失”。
+
+        做法（全部容忍失败）：删临时引用 → 触发 GC（释放游标/数据集句柄，
+        ArcGIS 在对象析构时提交）→ 再等一拍。不跑重型检查，避免关机变慢。
+        """
+        if not self._started or self._kc is None:
+            return
+        try:
+            self.execute(
+                "import gc\n"
+                "gc.collect()\n"
+                "set_result({'flushed': True})",
+                timeout=30,
+            )
+        except Exception as exc:  # pragma: no cover - 关机不能因刷盘失败而中断
+            logger.debug("flush before shutdown failed: %s", exc)
+        time.sleep(0.5)
 
     def interrupt(self) -> None:
         """Send a soft interrupt to running code.

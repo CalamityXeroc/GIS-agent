@@ -45,6 +45,24 @@ def test_hygiene_flags_process_files_and_ratio_warning():
     assert any("倍" in w for w in warnings), warnings
 
 
+def test_hygiene_flags_probe_artifacts():
+    """回归：模型“试一下”留下的探查件要提醒删。
+
+    实测（14 届 4a-2）：为验证 create_map 能不能用，模型在成果目录里建了
+    ``_test.jpg`` / ``_test1.jpg`` / ``_test2.jpg``，出完图忘了删。
+    考卷明确要求“提交时删除非必要过程数据”。
+    真实数据名不能误伤（test_area.shp 不报）。
+    """
+    problems, warnings, _detail = hygiene_report(
+        _inventory(["year_centers"], files=[
+            "分布中心迁移.jpg", "_test1.jpg", "_test2.jpg", "test_area.shp",
+        ])
+    )
+    assert not problems, problems
+    assert any("_test1.jpg" in w for w in warnings), warnings
+    assert not any("test_area" in w for w in warnings), ("真数据不该被误报", warnings)
+
+
 def test_hygiene_ok_for_clean_delivery():
     problems, warnings, _detail = hygiene_report(
         _inventory(["landcover_utm10"], files=["分类面积统计.md"], temp_bytes=6_000_000, result_bytes=5_000_000)
@@ -187,6 +205,80 @@ def test_verifier_vision_check_warns_or_blocks(tmp_path):
     assert off.vision_check_image(img).get("skipped") is True
 
 
+def test_shared_legend_bounds_reads_decisions_and_notes(tmp_path):
+    """回归：分级边界写在 decisions/notes 里时也要能认出来。
+
+    实测（14 届 4a-1 实测）：制图配方写出的 .spec.json 顶层**没有** renderer 键，
+    分级藏在 decisions（explicit_bounds）与 notes（raster_classify: [...]）里。
+    检查器只认 renderer.applied_bounds，于是四张图明明是统一图例却报
+    “这些图没有分级信息（未统一图例）”——而这正是 benchmark 里那条断言的判据。
+    """
+    import json
+
+    from gis_cli.recipes.store import RecipeLibrary
+
+    specs = tmp_path / "制图"
+    specs.mkdir()
+    # 一份走 decisions，一份走 notes：两种写法都要能认出
+    (specs / "图1.spec.json").write_text(
+        json.dumps(
+            {"decisions": [{"key": "explicit_bounds", "value": [0, 2, 4, 6, 8]}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (specs / "图2.spec.json").write_text(
+        json.dumps(
+            {"notes": ["raster_classify(统一图例): [0.0, 2.0, 4.0, 6.0, 8.0]"]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    lib = RecipeLibrary()
+    good = lib.run_assertions(
+        [{"type": "shared_legend_bounds", "path": str(specs), "value": {"min_files": 2}}]
+    )[0]
+    assert good.ok is True, good.detail
+    assert "2 份图共用 1 套分级" in good.detail, good.detail
+
+
+def test_map_layout_ok_routes_through_code_runner(tmp_path):
+    """回归：版面体检要交给 code_runner（内核）跑，而不是在 venv 里 import arcpy。
+
+    实测（14 届 4a-2）：benchmark/CLI 跑在没有 arcpy 的 venv 里，check_layout
+    直接报“版面体检失败: No module named 'arcpy'”而判失败；而同一个检查在
+    ArcGIS 解释器里是能跑的。现在有 code_runner 时改走它。
+    """
+    from pathlib import Path
+
+    from gis_cli.recipes.store import RecipeLibrary
+
+    class _Result:
+        ok = True
+        result = {"verdict": {"ok": True, "checks": []}, "summary": "版面体检通过"}
+        error = None
+
+    class _Runner:
+        def __init__(self):
+            self.code = ""
+
+        def run(self, code, timeout=None, workspace=None):
+            self.code = code
+            return _Result()
+
+    runner = _Runner()
+    lib = RecipeLibrary(code_runner=runner)
+    aprx = tmp_path / "map.aprx"
+    aprx.write_text("x", encoding="utf-8")
+
+    result = lib.run_assertions(
+        [{"type": "map_layout_ok", "path": str(aprx), "image": str(tmp_path / "map.jpg")}]
+    )[0]
+    assert result.ok is True, result.detail
+    assert "check_layout" in runner.code, "必须让 code_runner 去跑 check_layout"
+    assert "arcpy" not in runner.code, "不要把 arcpy 直接写进模板（由 qc 内部 import）"
+
+
 def test_shared_legend_bounds_assertion(tmp_path):
     """统一图例断言：多份 spec 的实测分级必须完全一致（4 期密度图对比的硬判据）。"""
     import json
@@ -299,6 +391,79 @@ def test_class_bounds_edges_semantics():
     assert renderer["classification_method"] == "Manual"
 
 
+def test_stamp_arrows_accepts_both_key_spellings(tmp_path):
+    """回归：箭头坐标两种写法都要认，并在一张都用不了时报错（不假装成功）。
+
+    实测（14 届 4a-2）：stamp_arrows 只认 ``from``/``to``，而任务提示词与
+    create_map 工具描述给的是 ``x0/y0/x1/y1``。模型照提示词写，get("from")
+    取不到就默认 [0, 0]，19 条箭头全画到原点，drawn 却报 19——“成功”了但图上
+    什么都没有，模型只能反复改参数去猜。
+    """
+    from PIL import Image
+
+    from gis_cli.cartography.image_overlay import stamp_arrows
+
+    img_path = tmp_path / "map.jpg"
+    Image.new("RGB", (400, 400), "white").save(img_path)
+    extent = {"xmin": 0, "ymin": 0, "xmax": 1000, "ymax": 1000, "width": 1000, "height": 1000}
+    box = (0.0, 0.0, 100.0, 100.0)
+
+    for arrow in (
+        {"from": [100, 100], "to": [500, 500], "label": "1982→1983"},
+        {"x0": 100, "y0": 100, "x1": 500, "y1": 500, "label": "1982→1983"},
+    ):
+        result = stamp_arrows(
+            str(img_path), [arrow], extent=extent, box_mm=box, page_height_mm=100.0, dpi=25.4
+        )
+        assert result.get("ok") is True, result
+        assert result.get("drawn") == 1, result
+
+    # 坐标完全缺失 → 必须报失败，而不是画到原点还报成功
+    bad = stamp_arrows(
+        str(img_path), [{"label": "x"}], extent=extent, box_mm=box, page_height_mm=100.0, dpi=25.4
+    )
+    assert bad.get("ok") is False, bad
+    assert "坐标" in str(bad.get("detail")), bad
+
+
+def test_layer_paths_made_absolute(monkeypatch, tmp_path):
+    """回归：传给 ArcGIS 的图层路径必须是绝对路径。
+
+    实测（14 届 4a-2）：addDataFromPath("input/study_area.shp") 传相对路径时，
+    ArcGIS 不把它当本地文件，而当成 Web 服务去解析，直接报
+
+        RuntimeError: AUTOMATIC 失败，可能需要提供更具体的 web_service_type。
+
+    换成绝对路径就正常——而模型习惯写相对路径（基准文档就这么写的）。
+    """
+    from pathlib import Path
+
+    from gis_cli.cartography import _absolute_layers
+    from gis_cli.cartography.apply import _as_absolute
+
+    monkeypatch.chdir(tmp_path)
+
+    # create_map 入口：相对 → 绝对，绝对保持，空串丢弃，非字符串原样保留
+    got = _absolute_layers(["input/a.shp", "", "  "])
+    assert len(got) == 1, got
+    assert Path(got[0]).is_absolute(), got
+    assert got[0].endswith("a.shp"), got
+
+    already = str(tmp_path / "b.shp")
+    assert _absolute_layers([already])[0] == already
+
+    class _Layer:
+        pass
+
+    obj = _Layer()
+    assert _absolute_layers([obj])[0] is obj
+
+    # render 调用点：同样的解析（两处都做，任一处漏掉都会炸）
+    assert Path(_as_absolute("input/c.shp")).is_absolute()
+    assert _as_absolute(already) == already
+    assert _as_absolute("") == ""
+
+
 def test_map_to_px_coordinate_mapping():
     """数据坐标 → 像素：含 y 翻转与 mm→px 换算（迁移图箭头定位的数学核心）。"""
     from gis_cli.cartography.image_overlay import map_to_px
@@ -358,3 +523,90 @@ def test_raster_class_counts_between():
          "value": {"1": [1, 5]}}
     ])[0]
     assert bad.ok is False and "不在" in bad.detail
+
+
+def test_create_map_tool_exposes_full_intent_surface(tmp_path):
+    """回归：create_map 工具要把渲染/分级/叠加/版式参数都暴露出来。
+
+    实测（14 届 4a-1/4a-2）：模型为了知道怎么设栅格分级、色带、overlay，
+    用 execute_code 读了 214 次我们自己的源码（cartography/*.py）。
+    根因是这些参数只存在于"直接写代码"的路径里，工具面上没有。
+    工具描述里也点名"这些参数就是全部接口，不要去读源码"。
+    """
+    from pathlib import Path
+
+    from gis_cli.engine.tools import EngineContext, build_default_registry
+
+    captured: dict = {}
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            captured["code"] = code
+
+            class R:
+                ok = True
+                result = {"output": "out.jpg", "aprx": "out.aprx", "qc_ok": True, "qc_summary": ""}
+                error = None
+                stdout = ""
+                stderr = ""
+
+            return R()
+
+    registry = build_default_registry()
+    tool = [t for t in registry._tools.values() if t.name == "create_map"][0]
+    props = set((tool.parameters or {}).get("properties") or {})
+    for key in (
+        "mode", "explicit_bounds", "class_bounds", "classification", "color_ramp",
+        "category_names", "category_colors", "overlay", "overrides",
+    ):
+        assert key in props, f"create_map 缺少参数 {key}"
+
+    ctx = EngineContext(workspace=Path("."), code_runner=_Runner())
+    registry.execute(
+        "create_map",
+        {
+            "layers": ["input/a.shp"],
+            "output_path": "out.jpg",
+            "mode": "raster_stretch",
+            "explicit_bounds": "0,2,4,6,8",
+            "color_ramp": "Purples",
+            "overlay": {"arrows": [{"from": [1, 2], "to": [3, 4], "label": "a"}]},
+            "overrides": {"scale_bar.element_width_mm": 55},
+        },
+        ctx,
+    )
+    code = captured["code"]
+    # 这些键必须真的进到 create_map 的 intent 里（不是只在 schema 里摆着）
+    for token in ("raster_stretch", "0,2,4,6,8", "Purples", "arrows", "element_width_mm"):
+        assert token in code, f"{token} 没有传到 create_map"
+
+
+def test_raster_range_falls_back_when_describe_min_missing():
+    """回归：Describe 取不到 min 时要退到 raster_stats（同一产物不能两个结论）。
+
+    实测（14 届 4a-1 回归）：同一个栅格，raster_not_constant 拿到 range=None
+    而紧随其后的 raster_stat_between 拿到 max=6.012。前者走 Describe（当时
+    一个 try 包住 MINIMUM+MAXIMUM，MIN 抛异常把 MAX 也置 None），后者走
+    _raster_stats。同一条产物两个矛盾结论 = 误判成品为坏。
+    """
+    from gis_cli.recipes.store import RecipeLibrary
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            class R:
+                ok = True
+                error = None
+
+            r = R()
+            if "GetRasterProperties" in code:
+                # Describe 路径：MINIMUM 失败 → 只有 max
+                r.result = {"exists": True, "raster_min": None, "raster_max": 6.012}
+            else:
+                # RasterToNumPyArray 路径正常
+                r.result = {"sum": 1.0, "min": 0.0, "max": 6.012, "mean": 0.5, "count": 10}
+            return r
+
+    lib = RecipeLibrary(code_runner=_Runner())
+    assert lib._raster_range("x.gdb/kde") == (0.0, 6.012)
+    result = lib.run_assertions([{"type": "raster_not_constant", "path": "x.gdb/kde"}])[0]
+    assert result.ok is True, result.detail
