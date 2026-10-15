@@ -360,6 +360,7 @@ class PromptInput:
         input: Any = None,
         output: Any = None,
         registry: Any = None,
+        stream_provider: Callable[[], str] | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.mode = mode
@@ -374,6 +375,8 @@ class PromptInput:
         self._output = output
         #: 命令注册表（带参数候选）；由 agent 层注入，ui 层不反向依赖它
         self.registry = registry
+        #: 流式实时预览的数据源（模型正在生成的文本尾部；空串 = 没在流式）
+        self._stream_provider = stream_provider
         #: 最近一次输入框的 Buffer（测试与上层要用）
         self._buffer: Any = None
         self._session = None
@@ -396,14 +399,12 @@ class PromptInput:
                 auto_suggest=AutoSuggestFromHistory()
                 if not _is_dumb_terminal()
                 else None,
+                # 兜底补全器里**不放 PathCompleter**：它把任意文本当文件路径匹配，
+                # 于是普通句子也会命中候选 → 第一次回车只是“接受候选”而不提交，
+                # 用户得按两次回车（实测反馈）。文件补全保留在 ``@`` 触发的那条链上。
                 completer=SlashMenuCompleter(
                     self._commands,
-                    fallback=MixedCompleter(
-                        [
-                            AtFileCompleter(workspace_file_provider(self.workspace)),
-                            PathCompleter(expanduser=True, get_paths=lambda: [str(self.workspace)]),
-                        ]
-                    ),
+                    fallback=AtFileCompleter(workspace_file_provider(self.workspace)),
                 ),
                 key_bindings=self._key_bindings(),
                 style=prompt_style(self.mode, self.no_color),
@@ -507,14 +508,12 @@ class PromptInput:
             history = InMemoryHistory()
         return ui_tui.ChatPrompt(
             history=history,
+            # 补全链：行首 ``/`` 走命令表；``@`` 走文件补全。
+            # **不放 PathCompleter**：它把任意文本当文件路径匹配，普通句子命中了候选
+            # 时，第一次回车就只是“接受候选”而不提交（用户实测要按两次回车）。
             completer=SlashMenuCompleter(
                 self._commands,
-                fallback=MixedCompleter(
-                    [
-                        AtFileCompleter(workspace_file_provider(self.workspace)),
-                        PathCompleter(expanduser=True, get_paths=lambda: [str(self.workspace)]),
-                    ]
-                ),
+                fallback=AtFileCompleter(workspace_file_provider(self.workspace)),
                 registry=self.registry,
             ),
             style=prompt_style(self.mode, self.no_color),
@@ -524,6 +523,7 @@ class PromptInput:
             on_interrupt=self.on_interrupt,
             input=self._input,
             output=self._output,
+            stream_provider=self._stream_provider,
         )
 
     def read_line(

@@ -163,6 +163,11 @@ def to_unit(event: str, payload: dict[str, Any] | None = None) -> RenderUnit | N
     if event == "run_start":
         return RenderUnit("banner", str(data.get("goal", "")), meta={"run_id": str(data.get("run_id", ""))})
 
+    if event == "llm_delta":
+        # 流式增量：一次一个词，不适合当“一条记录”走 transcript；
+        # 由渲染层用实时块消费（见 TranscriptView.live_delta）。
+        return None
+
     if event == "requirements_extracted":
         count = int(data.get("count") or 0)
         if count <= 0:
@@ -320,6 +325,12 @@ class StatusTracker:
     verify_pass: bool | None = None
     tool_count: int = 0
     repair_count: int = 0
+    #: 流式实时字数（等待期 footer 显示"思考中 · 12s · 340 字"）
+    stream_chars: int = 0
+    #: 首个增量到达的时刻（算首字延迟 TTFB）
+    first_delta_at: float = 0.0
+    #: 排队提示（运行中用户又输入了消息时显示，让用户知道消息没丢）
+    queued_hint: str = ""
 
     # -- 更新 ---------------------------------------------------------
 
@@ -339,6 +350,17 @@ class StatusTracker:
                 self.model = model
             # 用量在这里累加：任何走 apply 的路径都不会漏（曾因只在某个调用点加而显示 ↑0 ↓0）
             self.add_usage(data.get("usage") if isinstance(data.get("usage"), dict) else None)
+            self.stream_chars = 0
+        elif event == "llm_delta":
+            text = str(data.get("text") or "")
+            if text:
+                if not self.first_delta_at:
+                    self.first_delta_at = now
+                self.stream_chars += len(text)
+        elif event == "queued":
+            # 运行中用户又提交了消息：立刻给可见反馈（消息没丢，本轮结束后继续）
+            count = int(data.get("count") or 0)
+            self.queued_hint = f"已排队 {count} 条，结束后合并继续" if count > 0 else ""
         elif event == "tool_call":
             self.tool_count += 1
             self.current_action = str(data.get("tool") or "")
@@ -393,15 +415,27 @@ class StatusTracker:
             "runner_error": "运行出错",
         }.get(self.status, self.status or "空闲")
         bits.append(status_text)
-        bits.append(f"第 {self.turn} 轮" if self.turn else "未开始")
-        bits.append(format_duration(self.elapsed))
-        bits.append(f"↑{format_tokens(self.tokens_in)} ↓{format_tokens(self.tokens_out)}")
-        if self.tool_count:
-            bits.append(f"工具 {self.tool_count}")
-        if self.repair_count:
-            bits.append(f"修复 {self.repair_count}")
-        if show_action and self.current_action:
-            bits.append(f"→ {self.current_action}")
+        idle = self.status in ("", "idle") and not self.turn
+        if not idle:
+            bits.append(f"第 {self.turn} 轮" if self.turn else "未开始")
+            bits.append(format_duration(self.elapsed))
+            bits.append(f"↑{format_tokens(self.tokens_in)} ↓{format_tokens(self.tokens_out)}")
+            if self.tool_count:
+                bits.append(f"工具 {self.tool_count}")
+            if self.repair_count:
+                bits.append(f"修复 {self.repair_count}")
+            if show_action and self.current_action:
+                bits.append(f"→ {self.current_action}")
+            elif show_action and self.stream_chars:
+                # 等待期活体提示：模型正在流式输出（避免盯着空屏不知死没死）
+                # 这里不引 theme.glyph：events 是底层模块，theme 反向依赖它会成环。
+                bits.append(f"思考中 · {self.stream_chars} 字")
+        elif self.queued_hint:
+            # 空闲但有排队中的后续任务：让用户知道它会被接着处理
+            bits.append(self.queued_hint)
+        if self.queued_hint and not idle:
+            # 运行中排队也要可见（用户实测：静默排队让人以为消息丢了）
+            bits.append(self.queued_hint)
         text = " · ".join(bits)
         if width and len(text) > width:
             text = text[: max(0, width - 1)] + "…"

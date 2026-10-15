@@ -176,8 +176,12 @@ class AutoCodec:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        on_delta: Any = None,
     ) -> tuple[LLMResponse, list[Action]]:
-        """Call the model and decode actions."""
+        """Call the model and decode actions.
+
+        ``on_delta`` 会透传给底层客户端（流式模式下逐块回调），用于界面实时显示。
+        """
         probe_model = model or self.client.config.model
         protocol = self.protocol_for(probe_model)
 
@@ -189,6 +193,7 @@ class AutoCodec:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                on_delta=on_delta,
             )
             actions = actions_from_native(response)
             if not response.tool_calls and response.content.strip():
@@ -202,6 +207,7 @@ class AutoCodec:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            on_delta=on_delta,
         )
         return response, actions_from_json(response)
 

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import deque
 from typing import Any, Iterable
 
@@ -46,6 +47,9 @@ _STATUS_ROLE = {
 _BODY_WIDTH = 88
 #: 思考块最多显示的行数（默认展开，但极端长的推理不至于淹没屏幕）
 _THOUGHT_MAX_LINES = 40
+
+#: 实时流块最多回显尾部多少字符（保持屏幕不涨得太快；定型时打全文）
+_LIVE_TAIL_CHARS = 1200
 
 
 from rich.cells import cell_len
@@ -122,6 +126,77 @@ def _short(text: str, limit: int = 88) -> str:
         return text
     head, _tail = _cut_by_width(text, max(1, limit - 1))
     return head + "…"
+
+
+def _printable_console(console: Any) -> bool:
+    """这个 Console 能不能安全使用富的 inline 重绘（rich ``Live``）。
+
+    **不能只看能不能构造 Live**（那是之前的错误：构造总是成功，所以降级永远
+    不触发）。真正的判据是"终端会不会解析 ANSI 控制序列"，这由项目自己的
+    :func:`console_env.ansi_ok` 保守判定（默认否，只认得高级终端）。
+
+    为什么必须保守：常见症状是整屏 ``?[2K?[1A?[2K`` —— ``Live`` 每帧发
+    ``ESC[2K``（清行）/ ``ESC[1A``（上移）/ ``ESC[?25l``（隐光标），
+    不解析 ANSI 的终端把它们当普通字符显示。实测（普通 Windows 控制台）：
+
+        ′x1b[?25l◆ 思考 · 0s
+        先看数据目录，再统计分组。
+        ′x1b[?25h
+′x1b[1A′x1b[2K′x1b[1A′x1b[2K◆ 思考
+
+    另：``Live`` 还会接管进程的 stderr 重定向，在没有真实 fd 的环境里
+    会直接静默退出（退出码 0，什么都看不到）——这条也是实测到的。
+    """
+    if not getattr(console, "is_terminal", False):
+        return False
+    try:
+        from .console_env import ansi_ok
+
+        return bool(ansi_ok())
+    except Exception:  # pragma: no cover - 环境判定失败时按“不支持”处理
+        return False
+
+
+def _make_live(console: Any) -> Any:
+    """建一个可原地重画的 Live；终端不支持 ANSI 时返回降级实现。
+
+    降级实现不重绘、不发任何控制序列：流式文本累积在内存，由状态行显示
+    "思考中 · N 字"，块结束时一次性定型打印（见 ``TranscriptView._end_live``）。
+    """
+    if not _printable_console(console):
+        return _NoRedrawFallback()
+    try:
+        from rich.live import Live
+
+        live = Live(Text(), console=console, refresh_per_second=4, transient=True)
+        live.start()
+        return live
+    except Exception:  # pragma: no cover - 依赖终端
+        return _NoRedrawFallback()
+
+
+class _NoRedrawFallback:
+    """不重绘的降级实现：只吸收 ``update()``，不发任何控制序列。
+
+    这不是"没有流式"：增量仍在 ``TranscriptView._live_text`` 里累积，
+    状态行会显示进度，块结束时完整打印。差别只是不能逐帧原地刷新。
+    """
+
+    #: 供 ``TranscriptView`` 判断要不要在状态行/预览窗里显示进度
+    live_render = False
+
+    def update(self, renderable: Any) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+
+class _PrintFallback(_NoRedrawFallback):
+    """兼容旧名字（历史上用于"Live 构造失败"的降级）。"""
+
+    def __init__(self, console: Any = None) -> None:
+        self.console = console
 
 
 class ToolOutputStore:
@@ -330,6 +405,14 @@ class TranscriptView:
         self._pending_result_ok: bool = True
         self._pending_folded: bool = False
         self._last_turn: int = 0
+        #: 流式实时块：正在增长的思考/正文（``None`` = 当前没有）
+        self._live: Any = None
+        self._live_kind: str = ""
+        self._live_text: list[str] = []
+        self._live_started: float = 0.0
+        self._live_printed_lines: int = 0
+        #: 本轮是否已用流式显示过思考（避免 llm_result 再打一遍）
+        self._live_streamed_this_turn: bool = False
 
     # -- 工具组缓冲 ----------------------------------------------------
 
@@ -378,6 +461,114 @@ class TranscriptView:
         if folded:
             self.store.add(self._pending_tool or "tool", summary)
 
+    # -- 流式实时块 ----------------------------------------------------
+
+    def live_delta(self, kind: str, text: str) -> None:
+        """模型边生成边送达的增量文本（``kind``: content / reasoning）。
+
+        对齐主流 CLI 的做法：**原地重画**同一个块，而不是每来一个词就打一行
+        （否则一屏全是碎片）。实现上先用 rich 的 ``Live`` 控制光标区域，
+        块结束时把最终文本定型打印。
+
+        任何异常都吞掉：渲染绝不能把模型调用搞挂。
+        """
+        if not text:
+            return
+        # 思考与正文交替时（推理→回答）先收掉上一块，避免混在一起
+        if self._live_kind and self._live_kind != kind:
+            self._end_live()
+        if self._live is None:
+            self.prepare_live_block()
+            self._live_kind = kind
+        self._live_streamed_this_turn = True
+        self._live_text.append(text)
+        try:
+            self._redraw_live()
+        except Exception:  # pragma: no cover - 渲染层问题不影响引擎
+            pass
+
+    def prepare_live_block(self) -> None:
+        """开始一个实时块（先冲掉挂起的工具组，保证顺序）。"""
+        self._flush_tools()
+        self._live_text = []
+        self._live_started = time.monotonic()
+        self._live_printed_lines = 0
+        self._live = _make_live(self.console)
+
+    def live_preview(self, *, max_chars: int = 400, max_lines: int = 6) -> str:
+        """给交互输入框上方的预览窗用：当前流式文本的尾部。
+
+        终端不解析 ANSI 时（``Live`` 不可用），靠这个让用户看到“模型正在写”。
+        返回空串表示当前没有流式内容。
+        """
+        if not self._live_text:
+            return ""
+        text = "".join(self._live_text)[-max_chars:]
+        lines = [line for line in text.splitlines() if line.strip()]
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        return "\n".join(lines)
+
+    @property
+    def live_text(self) -> str:
+        """当前实时块的累计文本（测试与状态行用）。"""
+        return "".join(self._live_text)
+
+    @property
+    def live_chars(self) -> int:
+        return sum(len(part) for part in self._live_text)
+
+    def _redraw_live(self) -> None:
+        if self._live is None:
+            return
+        from .events import format_duration
+
+        text = "".join(self._live_text)
+        marker = glyph("thought") if self._live_kind == "reasoning" else glyph("answer")
+        label = "思考" if self._live_kind == "reasoning" else "回复"
+        elapsed = time.monotonic() - self._live_started
+        head = Text()
+        head.append(f"{marker} ", style="gis.thought.tag" if self._live_kind == "reasoning" else "gis.answer.tag")
+        head.append(label, style="gis.thought.tag" if self._live_kind == "reasoning" else "gis.answer.tag")
+        head.append(f" · {format_duration(elapsed)}", style="gis.dim")
+        body_style = "gis.thought" if self._live_kind == "reasoning" else "gis.answer"
+        out = Text()
+        out.append(head)
+        out.append("\n")
+        out.append(text[-_LIVE_TAIL_CHARS:], style=body_style)
+        self._live.update(out)
+
+    def _end_live(self) -> None:
+        """收掉实时块：把最终文本定型打印（含耗时与总字数）。"""
+        live = self._live
+        text = "".join(self._live_text)
+        kind = self._live_kind
+        elapsed = (time.monotonic() - self._live_started) if self._live_started else 0.0
+        self._live = None
+        self._live_kind = ""
+        self._live_text = []
+        self._live_started = 0.0
+        self._live_printed_lines = 0
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:  # pragma: no cover
+                pass
+        if not text.strip():
+            return
+        # 定型：用与非流式相同的渲染路径，保证观感一致
+        from .events import RenderUnit
+
+        if kind == "reasoning":
+            unit = RenderUnit("thought", text, meta={"has_reasoning": True})
+            self.console.print(thought_block(unit, elapsed=elapsed if elapsed > 0.5 else None))
+        else:
+            self.console.print(answer_block(text, width=max(40, int(getattr(self.console, "width", 0) or _BODY_WIDTH) - 2)))
+
+    def end_live(self) -> None:
+        """对外：结束实时块（工具开始执行/轮次结束时调）。"""
+        self._end_live()
+
     # -- 事件入口 ------------------------------------------------------
 
     def handle(self, event: str, payload: dict | None = None) -> None:
@@ -405,6 +596,11 @@ class TranscriptView:
             self._buffer_tool_result(unit.text, bool(unit.ok), bool(unit.lines))
             return
 
+        # 流式已经把思考/正文实时显示过了 → llm_result 的重复块跳过（否则同一段思考打两遍）
+        if kind == "thought" and self._live_streamed_this_turn:
+            self._live_streamed_this_turn = False
+            return
+
         # 任何非工具事件都先冲掉挂起的工具组，保证顺序正确
         self._flush_tools()
 
@@ -416,6 +612,7 @@ class TranscriptView:
             turn = int(match.group(0)) if match else 0
             if turn and turn != self._last_turn:
                 self._last_turn = turn
+                self._live_streamed_this_turn = False
                 width = max(40, int(getattr(self.console, "width", 0) or _BODY_WIDTH) - 2)
                 self.console.print(turn_rule(turn, width=width))
             return
@@ -598,7 +795,11 @@ def result_card(state: dict[str, Any]) -> Panel:
 
 
 def footer_text(tracker: StatusTracker, *, width: int = 0) -> Text:
-    """状态行：模型 · 状态 · 轮次 · 用时 · token · 工具 · 当前动作。"""
+    """状态行：模型 · 状态 · 轮次 · 用时 · token · 工具 · 当前动作。
+
+    空闲时不显示噪声（“未开始 · 0s · ↑0 ↓0”）：那会让人以为“已经在跑了”
+    （用户实测反馈）。只有真正跑过/正在跑才展示运行数据。
+    """
     text = Text()
     pieces: list[tuple[str, str]] = []
     if tracker.model:
@@ -618,15 +819,21 @@ def footer_text(tracker: StatusTracker, *, width: int = 0) -> Text:
         "runner_error": "运行出错",
     }.get(tracker.status, tracker.status or "空闲")
     pieces.append((status_label, _STATUS_ROLE.get(tracker.status, "gis.status")))
-    pieces.append((f"第 {tracker.turn} 轮" if tracker.turn else "未开始", "gis.dim"))
-    pieces.append((format_duration(tracker.elapsed), "gis.dim"))
-    pieces.append((f"↑{format_tokens(tracker.tokens_in)} ↓{format_tokens(tracker.tokens_out)}", "gis.dim"))
-    if tracker.tool_count:
-        pieces.append((f"工具 {tracker.tool_count}", "gis.dim"))
-    if tracker.repair_count:
-        pieces.append((f"修复 {tracker.repair_count}", "gis.warn"))
-    if tracker.current_action:
-        pieces.append((f"→ {tracker.current_action}", "gis.tool"))
+
+    idle = tracker.status in ("", "idle") and not tracker.turn
+    if not idle:
+        pieces.append((f"第 {tracker.turn} 轮" if tracker.turn else "未开始", "gis.dim"))
+        pieces.append((format_duration(tracker.elapsed), "gis.dim"))
+        pieces.append((f"↑{format_tokens(tracker.tokens_in)} ↓{format_tokens(tracker.tokens_out)}", "gis.dim"))
+        if tracker.tool_count:
+            pieces.append((f"工具 {tracker.tool_count}", "gis.dim"))
+        if tracker.repair_count:
+            pieces.append((f"修复 {tracker.repair_count}", "gis.warn"))
+        if tracker.current_action:
+            pieces.append((f"→ {tracker.current_action}", "gis.tool"))
+    elif tracker.queued_hint:
+        # 空闲但有排队中的后续任务：让用户知道它会被接着处理
+        pieces.append((tracker.queued_hint, "gis.dim"))
 
     plain_len = 0
     for index, (text_value, role) in enumerate(pieces):

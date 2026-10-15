@@ -68,6 +68,37 @@ set_result({"records": records})
 '''
 
 
+def _mtime_key(path: Path) -> float:
+    """文件 mtime（取不到时返回 0）——识图缓存的失效依据。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _shrink_json(value: Any, budget: int, depth: int = 0) -> Any:
+    """递归缩水 JSON（保持结构合法），给“内容太长”的验收材料用。
+
+    存在的理由：直接把 JSON 字符串切到 max_chars 会截在字符串中间，
+    ``json.loads`` 随即抛 JSONDecodeError，把整个任务拖死（实测踩到）。
+    这里只截长字符串、只留前几个列表项，得到的仍是合法 JSON。
+    """
+    if depth > 6:
+        return "…"
+    if isinstance(value, str):
+        room = max(16, budget // 4)
+        return value if len(value) <= room else value[: room - 1] + "…"
+    if isinstance(value, list):
+        kept = [_shrink_json(item, max(32, budget // 2), depth + 1) for item in value[:3]]
+        if len(value) > 3:
+            kept.append(f"…（共 {len(value)} 项）")
+        return kept
+    if isinstance(value, dict):
+        share = max(32, budget // max(1, len(value)))
+        return {str(k): _shrink_json(v, share, depth + 1) for k, v in list(value.items())[:12]}
+    return value
+
+
 def _artifact_exists(path: str) -> bool:
     """已删除的产物不该再算产物（文件系统或 GDB 语义都试一下）。
 
@@ -115,6 +146,10 @@ class Verifier:
         self.hygiene_mode = str(hygiene_mode or "warn").lower()
         # 图面识图质检：让识图模型看图，判定中文是否可读/图面是否被裁；warn|block|off
         self.vision_mode = str(vision_mode or "warn").lower()
+        #: 识图结论缓存：``(路径, mtime) -> 结论``。
+        #: 同一批产物在一个 run 里会被验两次（verify_outputs + finish），
+        #: 没有缓存就要把每张图看两遍（实测验图开销高达 200s+）。
+        self._vision_cache: dict[tuple[str, float], dict[str, Any]] = {}
 
     # ------------------------------------------------------------- structural
     def structural_check(self, artifacts: list[str]) -> list[dict[str, Any]]:
@@ -280,14 +315,20 @@ class Verifier:
             picked = {k: raw[k] for k in keys if k in raw}
             if not picked:
                 picked = {"keys": sorted(raw.keys())[:20]}
-            out.append(
-                {
-                    "path": str(path.relative_to(self.workspace)).replace("\\", "/"),
-                    "content": json.loads(
-                        json.dumps(picked, ensure_ascii=False, default=str)[:max_chars]
-                    ),
-                }
-            )
+            text = json.dumps(picked, ensure_ascii=False, default=str)
+            if len(text) > max_chars:
+                # 超长时**不能直接截断再 json.loads**：截在字符串中间会得到
+                # 非法 JSON 并抛 JSONDecodeError，把整个任务拖死（实测：有
+                # 孤立的 .spec.json 内容不完整 → 验收阶段崩 → run 直接挂）。
+                # 这里改成保留结构地递归缩水，实在不行就退成纯文本。
+                picked = _shrink_json(picked, max_chars)
+                text = json.dumps(picked, ensure_ascii=False, default=str)
+                if len(text) > max_chars:
+                    picked = {"note": "内容过长，已省略", "raw_prefix": text[: max(0, max_chars - 40)]}
+            out.append({
+                "path": str(path.relative_to(self.workspace)).replace("\\", "/"),
+                "content": picked,
+            })
         return out
 
     # -------------------------------------------------------------- hygiene
@@ -329,6 +370,117 @@ class Verifier:
         "没有问题时 issues 为空数组、text_ok=true。"
     )
 
+    #: 一次调用同时检查多张图时的提示词（省去每张一次网络往返）
+    _VISION_BATCH_PROMPT = (
+        "你是地图/图表质检员。下面依次给出 {count} 张图（顺序与编号一致）。\n"
+        "只输出一个 JSON 对象：\n"
+        '{{"images": [{{"index": 1, "text_ok": true, "issues": [], "summary": "一句话结论"}}]}}\n'
+        "判定要点：标题、图例、比例尺、坐标轴文字是否可读——**中文若显示为方框(口口口)或乱码则 text_ok=false**；"
+        "另外检查：图面是否被裁切、是否大面积空白、图例是否遮挡主体、地图要素是否缺失。\n"
+        "images 数组必须包含全部 {count} 项，index 从 1 开始。"
+    )
+
+    def vision_check_images(self, paths: list[Path]) -> dict[int, dict[str, Any]]:
+        """一次调用质检多张图，返回 ``{下标: 结论}``。
+
+        为什么要批量：实测收尾验收对 5 张图**逐张串行**调用，一次 run 光验图
+        就花了 200s+（占该 run 总耗时 82%）。一次请求带多张图，往返从 N 次降为 1 次。
+        任何失败都退回“逐张检查”的结果（``{}`` = 让调用方自己回退）。
+        """
+        if self.vision_mode == "off" or self.llm_client is None or not paths:
+            return {}
+        if not getattr(getattr(self.llm_client, "config", None), "vision", False):
+            return {}
+        if getattr(self.llm_client, "vision_rejected", False):
+            return {}
+        try:
+            from ..runtime.image_input import as_data_url
+
+            parts: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": self._VISION_BATCH_PROMPT.format(count=len(paths)),
+                }
+            ]
+            used = 0
+            for path in paths:
+                url = as_data_url(str(path))
+                if not url:
+                    continue
+                used += 1
+                parts.append({"type": "text", "text": f"第 {used} 张：{path.name}"})
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+            if used == 0:
+                return {}
+            response = self.llm_client.chat(
+                [
+                    {"role": "system", "content": "你只输出 JSON。"},
+                    {"role": "user", "content": parts},
+                ],
+                task_type="verify",
+            )
+            parsed = extract_json_object(response.content) or {}
+            items = parsed.get("images") if isinstance(parsed, dict) else None
+            if not isinstance(items, list):
+                return {}
+            out: dict[int, dict[str, Any]] = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item.get("index", 0)) - 1
+                except Exception:
+                    continue
+                if 0 <= index < len(paths):
+                    out[index] = self._normalize_vision(item, model=getattr(response, "model", ""))
+            return out
+        except Exception as exc:  # pragma: no cover - 识图失败退回逐张路径
+            logger.debug("batch vision check failed: %s", exc)
+            return {}
+
+    @staticmethod
+    def _normalize_vision(parsed: dict[str, Any], *, model: str = "") -> dict[str, Any]:
+        """把识图结论归一成统一结构。"""
+        text_ok = bool(parsed.get("text_ok", True))
+        issues = [str(item) for item in (parsed.get("issues") or [])][:5]
+        return {
+            "ok": text_ok and not issues,
+            "text_ok": text_ok,
+            "issues": issues,
+            "summary": str(parsed.get("summary", ""))[:200],
+            "model": model,
+        }
+
+    def _vision_verdicts(self, records: list[dict[str, Any]]) -> None:
+        """给每条图片产物填上 ``record["vision"]``（批量 + 缓存）。
+
+        - **批量**：多张图一次调用看完（实测逐张串行时 5 张图要 200s+）；
+        - **缓存**：以 ``(路径, mtime)`` 为键。同一批产物在一个 run 里会被验两次
+          （``verify_outputs`` 与 ``finish``），第二次直接命中缓存；图片改了
+          mtime 就自动失效。
+
+        """
+        if not records:
+            return
+        keys = [(str(r.get("path", "")), _mtime_key(Path(str(r.get("path", ""))))) for r in records]
+        missing = [i for i, key in enumerate(keys) if key not in self._vision_cache]
+        if missing:
+            paths = [Path(keys[i][0]) for i in missing]
+            verdicts = self.vision_check_images(paths) if len(paths) > 1 else {}
+            if not verdicts and len(paths) == 1:
+                verdicts = {0: self.vision_check_image(paths[0])}
+            if not verdicts:
+                # 批量不支持（或全失败）→ 退回逐张（至少部分图能验到）
+                for index in missing:
+                    verdicts[index] = self.vision_check_image(Path(keys[index][0]))
+            for index, verdict in verdicts.items():
+                if 0 <= index < len(missing):
+                    self._vision_cache[keys[missing[index]]] = verdict
+        for record, key in zip(records, keys):
+            verdict = self._vision_cache.get(key)
+            if verdict is not None:
+                record["vision"] = verdict
+
     def vision_check_image(self, path: Path) -> dict[str, Any]:
         """用识图模型核对一张产出的图（中文可读性、图面完整性）。
 
@@ -362,15 +514,7 @@ class Verifier:
         except Exception as exc:  # pragma: no cover - 识图失败不影响验收
             logger.debug("vision check failed: %s", exc)
             return {"ok": True, "skipped": True, "reason": f"识图调用失败: {str(exc)[:120]}"}
-        text_ok = bool(parsed.get("text_ok", True))
-        issues = [str(item) for item in (parsed.get("issues") or [])][:5]
-        return {
-            "ok": text_ok and not issues,
-            "text_ok": text_ok,
-            "issues": issues,
-            "summary": str(parsed.get("summary", ""))[:200],
-            "model": getattr(response, "model", ""),
-        }
+        return self._normalize_vision(parsed, model=getattr(response, "model", ""))
 
     # ----------------------------------------------------------------- verify
     def verify(self, state: Any) -> dict[str, Any]:
@@ -427,13 +571,12 @@ class Verifier:
 
         # 图面识图质检：中文是否可读、图例/图名是否齐全（模型支持识图时）
         vision_warnings: list[str] = []
-        for record in structural:
-            if not isinstance(record.get("image"), dict):
+        image_records = [r for r in structural if isinstance(r.get("image"), dict)]
+        self._vision_verdicts(image_records)
+        for record in image_records:
+            verdict = record.get("vision")
+            if not isinstance(verdict, dict) or verdict.get("skipped"):
                 continue
-            verdict = self.vision_check_image(Path(str(record.get("path", ""))))
-            if verdict.get("skipped"):
-                continue
-            record["vision"] = verdict
             if not verdict.get("ok"):
                 name = Path(str(record.get("path", ""))).name
                 detail = verdict.get("summary") or "；".join(verdict.get("issues") or [])

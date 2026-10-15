@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,26 +36,78 @@ class CodeRunner:
         self._kernel: ArcpyKernel | None = None
         self._kernel_failed = False
         self.last_backend = "none"
+        #: 内核启动很快（实测 arcpy 导入就要 8~11s）：预热与扫描并行，
+        #: 首个 execute_code 就不用再等。锁保证不会起两个内核。
+        self._kernel_lock = threading.Lock()
+        self._prewarm_thread: threading.Thread | None = None
+        #: 预热是**一次性**动作，用显式标志而不是“线程还活着吗”判断：
+        #: 工作线程可能在调用方等到锁之前就已结束，那时 ``is_alive()`` 已是
+        #: False，只看它会又起一个内核（实测竞争）。
+        self._prewarm_started = False
 
-    # ---------------------------------------------------------------- kernel
+    # ---------------------------------------------------------------- 预热
+    def prewarm(self) -> bool:
+        """后台启动内核（幂等）。已在跑或已就绪时返回 False。
+
+        为什么要预热：内核冷启动实测 11.6~17.6s（大头是 ``import arcpy``）。
+        启动时不预热的话，用户第一个要跑代码的任务会白等这一段；
+        预热后可与数据目录扫描、首轮模型调用同时进行。
+        没有 jupyter_client 时这里会快速失败并置 ``_kernel_failed``，
+        后续自动退回一次性子进程（与旧行为一致）。
+        """
+        if self._kernel_failed:
+            return False
+        if self._kernel is not None and self._kernel.is_alive():
+            return False
+        with self._kernel_lock:
+            # 先看一次性标志：线程可能已经结束，但那次预热已经做过了
+            if self._prewarm_started:
+                return False
+            if self._kernel_failed:
+                return False
+            if self._kernel is not None and self._kernel.is_alive():
+                return False
+            self._prewarm_started = True
+            self._prewarm_thread = threading.Thread(
+                target=self._ensure_kernel, name="gis-agent-kernel-prewarm", daemon=True
+            )
+            self._prewarm_thread.start()
+            return True
+
+    def wait_prewarm(self, timeout: float | None = None) -> None:
+        """等预热完成（不需要精确同步时可不调）。"""
+        thread = self._prewarm_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+
     def _ensure_kernel(self) -> ArcpyKernel | None:
         if self._kernel_failed:
             return None
         if self._kernel is not None and self._kernel.is_alive():
             return self._kernel
-        try:
-            self._kernel = ArcpyKernel(
-                python_executable=self.python_executable,
-                state_dir=self.state_dir,
-                workspace=str(self.workspace),
-            )
-            self._kernel.start()
-            self.last_backend = "kernel"
-            return self._kernel
-        except Exception as exc:
-            logger.warning("persistent kernel unavailable (%s); falling back to subprocess", exc)
-            self._kernel_failed = True
-            return None
+        with self._kernel_lock:
+            # 双重检查：预热线程与 execute_code 可能同时到达
+            if self._kernel_failed:
+                return None
+            if self._kernel is not None and self._kernel.is_alive():
+                return self._kernel
+            try:
+                from .timing import StageTimer
+
+                timer = StageTimer("kernel.prewarm")
+                self._kernel = ArcpyKernel(
+                    python_executable=self.python_executable,
+                    state_dir=self.state_dir,
+                    workspace=str(self.workspace),
+                )
+                self._kernel.start()
+                self.last_backend = "kernel"
+                timer.done(ok=True)
+                return self._kernel
+            except Exception as exc:
+                logger.warning("persistent kernel unavailable (%s); falling back to subprocess", exc)
+                self._kernel_failed = True
+                return None
 
     # ----------------------------------------------------------------- public
     def run(
@@ -133,6 +186,11 @@ class CodeRunner:
         self._kernel = None
 
     def shutdown(self) -> None:
+        """关内核。先等在途的预热收尾，避免与半启动的内核抢 shm（实测会抦 zmq 报
+        ``Bad address``）。
+        """
+        self._kernel_failed = True  # 关掉后不再自动重启
+        self.wait_prewarm(timeout=120)
         if self._kernel is not None:
             self._kernel.shutdown()
             self._kernel = None

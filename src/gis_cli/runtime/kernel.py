@@ -128,6 +128,14 @@ class ArcpyKernel:
         self._started = False
         self._namespace_dirty = False
         self._exec_count = 0
+        #: 执行串行化锁。
+        #:
+        #: **必须**：ZMQ socket 不是线程安全的。预热把内核建在后台线程、
+        #: 主线程随后执行代码时，两边的 socket 操作会交叉写坏 wire 协议。
+        #: 实测症状（可复现）：内核侧报 ``Invalid Signature: b'<IDS|MSG>'``
+        #: / ``DELIM not in msg_list``，客户端侧报 zmq ``Bad address``。
+        #: 锁把"发消息 + 收 iopub/shell + 取结果"整段封起来。
+        self._exec_lock = threading.RLock()
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -174,6 +182,9 @@ class ArcpyKernel:
         """Start the kernel and verify arcpy is importable."""
         if self._started and self.is_alive():
             return
+        from .timing import StageTimer
+
+        _timer = StageTimer("kernel.start")
         self._ensure_kernelspec()
         try:
             from jupyter_client.manager import KernelManager
@@ -206,6 +217,8 @@ class ArcpyKernel:
         if not probe.ok:
             self.shutdown()
             raise KernelError(f"Kernel started but arcpy is unavailable: {probe.error}")
+        # 分解：进程+连接就绪 vs 导入 arcpy（后者是大头，实测十几秒）
+        _timer.done(startup=".", exec_ms=probe.duration_ms)
 
     def _run_prelude(self) -> None:
         self._execute_raw(_PRELUDE, timeout=60)
@@ -323,9 +336,8 @@ class ArcpyKernel:
         """Execute user code in the persistent namespace.
 
         ``set_result(value)`` inside the code is captured and returned.
+        整个“执行 + 取结果”过程是**串行的**（见 ``_exec_lock`` 的说明）。
         """
-        if not self.is_alive():
-            self.start()
         ws = workspace or self.workspace
         prefix = ""
         if ws:
@@ -336,10 +348,16 @@ class ArcpyKernel:
                 "arcpy.env.overwriteOutput = True\n"
             )
         started = time.time()
-        outcome = self._execute_raw(prefix + code, timeout=timeout)
-        outcome.duration_ms = int((time.time() - started) * 1000)
-        if outcome.ok:
-            outcome.result = self._fetch_result()
+        # 整段串行化（发消息→收 iopub→取结果）：ZMQ socket 不是线程安全的，
+        # 与预热线程或另一个 execute 交叉操作会写坏 wire 协议（实测现象：
+        # 内核侧 Invalid Signature / DELIM not in msg_list，客户端 zmq Bad address）。
+        with self._exec_lock:
+            if not self.is_alive():
+                self.start()
+            outcome = self._execute_raw(prefix + code, timeout=timeout)
+            outcome.duration_ms = int((time.time() - started) * 1000)
+            if outcome.ok:
+                outcome.result = self._fetch_result()
         return outcome
 
     def _execute_raw(self, code: str, *, timeout: float) -> ExecResult:

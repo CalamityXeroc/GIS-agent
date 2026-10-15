@@ -113,14 +113,22 @@ def test_start_returns_false_while_busy():
         session.interrupt()
 
 
-def test_guide_injects_while_running():
+def test_guide_queues_while_running_without_touching_current_task():
+    """运行中的追加输入**排队**，不再静默注入当前任务。
+
+    旧行为是 ``loop.inject_user_message``：消息看起来消失了（没有可见反馈），
+    用户会以为没提交成功而重复输入（实测）。改为排队后：立刻有提示，
+    本轮结束后合并成同一个任务继续。
+    """
     loop = FakeLoop(wait_forever=True)
     session = _session(loop)
     session.start("任务")
     assert loop.started.wait(2.0)
     try:
-        assert session.guide("换个方法：先用 Select") is True
-        assert loop.injected == ["换个方法：先用 Select"]
+        assert session.guide("换个方法：先用 Select") is False, "排队返回 False"
+        assert loop.injected == [], "不应再注入当前任务"
+        assert session.queued_count == 1
+        assert "排队" in session.queue_hint()
     finally:
         session.interrupt()
         session.wait(timeout=5.0)

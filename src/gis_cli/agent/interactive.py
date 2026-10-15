@@ -35,7 +35,7 @@ class InteractiveChat:
         no_color: bool = False,
         color: bool = False,
         max_turns: int = 0,
-        refresh_catalog: bool = True,
+        refresh_catalog: bool = False,
         resume_id: str = "",
         continue_last: bool = False,
         prompt_input: Any = None,
@@ -51,7 +51,10 @@ class InteractiveChat:
         # color=None → 自动判定（默认不上色）；True → 强制上色
         self.color: bool | None = True if color else None
         self.max_turns = max_turns
-        self.refresh_catalog = refresh_catalog
+        #: 启动时是否同步扫全数据目录。默认 False：启动不阻塞，
+        #: 改由首个任务开始时后台扫描（见 engine/runner.py 的 prewarmer）。
+        #: 传 True（``--refresh-catalog``）时恢复“启动就扫全”的旧行为。
+        self.force_refresh_catalog = bool(refresh_catalog)
         self.console = ui_theme.make_console(theme_mode, no_color=no_color, color=self.color)
         self.sessions = session_store.SessionStore(self.workspace)
         self.session_id = resume_id or (self.sessions.latest_id() if continue_last else "") or self.sessions.new_id()
@@ -89,12 +92,15 @@ class InteractiveChat:
             if name == "run_end":
                 self._record_finish(payload)
 
-        with self.console.status("[gis.dim]启动引擎（加载数据目录/内核）…[/]"):
+        with self.console.status("[gis.dim]启动引擎（加载配方/配置）…[/]"):
             try:
                 self.bundle = build_engine(
                     workspace=self.workspace,
                     config_path=self.config,
-                    refresh_catalog=self.refresh_catalog,
+                    # 启动**不扫数据目录**：它改由首个任务开始时后台扫描，
+                    # 与首轮模型调用重叠（实测目录扫描曾占启动耗时 158s）。
+                    # 想启动就扫全的用 ``--refresh-catalog``。
+                    refresh_catalog=bool(self.force_refresh_catalog),
                     on_event=_on_event,
                 )
             except Exception as exc:
@@ -121,6 +127,14 @@ class InteractiveChat:
         if name == "run_end":
             self.view.flush()
             return
+        # 流式增量：边到边画（不走 to_unit——那是“一条事件一块”的粒度）
+        if name == "llm_delta":
+            kind = str((payload or {}).get("kind") or "content")
+            self.view.live_delta(kind, str((payload or {}).get("text") or ""))
+            return
+        if name in ("tool_call", "tool_result"):
+            # 工具开始/结束意味着模型这一轮的输出已经完了，收掉实时块
+            self.view.end_live()
         # 转录视图负责分组与样式：连续同工具合并、长文本折叠、思考/答复分块
         self.view.handle(name, payload)
 
@@ -130,15 +144,40 @@ class InteractiveChat:
         self.sessions.append(self.session_id, "assistant", summary[:1200], status=status)
 
     def _on_finish(self, state: Any) -> None:
-        """工作线程里的收尾渲染（patch_stdout 会保证不冲乱输入框）。"""
+        """工作线程里的收尾渲染（patch_stdout 会保证不冲乱输入框）。
+
+        若同时有排队的补充说明，本轮结束后**自动合并继续**（同一任务的后续），
+        不需要用户重新输入。
+        """
         if state is None:
             return
         self.view.flush()
         self.console.print()
         wiring.render_finish(self.console, self.session.tracker, state, trace_path=self.last_trace, show_trace=False)
-        queued = self.session.take_queued() if self.session else []
-        for index, text in enumerate(queued, 1):
-            self.console.print(Text(f"（排队第 {index} 条待执行）{text[:80]}", style="gis.dim"))
+        # 排队的消息 = 同一任务的补充说明 → 合并成一条新任务自动接着做
+        merged = self.session.merged_task("") if self.session else ""
+        if merged.strip():
+            self.console.print(
+                Text(f"（接着处理排队的补充说明，{merged.count(chr(10)) + 1} 行）", style="gis.dim")
+            )
+            self._pending_followup = merged
+
+    def _emit_queued(self, count: int) -> None:
+        """把“已排队”同时推进状态行（事件流）与转录。"""
+        try:
+            self.session.tracker.apply("queued", {"count": count})
+        except Exception:  # pragma: no cover - 状态行只是提示，不影响主流程
+            pass
+        try:
+            self.view.flush()
+        except Exception:
+            pass
+
+    def _take_followup(self) -> str:
+        """取走待自动执行的后续任务（主循环在下一轮开始时调用）。"""
+        text = getattr(self, "_pending_followup", "")
+        self._pending_followup = ""
+        return text
 
     # ------------------------------------------------------------ 命令
 
@@ -522,16 +561,24 @@ class InteractiveChat:
             input=self._prompt_input,
             output=self._prompt_output,
             registry=self._command_registry(),
+            # 流式实时预览（输入框上方）：模型正在生成的思考/回复。
+            # 终端不支持 ANSI 时，rich Live 会满屏乱码，这里改由
+            # prompt_toolkit 重绘（走 Win32 API，conhost 里也正确）。
+            stream_provider=lambda: self.view.live_preview(),
         )
 
         pending_initial = initial_task.strip()
         try:
             while True:
+                # 上一轮结束后若有排队的补充说明 → 直接接着做，不用用户再输入
+                # （回显由 _dispatch 统一负责，这里不再重复打印）
+                followup = self._take_followup()
+                if followup and not (self.session and self.session.busy):
+                    self._dispatch(followup)
+                    continue
                 if pending_initial:
                     text = pending_initial
                     pending_initial = ""
-                    # 命令行给的首条任务不在输入框里出现过 → 这里补一次回显
-                    self._echo_once = True
                 else:
                     busy = bool(self.session and self.session.busy)
                     try:
@@ -553,9 +600,7 @@ class InteractiveChat:
                     if not self._handle_command(text):
                         break
                     continue
-                echo = bool(getattr(self, "_echo_once", False))
-                self._echo_once = False
-                self._dispatch(text, echo=echo)
+                self._dispatch(text)
         finally:
             self._shutdown()
         return 0
@@ -568,30 +613,32 @@ class InteractiveChat:
     def _dispatch(self, text: str, *, echo: bool = False) -> None:
         """派发用户输入。
 
-        ``echo=False``（来自输入框）：不重复打印——输入框那一行本身就是回显，
-        再打一遍会出现 "› ▸ 同样的字"。
+        **总是回显**：输入框提交后会被擦掉（``erase_when_done``），不回显的话
+        滚动转录里就看不到“我刚才说了什么”，也无法确认提交成功（实测用户因此
+        以为没提交而重复输入）。
         """
         assert self.session is not None
-        if echo:
-            self.console.print(ui_render.user_block(text))
-            self.console.print()
+        self.console.print(ui_render.user_block(text))
+        self.console.print()
         self.sessions.append(self.session_id, "user", text)
         if self.session.busy:
-            injected = self.session.guide(text)
-            note = "已注入当前任务（下一轮生效）" if injected else "已排队，当前任务结束后执行"
-            self.console.print(Text(f"（{note}）", style="gis.dim"))
+            # 运行中：排队（不注入当前任务）。合并成同一个任务的补充说明，
+            # 本轮结束后自动接着做 —— 要换任务请开新对话。
+            self.session.guide(text)
+            count = self.session.queued_count
+            # 事件走一遍：状态行（footer）与转录都能看到“已排队”，
+            # 用户就不会以为消息丢了而重复输入。
+            self._emit_queued(count)
+            self.console.print(Text(f"（已排队 {count} 条，本轮结束后合并继续）", style="gis.dim"))
             return
         task = text
         if self.pending_context:
             task = f"{self.pending_context}\n\n本次任务：{text}"
             self.pending_context = ""
-        queued = self.session.take_queued()
-        if queued and queued[0] != text:
-            task = "\n".join(queued) + "\n\n" + task
         started = self.session.start(task)
         if not started:
-            self.console.print(Text("（引擎正忙，已改为排队）", style="gis.warn"))
             self.session.guide(text)
+            self.console.print(Text(f"（{self.session.queue_hint()}）", style="gis.dim"))
 
     # ------------------------------------------------------------ 快捷键
 

@@ -34,6 +34,12 @@ class LoopConfig:
     tool_protocol: str = "auto"
     context_soft_limit_tokens: int = 120_000
     keep_recent_messages: int = 24
+    #: 图片块按固定成本估算 token（不能按 base64 字符串长度算）
+    image_token_cost: int = 1_500
+    #: 压缩滞回：超过软上限后要多出一截才压（避免在阈值上反复抖动）
+    compact_hysteresis: float = 1.2
+    #: 待压缩的消息至少这么多条才值一次 LLM 往返
+    compact_min_messages: int = 8
     max_finish_rejections: int = 3
     verbose: bool = False
     max_diagnosis_turns: int = 3
@@ -68,6 +74,7 @@ class AgentLoop:
         auto_extract_requirements: bool = True,
         use_error_memory: bool = True,
         use_project_log: bool = True,
+        catalog_prewarmer: Any = None,
     ):
         self.workspace = Path(workspace)
         self.llm = llm_client
@@ -83,6 +90,8 @@ class AgentLoop:
         self.auto_extract_requirements = auto_extract_requirements
         self.use_error_memory = use_error_memory
         self.use_project_log = use_project_log
+        #: 数据目录后台预热器（启动不扫时用；``start_prewarm`` 与首轮 LLM 重叠）
+        self.catalog_prewarmer = catalog_prewarmer
         self._hints_seen: list[str] = []
         self._design_notes: list[str] = []
         self._hygiene_warned: set[str] = set()
@@ -126,6 +135,9 @@ class AgentLoop:
 
         # Auto-extract requirements when none were provided (doc -> checklist).
         if not self.state.requirements and self.auto_extract_requirements:
+            # 先给可见反馈再调模型：这一步是一次完整的 LLM 往返（数秒到二十几秒），
+            # 静默时用户会以为提交没成功而重复输入（实测反馈）。
+            self._emit("note", {"text": "正在分析需求…"})
             extracted = self._extract_requirements(goal, doc_paths)
             if extracted:
                 self.state.requirements.extend(extracted)
@@ -147,6 +159,10 @@ class AgentLoop:
             except Exception as exc:
                 logger.warning("code runner reset failed: %s", exc)
 
+        # 数据目录后台扫描：与首轮模型调用重叠（启动时不扫，界面才能立刻可用）。
+        # 先启动再拼 system prompt：摘要里能如实写上“正在扫描”，
+        # 真正的数据由 catalog_query 工具在需要时等扫描完再给。
+        self._start_catalog_prewarm()
         self._messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": self._initial_user_message(goal, doc_paths)},
@@ -185,6 +201,7 @@ class AgentLoop:
                     self.registry.schemas(),
                     task_type=task_type,
                     temperature=0.1,
+                    on_delta=self._on_llm_delta,
                 )
             except Exception as exc:
                 # Gateway/network outage: stop gracefully instead of crashing.
@@ -760,14 +777,46 @@ class AgentLoop:
 
     # ------------------------------------------------------------ compaction
     def _estimate_tokens(self) -> int:
+        """粗略估算对话 token 数（用于决定何时压缩）。
+
+        关键：**图片块必须按固定成本算**，不能把 base64 当文本。
+        实测坑：一张 400KB 的图 base64 后有 53 万字符，旧公式
+        ``len(str(content))//2`` 算出 26.7 万 token（软上限才 12 万）——
+        于是每附一张图就必定触发压缩，而压缩本身又是一次完整 LLM 调用。
+        实测一个 32 轮的 run 里压了 16 次，后半段每轮白多一次往返。
+        视觉 token 由模型侧计，这里只估"有没有图"，量级对就够了。
+        """
         total = 0
+        image_cost = max(1, int(self.config.image_token_cost))
         for message in self._messages:
-            content = message.get("content") or ""
-            total += len(str(content)) // 2
+            content = message.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        total += len(str(part)) // 2
+                        continue
+                    ptype = part.get("type")
+                    if ptype == "image_url":
+                        total += image_cost
+                    elif ptype == "text":
+                        total += len(str(part.get("text") or "")) // 2
+                    else:
+                        total += len(str(part)) // 2
+                continue
+            total += len(str(content or "")) // 2
         return total
 
     def _compact_if_needed(self) -> None:
-        if self._estimate_tokens() < self.config.context_soft_limit_tokens:
+        """上下文超限时压缩早期消息（带滞回与最少条数门槛）。
+
+        滞回的必要性：旧逻辑"超一点就压"，而压缩后 tail 里可能仍超限，
+        于是每轮都压一次（实测连压 16 轮，每轮多一次 LLM 往返）。
+        现在要求超出软上限的一截（``compact_hysteresis``）才动手，
+        且待压缩内容至少有 ``compact_min_messages`` 条——不够就不值一次调用。
+        """
+        estimated = self._estimate_tokens()
+        threshold = self.config.context_soft_limit_tokens
+        if threshold <= 0 or estimated < threshold * max(1.0, self.config.compact_hysteresis):
             return
         keep = self.config.keep_recent_messages
         if len(self._messages) <= keep + 2:
@@ -775,11 +824,18 @@ class AgentLoop:
         head = self._messages[:2]
         middle = self._messages[2:-keep]
         tail = self._messages[-keep:]
+        if len(middle) < max(1, self.config.compact_min_messages):
+            # 没多少可压的：压了也降不下来，白花一次调用
+            return
         summary = self._summarize(middle)
         self._messages = head + [
             {"role": "user", "content": f"[进展摘要（早期轮次已压缩）]\n{summary}"}
         ] + tail
-        self.recorder.record("context_compacted", {"summarized_messages": len(middle)})
+        if self.recorder is not None:
+            self.recorder.record(
+                "context_compacted",
+                {"summarized_messages": len(middle), "estimated_tokens": estimated},
+            )
 
     def _summarize(self, messages: list[dict[str, Any]]) -> str:
         joined = []
@@ -805,10 +861,19 @@ class AgentLoop:
     def _catalog_digest(self) -> str:
         if self.catalog is None:
             return "（未配置数据目录）"
+        scanning = bool(getattr(self.catalog_prewarmer, "busy", False))
         try:
             from ..datacatalog.summary import build_digest
 
-            return build_digest(self.catalog, max_datasets=30, max_fields=24, with_samples=False)
+            digest = build_digest(self.catalog, max_datasets=30, max_fields=24, with_samples=False)
+            if scanning:
+                # 启动不再阻塞扫描：首次运行时目录可能还是空的。
+                # 这里必须讲清楚，否则模型会以为“没有数据”而直接放弃。
+                digest += (
+                    "\n（注：数据目录正在后台扫描中。若上面为空或不全，"
+                    "直接调用 catalog_query 即可——它会等扫描完成再返回真实字段。）"
+                )
+            return digest
         except Exception as exc:
             logger.warning("catalog digest failed: %s", exc)
             return "（数据目录读取失败）"
@@ -857,6 +922,34 @@ class AgentLoop:
             else:
                 safe[key] = value
         return safe
+
+    def _start_catalog_prewarm(self) -> None:
+        """启动后台预热：数据目录扫描 + 内核启动（幂等；无预热器时只起内核）。
+
+        两者都是"用户已经发了任务、但还没用到"的资源：
+        - 目录扫描：与首轮 LLM 调用重叠；
+        - 内核启动（实测 11.6~17.6s，大头是 import arcpy）：与两者重叠，
+          这样第一个 execute_code 到达时内核已经就绪。
+        """
+        if self.catalog_prewarmer is not None:
+            try:
+                if self.catalog_prewarmer.start():
+                    self._emit("catalog_scan", {"state": "started"})
+                    self.recorder and self.recorder.record("catalog_scan", {"state": "started"})
+            except Exception as exc:  # pragma: no cover - 扫描失败不影响任务
+                logger.warning("catalog prewarm start failed: %s", exc)
+        if self.code_runner is not None and hasattr(self.code_runner, "prewarm"):
+            try:
+                self.code_runner.prewarm()
+            except Exception as exc:  # pragma: no cover - 预热失败不影响任务
+                logger.debug("kernel prewarm failed: %s", exc)
+
+    def _on_llm_delta(self, kind: str, text: str) -> None:
+        """模型流式增量 → 界面事件（``llm_delta``）。
+
+        只转发，不做任何决策；界面不在时（基准/单测）开销就是一次函数调用。
+        """
+        self._emit("llm_delta", {"kind": kind, "text": text})
 
     def _emit(self, event: str, payload: dict[str, Any]) -> None:
         if self.on_event:
@@ -920,6 +1013,7 @@ class AgentLoop:
                     self.registry.schemas(),
                     task_type="agent",
                     temperature=0.1,
+                    on_delta=self._on_llm_delta,
                 )
             except Exception as exc:
                 self.state.status = "llm_unavailable"

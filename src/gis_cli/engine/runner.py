@@ -28,6 +28,8 @@ class EngineBundle:
     verifier: Verifier
     context: EngineContext
     workspace: Path
+    #: 数据目录后台预热器（``None`` = 启动时已同步扫完）
+    prewarmer: Any = None
 
     def close(self) -> None:
         try:
@@ -78,7 +80,9 @@ def build_engine(
     from ..datacatalog.store import Catalog
     from ..recipes.store import RecipeLibrary
     from ..runtime.code_runner import CodeRunner
+    from ..runtime.timing import StageTimer
 
+    _total = StageTimer("build_engine.total")
     ws = Path(workspace)
     state_dir = ws / ".gis_agent"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -95,12 +99,14 @@ def build_engine(
         state_dir=state_dir / "kernel",
         exec_timeout=float(engine_cfg.get("kernel_exec_timeout_seconds", 600)),
     )
+    _recipes_timer = StageTimer("recipes.load")
     recipes = RecipeLibrary(
         user_dir=ws / "recipes",
         code_runner=code_runner,
         catalog=catalog,
     )
     recipes.load()
+    _recipes_timer.done(count=len(recipes.all()))
     verifier = Verifier(
         workspace=ws,
         code_runner=code_runner,
@@ -128,11 +134,23 @@ def build_engine(
         exec_timeout=float(engine_cfg.get("kernel_exec_timeout_seconds", 600)),
         tool_protocol=str(engine_cfg.get("tool_protocol", "auto")),
         context_soft_limit_tokens=int(engine_cfg.get("context_soft_limit_tokens", 120_000)),
+        image_token_cost=int(engine_cfg.get("image_token_cost", 1_500)),
+        compact_hysteresis=float(engine_cfg.get("compact_hysteresis", 1.2)),
+        compact_min_messages=int(engine_cfg.get("compact_min_messages", 8)),
         max_diagnosis_turns=int(engine_cfg.get("exploration_turn_budget", 3)),
         escalate_after_failures=int(engine_cfg.get("escalate_after_failures", 2)),
         run_deadline_seconds=float(engine_cfg.get("run_deadline_seconds", 7200)),
         verbose=verbose,
     )
+
+    # 数据目录后台预热器：``refresh_catalog=False``（启动不阻塞）时用它，
+    # 与首轮模型调用重叠；``catalog_query`` 首次用到目录时会等它完成。
+    from ..datacatalog.prewarm import CatalogPrewarmer
+
+    prewarmer: Any = None
+    if not refresh_catalog:
+        prewarmer = CatalogPrewarmer(catalog=catalog, code_runner=code_runner, workspace=ws)
+        context.extra["prewarmer"] = prewarmer
 
     loop = AgentLoop(
         workspace=ws,
@@ -146,6 +164,7 @@ def build_engine(
         config=loop_config,
         on_event=on_event,
         auto_extract_requirements=bool(engine_cfg.get("auto_extract_requirements", True)),
+        catalog_prewarmer=prewarmer,
     )
     context.state = loop.state  # updated per run in loop.run
 
@@ -158,16 +177,30 @@ def build_engine(
         verifier=verifier,
         context=context,
         workspace=ws,
+        prewarmer=prewarmer,
     )
 
     if refresh_catalog:
+        timer = StageTimer("catalog.refresh")
         try:
             existing_roots = _candidate_data_roots(ws)
             if existing_roots:
                 stats = do_refresh(catalog, existing_roots, code_runner, force=False)
                 logger.info("catalog refreshed: %s", stats)
+                timer.done(
+                    discovered=stats.discovered,
+                    scanned=stats.scanned,
+                    skipped=stats.skipped,
+                )
+            else:
+                timer.done(roots=0)
         except Exception as exc:
+            timer.done(error=str(exc)[:60])
             logger.warning("catalog refresh failed (continuing): %s", exc)
+        _total.done(refresh=True)
+        return bundle
+
+    _total.done(refresh=False, prewarm="deferred")
     return bundle
 
 

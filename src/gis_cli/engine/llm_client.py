@@ -100,6 +100,14 @@ class EngineLLMConfig:
     # 思考档位（reasoning_effort）。实测部分推理模型默认**不返回** reasoning_content，
     # 必须显式传该字段才有思考内容；空串 = 不传（兼容不支持它的网关）。
     reasoning_effort: str = ""
+    #: 按任务类型覆盖思考档位，如 ``{"agent": "low", "planning": "medium"}``。
+    #: 实测（deepseek-v4.1-flash-intl）交互轮换 low：首字 5.11s→2.37s、
+    #: 总耗时 8.72s→5.80s，而输出质量相当；规划/验收这类“想清楚更重要”的
+    #: 环节保持默认档位。空字典 = 全部用 reasoning_effort。
+    reasoning_effort_by_task: dict[str, str] = field(default_factory=dict)
+    # 流式输出：模型边生成边把正文/思考推给界面（用户不必盯着空屏等整段跑完）。
+    # 组装后的返回值与非流式完全一致，调用方无感；网关不支持时自动降级。
+    stream: bool = True
 
     @classmethod
     def from_file(cls, path: str | Path) -> "EngineLLMConfig":
@@ -121,6 +129,12 @@ class EngineLLMConfig:
             reasoning_effort=str(
                 engine.get("reasoning_effort", data.get("reasoning_effort", "")) or ""
             ).strip(),
+            reasoning_effort_by_task={
+                str(k).strip().lower(): str(v).strip()
+                for k, v in (engine.get("reasoning_effort_by_task", {}) or {}).items()
+                if str(v).strip()
+            },
+            stream=bool(engine.get("stream", data.get("stream", True))),
             http_keepalive=bool(data.get("http_keepalive", engine.get("http_keepalive", True))),
             fallback_models=[str(m) for m in data.get("fallback_models", []) if str(m).strip()],
             model_failure_threshold=int(engine.get("model_failure_threshold", data.get("model_failure_threshold", 2))),
@@ -135,6 +149,15 @@ class EngineLLMConfig:
             backoff_seconds=float(engine.get("request_backoff_seconds", 8.0)),
             max_backoff_seconds=float(engine.get("request_max_backoff_seconds", 90.0)),
         )
+
+    def effort_for(self, task_type: str | None = None) -> str:
+        """该任务类型的思考档位（按任务覆盖优先，否则用全局值）。"""
+        key = (task_type or "").strip().lower()
+        if key:
+            override = self.reasoning_effort_by_task.get(key)
+            if override:
+                return override
+        return (self.reasoning_effort or "").strip()
 
     def models_for(self, task_type: str | None = None, explicit: str | None = None) -> list[str]:
         """Return ordered candidate models for a task type."""
@@ -159,6 +182,84 @@ class EngineLLMConfig:
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
+class _StreamUnsupported(RuntimeError):
+    """上游不真的支持流式（忽略 stream 参数或直接报错）——内部的回退信号。"""
+
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+def _usage_dict(raw_usage: Any) -> dict[str, int]:
+    """把 SDK 的 usage 对象转成 dict（多取前缀缓存字段，供缓存命中率统计）。"""
+    out: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        try:
+            out[key] = int(getattr(raw_usage, key, 0) or 0)
+        except Exception:
+            out[key] = 0
+    for key in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "cached_tokens"):
+        value = getattr(raw_usage, key, None)
+        if value is not None:
+            try:
+                out[key] = int(value)
+            except Exception:
+                pass
+    return out
+
+
+def _looks_like_complete_response(obj: Any) -> bool:
+    """判断上游给的是"完整响应"而不是 chunk 迭代器。
+
+    为什么要显式判：SDK 的响应对象是 pydantic 模型（带 ``__iter__``），
+    拿它去 ``for`` 会迭代出字段元组，看起来"有值"但绝不是 chunk；
+    以前这种误判会静默地组出一个空回答。
+    """
+    if obj is None:
+        return False
+    # 迭代器/生成器就是我们要的流
+    if hasattr(obj, "__next__"):
+        return False
+    # 已解析的完整响应：有 choices 且首个 choice 带 message（而非 delta）
+    choices = getattr(obj, "choices", None)
+    if choices:
+        first = choices[0]
+        if hasattr(first, "message"):
+            return True
+        if hasattr(first, "delta"):
+            return False
+    # 没法判断时：能当迭代用就当流
+    return not hasattr(obj, "__iter__")
+
+
+def _emit_delta(on_delta: Any, kind: str, text: str) -> None:
+    """回调界面（异常一律吞掉：渲染绝不能把模型调用搞挂）。"""
+    if on_delta is None:
+        return
+    try:
+        on_delta(kind, text)
+    except Exception:  # pragma: no cover - 渲染层问题不影响请求
+        pass
+
+
+def _timing_suffix(response: Any) -> str:
+    """日志后缀：token 用量、是否流式、首字之前的等待看不见就写总量。"""
+    try:
+        usage = getattr(response, "usage", None) or {}
+        if not isinstance(usage, dict):
+            usage = {}
+        raw = getattr(response, "raw", None) or {}
+        bits = [f"in={usage.get('prompt_tokens', 0)}", f"out={usage.get('completion_tokens', 0)}"]
+        cached = usage.get("prompt_cache_hit_tokens") or usage.get("cached_tokens") or 0
+        if cached:
+            bits.append(f"cached={cached}")
+        if isinstance(raw, dict) and raw.get("streamed"):
+            bits.append(f"chars={raw.get('emitted_chars', 0)}")
+        return "  " + " ".join(bits)
+    except Exception:  # pragma: no cover
+        return ""
+
+
 class EngineLLMClient:
     """Single-flight, retrying chat client with tool-calling support."""
 
@@ -170,6 +271,8 @@ class EngineLLMClient:
         self._consecutive_429 = 0
         #: 上游拒过图（400）后置位：调用方据此不再附图，省下每轮的无效请求
         self.vision_rejected = False
+        #: 上游不吃流式（代理忽略 stream 或直接报错）后置位：后续一律走非流式
+        self._stream_unsupported = False
         self._failures: dict[str, int] = {}
         self._cooldown_until: dict[str, float] = {}
         self._cooldown_strikes: dict[str, int] = {}
@@ -215,8 +318,13 @@ class EngineLLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
+        on_delta: Any = None,
     ) -> LLMResponse:
         """Send a chat completion, retrying transient failures.
+
+        ``on_delta(kind, text)`` 在流式模式下被逐块调用（``kind`` 为
+        ``"content"``/``"reasoning"``），供界面边生成边显示；不传则静默累积。
+        **返回值与非流式逐字段一致**，调用方无需关心是否流式。
 
         Raises ``LLMError`` when every candidate model has been exhausted.
         """
@@ -238,6 +346,8 @@ class EngineLLMClient:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
+                    on_delta=on_delta,
+                    task_type=task_type,
                 )
                 self._record_success(candidate)
                 return response
@@ -306,6 +416,8 @@ class EngineLLMClient:
         temperature: float | None,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
+        on_delta: Any = None,
+        task_type: str | None = None,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": model,
@@ -318,10 +430,11 @@ class EngineLLMClient:
             payload["tool_choice"] = tool_choice or "auto"
         if response_format:
             payload["response_format"] = response_format
-        if self.config.reasoning_effort:
+        effort = self.config.effort_for(task_type)
+        if effort:
             # 走 extra_body 而不是顶层：OpenAI SDK 对未知顶层字段会直接拒绝，
             # 而各家 OpenAI 兼容网关都从 body 里读这个字段。
-            payload["extra_body"] = {"reasoning_effort": self.config.reasoning_effort}
+            payload["extra_body"] = {"reasoning_effort": effort}
 
         last_error: Exception | None = None
         conn_failures = 0
@@ -339,11 +452,39 @@ class EngineLLMClient:
                 break
             with self._semaphore:
                 try:
-                    response = self.client.chat.completions.create(
-                        **payload, timeout=max(30.0, remaining_budget)
-                    )
+                    started = time.perf_counter()
+                    if self.config.stream and not self._stream_unsupported:
+                        try:
+                            response = self._stream_once(
+                                payload, model, deadline=deadline, on_delta=on_delta
+                            )
+                        except _StreamUnsupported as exc:
+                            # 网关不支持流式（有些代理直接忽略 stream 参数或报错）：
+                            # 关掉后续流式尝试，本回合用非流式重来一次。
+                            self._stream_unsupported = True
+                            logger.info(
+                                "上游不支持流式（%s），改用非流式：%s",
+                                getattr(exc, "status", None),
+                                str(exc)[:160],
+                            )
+                            continue
+                    else:
+                        response = self._normalize(
+                            self.client.chat.completions.create(
+                                **payload, timeout=max(30.0, remaining_budget)
+                            ),
+                            model,
+                        )
                     self._consecutive_429 = 0
-                    return self._normalize(response, model)
+                    logger.info(
+                        "[timing] llm.%-18s %7.2fs%s",
+                        getattr(response, "model", model),
+                        time.perf_counter() - started,
+                        _timing_suffix(response),
+                    )
+                    return response
+                except LLMError:
+                    raise
                 except Exception as exc:  # provider-specific exception types
                     status = _status_code(exc)
                     body = _error_body(exc)
@@ -361,6 +502,15 @@ class EngineLLMClient:
                             self.vision_rejected = True
                             logger.warning(
                                 "上游拒绝图片（%s），已摘掉图片重试：%s", status, (body or "")[:160]
+                            )
+                            continue
+                        # 网关直接拒 stream 参数（400/422）时不能让任务死：
+                        # 关掉流式并用同一个模型重试一次（非流式语义完全一样，
+                        # 只是拿不到逐字输出）。
+                        if self.config.stream and not self._stream_unsupported:
+                            self._stream_unsupported = True
+                            logger.warning(
+                                "上游拒绝流式（%s），改用非流式重试：%s", status, (body or "")[:160]
                             )
                             continue
                         raise LLMError(
@@ -396,6 +546,115 @@ class EngineLLMClient:
             body=_error_body(last_error),
         )
 
+    # ------------------------------------------------------------------ 流式
+    def _stream_once(
+        self,
+        payload: dict[str, Any],
+        model: str,
+        *,
+        deadline: float,
+        on_delta: Any = None,
+    ) -> LLMResponse:
+        """流式请求，边收边回调，最终组装成与非流式等价的 LLMResponse。
+
+        兼容要点（实测 workbuddy 反代 / CodeBuddy 上游）：
+        - ``delta.content`` / ``delta.reasoning_content`` 逐块到达；
+        - ``delta.tool_calls`` 分片：首块带 ``id``/``name``，后续块只补 ``arguments``
+          片段且可能不带 ``index`` 以外字段 —— 必须按 ``index`` 累积拼接；
+        - ``usage`` 只出现在末尾那个 chunk（有时只在 ``[DONE]`` 前最后一个）。
+
+        上游忽略 ``stream`` 参数（当成非流式返回）时抬 ``_StreamUnsupported``，
+        由调用方回退到非流式重试。
+        """
+        remaining = max(30.0, deadline - time.monotonic())
+        stream = self.client.chat.completions.create(
+            **payload, stream=True, timeout=remaining
+        )
+
+        if _looks_like_complete_response(stream):
+            # 上游把 stream 参数忽略了，直接返回完整响应。
+            # 这里必须显式识别：SDK 的响应对象是 pydantic 模型，带 __iter__，
+            # 直接 for 循环会静默地迭代出 (字段名, 值) 元组而不是 chunk。
+            # 既然完整结果已经拿到，就按非流式处理（不再多发一次请求）。
+            self._stream_unsupported = True
+            logger.info("上游忽略了 stream 参数（返回完整响应），按非流式处理")
+            return self._normalize(stream, model)
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        # index -> {id, name, arguments}；arguments 是分片拼起来的字符串
+        calls: dict[int, dict[str, str]] = {}
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+        emitted = 0
+        saw_chunk = False
+        for chunk in stream:
+            saw_chunk = True
+            raw_usage = getattr(chunk, "usage", None)
+            if raw_usage is not None:
+                usage = _usage_dict(raw_usage)
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if getattr(choice, "finish_reason", None):
+                finish_reason = str(choice.finish_reason)
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            text = getattr(delta, "content", None)
+            if text:
+                content_parts.append(str(text))
+                emitted += len(str(text))
+                _emit_delta(on_delta, "content", str(text))
+            think = getattr(delta, "reasoning_content", None)
+            if think:
+                reasoning_parts.append(str(think))
+                emitted += len(str(think))
+                _emit_delta(on_delta, "reasoning", str(think))
+            for raw_call in getattr(delta, "tool_calls", None) or []:
+                index = int(getattr(raw_call, "index", 0) or 0)
+                slot = calls.setdefault(
+                    index, {"id": "", "name": "", "arguments": ""}
+                )
+                call_id = getattr(raw_call, "id", None)
+                if call_id:
+                    slot["id"] = str(call_id)
+                fn = getattr(raw_call, "function", None)
+                if fn is not None:
+                    name = getattr(fn, "name", None)
+                    if name:
+                        slot["name"] = str(name)
+                    args = getattr(fn, "arguments", None)
+                    if args:
+                        slot["arguments"] += str(args)
+        if not saw_chunk:
+            # 一个 chunk 都没收到：上游可能把 stream 忽略了。交给非流式重试。
+            raise _StreamUnsupported("stream returned no chunks (upstream may ignore 'stream')")
+
+        tool_calls: list[ToolCall] = []
+        for index in sorted(calls):
+            slot = calls[index]
+            args, parse_error = _parse_arguments(slot["arguments"])
+            tool_calls.append(
+                ToolCall(
+                    id=slot["id"] or f"call_{index}",
+                    name=slot["name"],
+                    arguments=args,
+                    raw_arguments=slot["arguments"],
+                    parse_error=parse_error,
+                )
+            )
+        return LLMResponse(
+            content="".join(content_parts),
+            reasoning="".join(reasoning_parts),
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+            model=model,
+            raw={"streamed": True, "emitted_chars": emitted},
+        )
+
     def _backoff_delay(self, attempt: int, status: int | None) -> float:
         if status == 429:
             # Gateways with a hard concurrency cap need patient backoff.
@@ -427,13 +686,9 @@ class EngineLLMClient:
                 )
             )
         usage_obj = getattr(response, "usage", None)
-        usage = {}
+        usage: dict[str, int] = {}
         if usage_obj is not None:
-            usage = {
-                "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
-                "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
-                "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
-            }
+            usage = _usage_dict(usage_obj)
         return LLMResponse(
             content=content,
             reasoning=reasoning,

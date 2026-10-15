@@ -1,87 +1,77 @@
 @echo off
-chcp 65001 >nul 2>&1
-title GIS Agent Launcher
+REM GIS Agent Launcher (ArcGIS Pro 3.6)
+REM NOTE: keep this file ASCII-only. cmd.exe parses .bat in the ANSI codepage,
+REM       so Chinese comments here can break parsing (verified).
+REM       All user-facing text lives in scripts/check_install.py and the agent.
 
-setlocal
-cd /d "%~dp0"
+setlocal enabledelayedexpansion
+
+title GIS Agent (ArcGIS Pro 3.6)
 
 echo.
 echo ========================================
 echo   GIS Agent Launcher
-echo   Ready-to-use Workspace Mode
+echo   ArcGIS Pro 3.6 Python Runtime
 echo ========================================
 echo.
 
 set "PYTHON_PATH=E:\ArcGISPro3.6\bin\Python\envs\arcgispro-py3\python.exe"
+set "REPO_ROOT=%~dp0"
+if "%REPO_ROOT:~-1%"=="\" set "REPO_ROOT=%REPO_ROOT:~0,-1%"
 
 if not exist "%PYTHON_PATH%" (
-    echo [WARN] ArcGIS Pro Python not found, trying system Python...
-    for %%I in (python.exe) do set "PYTHON_PATH=%%~$PATH:I"
-    if "%PYTHON_PATH%"=="" (
-        echo [ERROR] No Python runtime available.
-        echo Please install Python 3.10+ or ArcGIS Pro Python.
-        pause
-        exit /b 1
-    )
-)
-
-echo [√] Python: %PYTHON_PATH%
-echo.
-
-:: 初始化工作空间目录（开箱即用）
-if not exist "workspace" mkdir "workspace"
-if not exist "workspace\input" mkdir "workspace\input"
-if not exist "workspace\output" mkdir "workspace\output"
-if not exist "workspace\temp" mkdir "workspace\temp"
-if not exist "workspace\skills" mkdir "workspace\skills"
-
-:: 引导用户准备本地 llm 配置
-if not exist "config\llm_config.json" (
-    if exist "config\llm_config.example.json" (
-        copy /Y "config\llm_config.example.json" "config\llm_config.json" >nul
-        echo [INFO] Generated config\llm_config.json from template.
-        echo [INFO] Please fill your API key before using online LLM.
-    )
-)
-
-:: 检查 openai 包
-"%PYTHON_PATH%" -c "import openai" >nul 2>&1
-if errorlevel 1 (
-    echo [INFO] Installing openai package...
-    "%PYTHON_PATH%" -m pip install openai --quiet
-)
-
-:: 检查 litellm 包（统一模型路由必需）
-"%PYTHON_PATH%" -c "import litellm" >nul 2>&1
-if errorlevel 1 (
-    echo [INFO] Installing litellm package...
-    "%PYTHON_PATH%" -m pip install litellm --quiet
-)
-
-:: 检查 yaml/jupyter 包（配方解析与 ArcPy 持久内核）
-"%PYTHON_PATH%" -c "import yaml" >nul 2>&1
-if errorlevel 1 (
-    echo [INFO] Installing PyYAML package...
-    "%PYTHON_PATH%" -m pip install PyYAML --quiet
-)
-"%PYTHON_PATH%" -c "import jupyter_client" >nul 2>&1
-if errorlevel 1 (
-    echo [INFO] Installing jupyter-client package...
-    "%PYTHON_PATH%" -m pip install jupyter-client --quiet
-)
-
-:: 每次启动都同步本地源码，避免运行到旧版本已安装包
-echo [INFO] Syncing local gis_cli package (editable install)...
-"%PYTHON_PATH%" -m pip install -e . --quiet
-if errorlevel 1 (
-    echo [ERROR] Package sync failed
+    echo [ERROR] ArcGIS Pro Python not found
+    echo Path: %PYTHON_PATH%
     echo.
-    echo Please run manually:
-    echo   "%PYTHON_PATH%" -m pip install -e .
+    echo Please run install.bat first.
     pause
     exit /b 1
 )
-echo [OK] Local package synced
+
+echo [OK] Python: %PYTHON_PATH%
+echo.
+
+REM ---------------------------------------------------------------------------
+REM Install check: only run "pip install -e ." when it is actually needed.
+REM
+REM An editable install just drops a .pth file into site-packages pointing at
+REM this repo's src\, so source changes take effect automatically. Re-running
+REM pip on every launch re-resolves the whole dependency tree (langchain,
+REM chromadb, litellm ...) and took tens of seconds to minutes.
+REM Decision logic lives in scripts\check_install.py:
+REM   - .pth missing
+REM   - .pth points somewhere else
+REM   - pyproject.toml newer than the .pth (deps may have changed)
+REM Force a reinstall with:  REINSTALL=1 一键启动.bat   (see REINSTALL_FLAG below)
+set "REINSTALL_FLAG="
+if "%REINSTALL%"=="1" set "REINSTALL_FLAG=--reinstall"
+REM ---------------------------------------------------------------------------
+"%PYTHON_PATH%" "%REPO_ROOT%\scripts\check_install.py" --repo "%REPO_ROOT%" --quiet %REINSTALL_FLAG%
+if errorlevel 1 (
+    echo [INFO] Installing / updating gis_cli package...
+    "%PYTHON_PATH%" -m pip install -e "%REPO_ROOT%" --quiet
+    if errorlevel 1 (
+        echo [ERROR] Package install failed
+        echo.
+        echo Please run manually:
+        echo   "%PYTHON_PATH%" -m pip install -e .
+        pause
+        exit /b 1
+    )
+    echo [OK] Package installed
+) else (
+    echo [OK] Package ready ^(editable install, source changes auto-apply^)
+)
+echo.
+
+REM Optional-dependency guard: a missing package silently degrades the agent
+REM (kernel falls back to one-shot subprocess, no input box), so install it.
+REM Only "import" is checked - takes well under a second.
+call :ensure openai "openai"
+call :ensure prompt_toolkit "prompt-toolkit>=3.0.43"
+call :ensure jupyter_client "jupyter-client>=8.0.0"
+call :ensure PIL "pillow>=10.0.0"
+call :ensure numpy "numpy>=1.26"
 echo.
 
 echo Starting GIS Agent...
@@ -89,23 +79,32 @@ echo.
 echo ----------------------------------------
 echo Notes:
 echo   - Put input data into workspace\input\
-echo   - Results will be written to workspace\output\
-echo   - Type 'exit' to quit
+echo   - Type /help for commands, Esc to interrupt
+echo   - Use --continue to resume the last session
+echo   - While running: type to queue a follow-up, merged into the same task
 echo ----------------------------------------
 echo.
 
-if "%~1"=="loop" (
-    :: 引擎模式：一键启动.bat loop "任务描述"
-    shift
-    "%PYTHON_PATH%" -m gis_cli.agent.cli loop %* --workspace ".\workspace"
-) else (
-    "%PYTHON_PATH%" -m gis_cli.agent.cli chat --workspace ".\workspace"
-)
+"%PYTHON_PATH%" -m gis_cli.agent.cli chat --workspace "%REPO_ROOT%\workspace" %*
 
 if errorlevel 1 (
     echo.
     echo [ERROR] Startup failed
     pause
 )
-
 endlocal
+exit /b 0
+
+REM --- subroutine: install a package only if its import is missing -----------
+:ensure
+"%PYTHON_PATH%" -c "import %~1" >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] Installing %~2 ...
+    "%PYTHON_PATH%" -m pip install %~2 --quiet
+    if errorlevel 1 (
+        echo [WARN] Could not install %~2 (startup continues, related feature degrades)
+    ) else (
+        echo [OK] %~2 installed
+    )
+)
+exit /b 0

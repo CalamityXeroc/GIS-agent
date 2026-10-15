@@ -361,3 +361,329 @@ def test_repeat_offender_gets_reduced_attempt_budget(monkeypatch):
     second = seen.get("timeout")
     assert first and second and second < first, (first, second)
     assert second <= 60.0, second
+
+
+# --------------------------------------------------------------------- 流式
+class _Delta:
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class _Choice:
+    def __init__(self, delta=None, finish_reason=None):
+        self.delta = delta
+        self.finish_reason = finish_reason
+
+
+class _Chunk:
+    def __init__(self, delta=None, finish_reason=None, usage=None, choices=True):
+        self.choices = [_Choice(delta, finish_reason)] if choices else []
+        self.usage = usage
+
+
+class _Usage:
+    prompt_tokens = 11
+    completion_tokens = 7
+    total_tokens = 18
+    prompt_cache_hit_tokens = 5
+
+
+class _Fn:
+    def __init__(self, name=None, arguments=None):
+        self.name = name
+        self.arguments = arguments
+
+
+class _ToolCallDelta:
+    def __init__(self, index=0, id=None, function=None):
+        self.index = index
+        self.id = id
+        self.function = function
+
+
+def _stream_client(chunks):
+    """构造一个假的流式网关：调用 create 时按 chunks 逐块吐出。"""
+
+    class _Completions:
+        def create(self, **kwargs):
+            return iter(chunks)
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    cfg = EngineLLMConfig(model="m", api_key="x", stream=True)
+    client = EngineLLMClient(cfg)
+    client._client = _Client()
+    return client
+
+
+def _nonstream_client(response_obj):
+    class _Completions:
+        def create(self, **kwargs):
+            return response_obj
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    cfg = EngineLLMConfig(model="m", api_key="x", stream=False)
+    client = EngineLLMClient(cfg)
+    client._client = _Client()
+    return client
+
+
+def test_streaming_assembles_content_and_reasoning():
+    """正文与思考分片按序拼装，usage 取自末尾 chunk。"""
+    chunks = [
+        _Chunk(_Delta(reasoning_content="Let me ")),
+        _Chunk(_Delta(reasoning_content="think.")),
+        _Chunk(_Delta(content="北京")),
+        _Chunk(_Delta(content="市")),
+        _Chunk(_Delta(), finish_reason="stop", usage=_Usage()),
+    ]
+    seen: list[tuple[str, str]] = []
+    client = _stream_client(chunks)
+    response = client.chat(
+        [{"role": "user", "content": "hi"}], on_delta=lambda k, t: seen.append((k, t))
+    )
+    assert response.content == "北京市"
+    assert response.reasoning == "Let me think."
+    assert response.finish_reason == "stop"
+    assert response.usage["total_tokens"] == 18
+    # 增量按到达顺序回调，思考在前
+    assert seen == [
+        ("reasoning", "Let me "),
+        ("reasoning", "think."),
+        ("content", "北京"),
+        ("content", "市"),
+    ]
+
+
+def test_streaming_tool_calls_fragments_merge():
+    """tool_calls 分片：首块带 id/name，后续只补 arguments 片段。"""
+    chunks = [
+        _Chunk(_Delta(tool_calls=[_ToolCallDelta(0, id="call_1", function=_Fn("catalog_query", ""))])),
+        _Chunk(_Delta(tool_calls=[_ToolCallDelta(0, function=_Fn(None, '{"que'))])),
+        _Chunk(_Delta(tool_calls=[_ToolCallDelta(0, function=_Fn(None, 'ry": "北京"}'))])),
+        _Chunk(_Delta(), finish_reason="tool_calls", usage=_Usage()),
+    ]
+    client = _stream_client(chunks)
+    response = client.chat([{"role": "user", "content": "hi"}])
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.id == "call_1"
+    assert call.name == "catalog_query"
+    assert call.arguments == {"query": "北京"}
+    assert call.parse_error == ""
+
+
+def test_streaming_multiple_tool_calls_by_index():
+    """多个并行工具调用按 index 各自累积，不串味。"""
+    chunks = [
+        _Chunk(_Delta(tool_calls=[
+            _ToolCallDelta(0, id="a", function=_Fn("t1", '{"x":1}')),
+            _ToolCallDelta(1, id="b", function=_Fn("t2", '{"y":')),
+        ])),
+        _Chunk(_Delta(tool_calls=[_ToolCallDelta(1, function=_Fn(None, "2}"))])),
+        _Chunk(_Delta(), finish_reason="tool_calls", usage=_Usage()),
+    ]
+    client = _stream_client(chunks)
+    response = client.chat([{"role": "user", "content": "hi"}])
+    assert [c.name for c in response.tool_calls] == ["t1", "t2"]
+    assert response.tool_calls[0].arguments == {"x": 1}
+    assert response.tool_calls[1].arguments == {"y": 2}
+
+
+def test_streaming_matches_nonstream_fields():
+    """同一份内容：流式组装结果与非流式逐字段等价（调用方无感）。"""
+    class _Msg:
+        content = "北京市"
+        reasoning_content = "Let me think."
+        tool_calls = None
+
+    class _RespChoice:
+        message = _Msg()
+        finish_reason = "stop"
+
+    class _Resp:
+        choices = [_RespChoice()]
+        usage = _Usage()
+
+    chunks = [
+        _Chunk(_Delta(reasoning_content="Let me ")),
+        _Chunk(_Delta(reasoning_content="think.")),
+        _Chunk(_Delta(content="北京")),
+        _Chunk(_Delta(content="市")),
+        _Chunk(_Delta(), finish_reason="stop", usage=_Usage()),
+    ]
+    streamed = _stream_client(chunks).chat([{"role": "user", "content": "hi"}])
+    plain = _nonstream_client(_Resp()).chat([{"role": "user", "content": "hi"}])
+    assert streamed.content == plain.content
+    assert streamed.reasoning == plain.reasoning
+    assert streamed.finish_reason == plain.finish_reason
+    assert streamed.usage == plain.usage
+    assert len(streamed.tool_calls) == len(plain.tool_calls) == 0
+
+
+def test_stream_ignored_by_gateway_falls_back_to_nonstream():
+    """上游忽略 stream（返回空块流）→ 自动降级为非流式，任务不断。"""
+    class _Msg:
+        content = "非流式回答"
+        reasoning_content = ""
+        tool_calls = None
+
+    class _RespChoice:
+        message = _Msg()
+        finish_reason = "stop"
+
+    class _Resp:
+        choices = [_RespChoice()]
+        usage = _Usage()
+
+    calls: list[dict] = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if kwargs.get("stream"):
+                return iter([])  # 假装忽略了 stream 参数
+            return _Resp()
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    cfg = EngineLLMConfig(model="m", api_key="x", stream=True, retry_count=2)
+    client = EngineLLMClient(cfg)
+    client._client = _Client()
+    response = client.chat([{"role": "user", "content": "hi"}])
+    assert response.content == "非流式回答"
+    assert client._stream_unsupported is True
+    # 先试了流式，再回落非流式
+    assert [bool(c.get("stream")) for c in calls] == [True, False]
+
+
+def test_stream_disabled_never_requests_stream():
+    """配置关掉流式时请求里不带 stream=True。"""
+
+    class _Msg:
+        content = "x"
+        reasoning_content = ""
+        tool_calls = None
+
+    class _RespChoice:
+        message = _Msg()
+        finish_reason = "stop"
+
+    class _Resp:
+        choices = [_RespChoice()]
+        usage = _Usage()
+
+    plain = _nonstream_client(_Resp())
+    seen: dict = {}
+
+    class _Completions:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return _Resp()
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    plain._client = _Client()
+    plain.chat([{"role": "user", "content": "hi"}])
+    assert not seen.get("stream"), seen
+
+
+# ------------------------------------------------- 思考档位（按任务类型）
+
+
+def test_effort_per_task_type_overrides_global():
+    """按任务类型覆盖思考档位：交互轮用低档，规划/验收保持默认。
+
+    实测（deepseek-v4.1-flash-intl）交互轮换 low：首字 5.11s→2.37s、
+    总耗时 8.72s→5.80s，输出质量相当。
+    """
+    cfg = EngineLLMConfig(
+        model="m",
+        reasoning_effort="medium",
+        reasoning_effort_by_task={"agent": "low", "verify": "high"},
+    )
+    assert cfg.effort_for("agent") == "low"
+    assert cfg.effort_for("AGENT") == "low"  # 大小写不敏感
+    assert cfg.effort_for("verify") == "high"
+    assert cfg.effort_for("planning") == "medium"  # 没覆盖 → 全局
+    assert cfg.effort_for(None) == "medium"
+    assert cfg.effort_for("") == "medium"
+
+
+def test_effort_by_task_read_from_config_file(tmp_path):
+    """engine.reasoning_effort_by_task 能从配置文件读出来。"""
+    import json
+
+    path = tmp_path / "llm_config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "model": "m",
+                "api_key": "k",
+                "engine": {
+                    "reasoning_effort": "medium",
+                    "reasoning_effort_by_task": {"agent": "low"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = EngineLLMConfig.from_file(path)
+    assert cfg.effort_for("agent") == "low"
+    assert cfg.effort_for("planning") == "medium"
+
+
+def test_effort_by_task_empty_means_global_everywhere():
+    """没配分档时所有任务都走全局值（默认行为不变）。"""
+    cfg = EngineLLMConfig(model="m", reasoning_effort="high")
+    assert cfg.effort_for("agent") == "high"
+    assert cfg.effort_for("verify") == "high"
+
+
+def test_chat_sends_effort_for_the_given_task_type():
+    """实际请求体里的 reasoning_effort 要按 task_type 选。"""
+    seen: dict = {}
+
+    class _Msg:
+        content = "ok"
+        reasoning_content = ""
+        tool_calls = None
+
+    class _Choice:
+        message = _Msg()
+        finish_reason = "stop"
+
+    class _Resp:
+        choices = [_Choice()]
+        usage = _Usage()
+
+    class _Completions:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return _Resp()
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    cfg = EngineLLMConfig(
+        model="m",
+        api_key="x",
+        stream=False,
+        reasoning_effort="medium",
+        reasoning_effort_by_task={"agent": "low"},
+    )
+    client = EngineLLMClient(cfg)
+    client._client = _Client()
+    client.chat([{"role": "user", "content": "hi"}], task_type="agent")
+    assert seen.get("extra_body", {}).get("reasoning_effort") == "low"

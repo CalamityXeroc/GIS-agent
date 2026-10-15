@@ -335,6 +335,11 @@ def build_default_registry() -> EngineToolRegistry:
 
         if ctx.catalog is None:
             return Observation(ok=False, summary="数据目录不可用", error={"type": "NoCatalog"})
+        # 后台扫描可能还在跑（启动不阻塞）：首次用到目录时等一下，
+        # 保证返回的永远是真实字段名/坐标系，而不是“空目录”。
+        prewarmer = ctx.extra.get("prewarmer") if isinstance(ctx.extra, dict) else None
+        if prewarmer is not None and getattr(prewarmer, "busy", False):
+            prewarmer.wait_ready()
         query = str(args.get("query", "") or "")
         kind = args.get("kind")
         limit = int(args.get("limit", 20) or 20)

@@ -354,3 +354,123 @@ def test_backup_handles_relative_paths_without_ctx(tmp_path):
 
     # 传 ctx 也不能崩（走 _resolve_path 分支）
     assert isinstance(_referenced_existing_paths(code, tmp_path, _Ctx()), list)
+
+
+# ------------------------------------------------ 上下文压缩（抖动回归）
+
+
+def _loop_for_compaction(**overrides):
+    """造一个只用于测压缩逻辑的 loop（不触网、不跑代码）。"""
+    from gis_cli.engine.loop import AgentLoop, LoopConfig
+
+    config = LoopConfig(**overrides)
+    return AgentLoop(
+        workspace=".",
+        llm_client=None,
+        registry=None,
+        context=None,
+        config=config,
+        auto_extract_requirements=False,
+        use_project_log=False,
+    )
+
+
+def _image_message(payload_chars=533_000):
+    """一条带图的消息（模拟 400KB JPG 的 base64）。"""
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "看这张图"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64," + "A" * payload_chars},
+            },
+        ],
+    }
+
+
+def test_image_blocks_use_fixed_token_cost():
+    """图片必须按固定成本估算 —— 不能把 base64 当文本算。
+
+    实测坑：一张 400KB 图 base64 有 53 万字符，旧公式算出 26.7 万 token
+    （软上限 12 万）→ 一附图就必触发压缩，而压缩本身是一次 LLM 调用。
+    """
+    loop = _loop_for_compaction(image_token_cost=1500, context_soft_limit_tokens=120_000)
+    loop._messages = [_image_message()]
+    estimated = loop._estimate_tokens()
+    assert estimated < 10_000, f"单张图不应被估成 {estimated} token"
+
+
+def test_image_heavy_conversation_does_not_compact_every_turn():
+    """带图长对话不应反复触发压缩（滞回 + 固定成本一起生效）。"""
+    loop = _loop_for_compaction(
+        image_token_cost=1500,
+        context_soft_limit_tokens=120_000,
+        compact_hysteresis=1.2,
+        compact_min_messages=8,
+    )
+    # 30 条消息、每条 3 张图：真实 token 远低于上限
+    loop._messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+    for _ in range(30):
+        loop._messages.append(_image_message())
+        loop._messages.append({"role": "assistant", "content": "看完了"})
+
+    summarized: list[int] = []
+
+    class _Recorder:
+        def record(self, event, payload=None, duration_ms=0):
+            if event == "context_compacted":
+                summarized.append(payload.get("summarized_messages"))
+            return None
+
+    loop.recorder = _Recorder()
+    loop._messages_backup = list(loop._messages)
+    for _ in range(30):  # 模拟连续 30 轮检查
+        loop._compact_if_needed()
+    assert not summarized, f"不该发生压缩（实际 {len(summarized)} 次）"
+    assert len(loop._messages) == 62
+
+
+def test_compaction_has_hysteresis_above_soft_limit():
+    """刚过软上限不压；超过滞回阈值才压。"""
+    loop = _loop_for_compaction(
+        context_soft_limit_tokens=1_000,
+        compact_hysteresis=2.0,
+        compact_min_messages=2,
+        keep_recent_messages=2,
+    )
+    calls: list[int] = []
+    loop._summarize = lambda msgs: (calls.append(len(msgs)), "摘要")[1]
+
+    # 估算约 1000+ token（每条 200 字符 → 100 token），但不到 2000 的滞回线
+    loop._messages = [{"role": "system", "content": "s"}] + [
+        {"role": "user", "content": "x" * 200} for _ in range(8)
+    ]
+    assert loop._estimate_tokens() < 2_000
+    loop._compact_if_needed()
+    assert not calls, "刚过软上限（未达滞回线）不该压"
+
+    # 加长到超过滞回线 → 应触发一次
+    loop._messages += [{"role": "user", "content": "x" * 400} for _ in range(8)]
+    assert loop._estimate_tokens() >= 2_000
+    loop._compact_if_needed()
+    assert len(calls) == 1, "超过滞回线应压一次"
+    loop._compact_if_needed()
+    assert len(calls) == 1, "压完就应安静下来（不再连续压）"
+
+
+def test_compaction_skips_when_nothing_worth_summarizing():
+    """可压消息太少时不花那次 LLM 调用。"""
+    loop = _loop_for_compaction(
+        context_soft_limit_tokens=10,
+        compact_hysteresis=1.0,
+        compact_min_messages=8,
+        keep_recent_messages=2,
+    )
+    calls: list[int] = []
+    loop._summarize = lambda msgs: (calls.append(len(msgs)), "摘要")[1]
+    loop._messages = [{"role": "system", "content": "s"}] + [
+        {"role": "user", "content": "x" * 200} for _ in range(4)
+    ]
+    loop._compact_if_needed()
+    assert not calls, "只有 4 条可压消息，不值得一次 LLM 往返"

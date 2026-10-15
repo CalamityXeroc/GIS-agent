@@ -79,6 +79,8 @@ MAX_INPUT_LINES = 12
 REFRESH_INTERVAL = 0.4
 #: 左/右边栏宽度（1 格符号 + 1 格留白）
 RAIL_WIDTH = 2
+#: 流式预览窗最多显示几行（再长就只看尾部；块结束时会完整打一遍）
+_STREAM_ROWS = 6
 
 
 class ChatPrompt:
@@ -107,6 +109,7 @@ class ChatPrompt:
         refresh_interval: float = REFRESH_INTERVAL,
         input: Any = None,
         output: Any = None,
+        stream_provider: Callable[[], str] | None = None,
     ) -> None:
         if not _PT_AVAILABLE:  # pragma: no cover - 调用方应先查 available()
             raise RuntimeError("prompt_toolkit 不可用")
@@ -126,6 +129,12 @@ class ChatPrompt:
         self._refresh_interval = max(0.0, float(refresh_interval))
         self._input = input
         self._output = output
+        #: 流式实时预览：返回当前正在生成的思考/回复文本（空串 = 没在流式）。
+        #:
+        #: 为什么不用 rich ``Live``：Live 每帧发光标控制序列（ESC[2K/ESC[1A），
+        #: 普通 Windows 控制台不解析 ANSI，屏幕上就是满屏 ``?[2K?[1A``（实测）。
+        #: 而这里由 prompt_toolkit 自己重绘 —— 它走 Win32 API，在 conhost 里也对。
+        self._stream_provider = stream_provider
         #: 最近一次构建的输入 buffer（测试与上层要用）
         self.buffer: Any = None
 
@@ -236,6 +245,13 @@ class ChatPrompt:
 
         root = HSplit(
             [
+                # 流式实时预览（模型正在写的思考/回复，尾部若干行）。
+                # 只在真有流式内容时占行；空的时候不占任何空间。
+                ConditionalContainer(
+                    self._stream_window(),
+                    Condition(lambda: bool((self._stream_provider() or "").strip())
+                              if self._stream_provider else False),
+                ),
                 self._border_line_window(side="top"),
                 VSplit(
                     [
@@ -264,6 +280,10 @@ class ChatPrompt:
             style=self._style,
             full_screen=False,  # 走"就地重绘"，与滚动转录共存
             mouse_support=False,
+            # 提交后**擦掉这个框**。不擦的后果（用户实测）：旧框留在屏幕上，
+            # 主循环又画一个新框 → 看起来"启动后就有两个聊天框"，
+            # 而且新框状态行写着"运行中 · 0s"，让人以为任务已经开跑了。
+            erase_when_done=True,
             # 定时重绘：状态行要跟着运行进度跳动（tracker 由工作线程更新，
             # 不主动重绘就看不到轮次/token 变化）
             refresh_interval=self._refresh_interval,
@@ -374,6 +394,46 @@ class ChatPrompt:
             style="class:frame",
         )
 
+    def _stream_window(self) -> Any:
+        """流式实时预览窗（输入框上方，显示模型正在生成的文本尾部）。
+
+        为什么不用 rich ``Live``：Live 逐帧发光标控制序列，普通控制台不解析
+        ANSI 就满屏 ``?[2K?[1A``（实测）。这里由 prompt_toolkit 重绘，
+        它在 Windows 上走 Win32 API，不依赖 ANSI。
+
+        高度随内容自适应（上限 ``_STREAM_ROWS``），内容被折行、中文按双宽算。
+        """
+
+        def _render() -> Any:
+            try:
+                text = str(self._stream_provider() or "")
+            except Exception:
+                text = ""
+            lines: list[tuple[str, str]] = [("class:hint", f" {glyph('thought')} 模型正在生成…")]
+            width = max(24, _term_columns() - 4)
+            body = (text or "").strip()
+            shown: list[str] = []
+            for paragraph in body.splitlines():
+                shown.extend(_clip_width_lines(paragraph, width))
+            for line in shown[-_STREAM_ROWS:]:
+                lines.append(("class:code", f"   {line}"))
+            return FormattedText(lines)
+
+        def _height() -> Any:
+            try:
+                text = str(self._stream_provider() or "").strip()
+            except Exception:
+                text = ""
+            if not text:
+                return Dimension(min=0, max=0)
+            width = max(24, _term_columns() - 4)
+            total = 1  # 标题行
+            for paragraph in text.splitlines():
+                total += max(1, math.ceil(_display_width(paragraph) / width))
+            return Dimension(min=min(total, _STREAM_ROWS), max=_STREAM_ROWS)
+
+        return Window(FormattedTextControl(_render), height=_height(), dont_extend_height=True, style="class:hint")
+
     def _status_window(self) -> Any:
         """框下常驻状态行（模型 · 状态 · 轮次 · 用时 · token · 工具）。
 
@@ -402,12 +462,20 @@ class ChatPrompt:
 
         @bindings.add("enter")
         def _(event: Any) -> None:
-            """菜单开着时先应用当前候选，再按一次才提交（pi/Claude 手感）。"""
+            """回车提交；只有**用户主动导航过菜单**时才先应用候选。
+
+            以前的写法是"菜单开着且当前有选中项就先应用"。但菜单一弹出就会自动
+            高亮第一项，于是普通句子也可能吃掉一次回车（用户实测要按两次）。
+            现在改成只看 ``complete_index``：没按过 ↑↓ 导航（为 None）就直接提交。
+            要选候选可用 Tab（prompt_toolkit 默认绑定）。
+            """
             buf = event.current_buffer
             state = buf.complete_state
-            if state is not None and state.current_completion is not None:
-                buf.apply_completion(state.current_completion)
-                return
+            if state is not None and getattr(state, "complete_index", None) is not None:
+                current = state.current_completion
+                if current is not None:
+                    buf.apply_completion(current)
+                    return
             buf.validate_and_handle()
 
         @bindings.add("escape", "enter")
@@ -526,6 +594,25 @@ def _clip_to_width(text: str, limit: int) -> str:
         kept.append(char)
         used += width
     return "".join(kept)
+
+
+def _clip_width_lines(text: str, width: int) -> list[str]:
+    """按显示宽度折行（中文按双宽），给流式预览窗用。"""
+    if not text:
+        return []
+    lines: list[str] = []
+    current: list[str] = []
+    used = 0
+    for char in text:
+        w = _display_width(char)
+        if used + w > width and current:
+            lines.append("".join(current))
+            current, used = [], 0
+        current.append(char)
+        used += w
+    if current:
+        lines.append("".join(current))
+    return lines or [""]
 
 
 def _term_columns(default: int = 100) -> int:

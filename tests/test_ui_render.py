@@ -498,3 +498,119 @@ def test_wrap_lines_counts_cjk_as_two_columns():
 def test_short_uses_display_width():
     assert rd.disp_width(rd._short("中文" * 100, 20)) <= 20
     assert rd._short("abc", 10) == "abc"
+
+
+# --------------------------------------------------------------- 流式实时块
+
+
+def test_live_delta_accumulates_and_renders_once():
+    """流式增量累积到实时块，收尾时只定型打印一次（不逐词刷屏）。"""
+    view, console, _ = _view()
+    view.live_delta("reasoning", "先看数据")
+    view.live_delta("reasoning", "目录，再统计。")
+    assert view.live_chars == len("先看数据目录，再统计。")
+    assert view.live_text == "先看数据目录，再统计。"
+    view.end_live()
+    out = console.text
+    assert "先看数据目录，再统计。" in out
+    # 收尾后实时块清空，不会在下一轮串味
+    assert view.live_chars == 0
+    assert view.live_text == ""
+
+
+def test_live_delta_switches_between_reasoning_and_content():
+    """思考 → 正文 切换时要先收掉思考块，避免两段混在一起。"""
+    view, console, _ = _view()
+    view.live_delta("reasoning", "我在想")
+    view.live_delta("content", "结论是 X")
+    out = console.text
+    assert "我在想" in out, out
+    assert view.live_text == "结论是 X"
+    view.end_live()
+    assert "结论是 X" in console.text
+
+
+def test_llm_result_thought_not_duplicated_after_streaming():
+    """流式已经显示过思考 → llm_result 不能再打一遍同样的思考。"""
+    view, console, _ = _view()
+    view.live_delta("reasoning", "这段思考只应出现一次")
+    view.end_live()
+    view.handle(
+        "llm_result",
+        {
+            "model": "m",
+            "usage": {"total_tokens": 5},
+            "actions": [{"kind": "tool", "tool": "catalog_query", "reasoning": "这段思考只应出现一次"}],
+        },
+    )
+    assert console.text.count("这段思考只应出现一次") == 1, console.text
+
+
+def test_llm_result_thought_still_shown_without_streaming():
+    """非流式回退时（上游不支持流式）思考照旧要显示出来。"""
+    view, console, _ = _view()
+    view.handle(
+        "llm_result",
+        {
+            "model": "m",
+            "usage": {"total_tokens": 5},
+            "actions": [{"kind": "tool", "tool": "catalog_query", "reasoning": "非流式的思考内容"}],
+        },
+    )
+    assert "非流式的思考内容" in console.text
+
+
+def test_live_block_flushed_before_tool_call():
+    """工具开始执行前先收掉实时块，保证屏幕上顺序正确。"""
+    view, console, _ = _view()
+    view.live_delta("content", "我要去查数据了")
+    view.end_live()
+    view.handle("tool_call", {"tool": "catalog_query", "args": {"keyword": "x"}})
+    view.handle("tool_result", {"tool": "catalog_query", "ok": True, "summary": "1 条"})
+    view.flush()
+    out = console.text
+    assert out.index("我要去查数据了") < out.index("catalog_query"), out
+
+
+def test_tracker_counts_stream_chars_and_resets_per_turn():
+    """状态行要能看到流式字数；新的一轮 llm_result 后归零。
+
+    注意：流式字数只在**运行中**显示（空闲时不带运行数据，那是噪声）。
+    """
+    tracker = ev.StatusTracker()
+    tracker.status = "running"  # 运行中
+    tracker.apply("llm_delta", {"kind": "reasoning", "text": "abc"})
+    tracker.apply("llm_delta", {"kind": "content", "text": "de"})
+    assert tracker.stream_chars == 5
+    assert "思考中 · 5 字" in tracker.footer()
+    tracker.apply("llm_result", {"model": "m", "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    assert tracker.stream_chars == 0
+
+
+def test_footer_is_quiet_when_idle():
+    """空闲时状态行不显示运行数据（“未开始 · 0s ↑0 ↓0”是噪声）。
+
+    用户实测反馈：启动后什么都没做，状态行却像“已经在跑了”。
+    """
+    tracker = ev.StatusTracker()
+    text = tracker.footer()
+    assert "空闲" in text
+    for noise in ("未开始", "0s", "↑0", "↓0"):
+        assert noise not in text, f"空闲状态行不应包含 {noise!r}：{text}"
+
+
+def test_queued_event_shows_hint_in_footer():
+    """运行中用户又提交消息 → 状态行立刻提示“已排队”（消息没丢）。
+
+    实测坑：旧版静默注入当前任务，没有任何可见反馈，用户以为没提交
+    成功而重复输入。
+    """
+    tracker = ev.StatusTracker()
+    tracker.status = "running"
+    tracker.apply("queued", {"count": 1})
+    footer = tracker.footer()
+    assert "排队" in footer, footer
+    tracker.apply("queued", {"count": 2})
+    assert "2 条" in tracker.footer()
+    tracker.apply("queued", {"count": 0})
+    assert "排队" not in tracker.footer()

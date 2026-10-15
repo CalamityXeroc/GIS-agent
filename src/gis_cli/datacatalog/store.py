@@ -202,12 +202,31 @@ class Catalog:
                     ),
                 )
 
-    def remove_missing(self, existing_paths: set[str], existing_containers: set[str] | None = None) -> int:
+    def remove_missing(
+        self,
+        existing_paths: set[str],
+        existing_containers: set[str] | None = None,
+        within: list[str] | None = None,
+    ) -> int:
         """Delete entries whose files no longer exist.
 
         Records inside a container (GDB) are kept when the container itself is
         still present, even though their own path is not in ``existing_paths``.
+
+        ``within``：限定只清理这些路径前缀（绝对路径，小写）下的记录。
+        为什么需要：扫描可以只指定部分根目录（如只扫 ``input/``），
+        此时不能把未参与扫描的目录（``output/``）里的记录当成“已消失”——
+        实测旧逻辑会把自己刚生成的成果从目录里删掉（removed=19）。
+        传 ``None`` 时保持旧行为（全库对账）。
         """
+        prefixes = [str(p).replace("/", "\\").lower() for p in (within or []) if p]
+
+        def _in_scope(path: str) -> bool:
+            if not prefixes:
+                return True
+            normalized = str(path).replace("/", "\\").lower()
+            return any(normalized.startswith(prefix) for prefix in prefixes)
+
         containers = existing_containers or set()
         removed = 0
         with self._lock, self._conn:
@@ -216,6 +235,8 @@ class Catalog:
                 if row["path"] in existing_paths:
                     continue
                 if row["container"] and row["container"] in containers:
+                    continue
+                if not _in_scope(row["path"]):
                     continue
                 self._conn.execute("DELETE FROM datasets WHERE path = ?", (row["path"],))
                 self._conn.execute("DELETE FROM fields WHERE path = ?", (row["path"],))

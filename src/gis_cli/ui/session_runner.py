@@ -118,22 +118,45 @@ class EngineSession:
         return self._state
 
     def guide(self, text: str) -> bool:
-        """运行中纠偏：注入成功返回 True；否则把消息排队并返回 False。"""
+        """运行中的追加输入：排队等本轮结束，作为**同一个任务**的补充。
+
+        为什么是排队而不是注入当前任务：注入是静默的（消息看起来消失了，
+        用户会以为没提交成功而重复输入 —— 实测就是这么发生的）。
+        为什么合并成一个任务而不是各自成任务：用户的真实用法是为了完成
+        **同一件事**多次补充说明；要换任务会直接开新对话。
+
+        返回 ``False`` 表示已排队（调用方据此提示用户）。
+        """
         content = (text or "").strip()
         if not content:
             return True
-        loop = getattr(self.bundle, "loop", None)
-        if self.busy and loop is not None and hasattr(loop, "inject_user_message"):
-            try:
-                if loop.inject_user_message(content):
-                    return True
-            except Exception:
-                pass
-        self._queued.append(content)
+        with self._lock:
+            self._queued.append(content)
         return False
 
+    @property
+    def queued_count(self) -> int:
+        """已排队条数（界面据此显示提示）。"""
+        with self._lock:
+            return len(self._queued)
+
+    def queue_hint(self) -> str:
+        """排队提示文案（空串 = 没有排队）。"""
+        count = self.queued_count
+        if count <= 0:
+            return ""
+        return f"已排队 {count} 条，本轮结束后会合并成一个任务继续"
+
+    def merged_task(self, base: str) -> str:
+        """把原始目标与排队补给合并成一条任务（取走队列）。"""
+        queued = self.take_queued()
+        if not queued:
+            return base
+        extra = "\n".join(queued)
+        return f"{base}\n\n{extra}" if base else extra
+
     def take_queued(self) -> list[str]:
-        """取走排队消息（本轮结束后由调用方作为下一轮输入）。"""
+        """取走排队消息（本轮结束后由调用方合并进下一条任务）。"""
         with self._lock:
             items, self._queued = self._queued, []
         return items

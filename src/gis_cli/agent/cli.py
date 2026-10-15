@@ -21,11 +21,13 @@ except ImportError:
     print("缺少必要的依赖包。请运行: pip install typer rich")
     sys.exit(1)
 
-from .agent import GISAgent, AgentConfig
-from .evaluation import AgentEvaluationLoop, MultiModelBenchmark
-from .executor import ExecutionMode
-from .llm import create_llm_client, LLMConfig
-from .model_adaptation import BAMLBridge
+# 旧引擎（plan-then-execute）的导入**故意延迟到函数内**：
+# 它会把 pydantic / langchain / 工具注册表整条链拉进来（实测 0.75s，占
+# `import gis_cli.agent.cli` 总耗时 1.12s 的 67%），而新引擎（chat/loop）
+# 完全不碰这些模块。入口改成惰性后，新引擎的启动只剩自己的依赖。
+#
+# 旧命令（chat-legacy / benchmark-models / baml-check …）内部各自 import，
+# 行为不变，只是“用不到就不加载”。
 
 # 控制台自适应：把代码页尽量切到 UTF-8，并让 Python 流与控制台实际编码一致。
 # 踩过的坑：无条件强制 stdout=UTF-8 时，GBK 控制台会把 UTF-8 字节按 GBK 解码 → 整屏乱码。
@@ -122,8 +124,12 @@ def create_agent(
     baml_strict: bool = False,
     baml_require: Optional[list[str]] = None,
     expert_mode: bool = True,
-) -> GISAgent:
+) -> "GISAgent":
     """Create and configure the GIS Agent."""
+    from .agent import GISAgent, AgentConfig
+    from .executor import ExecutionMode
+    from .llm import LLMConfig, create_llm_client
+
     workspace_root = workspace or Path.cwd()
     safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", str(workspace_root.resolve()))
     config = AgentConfig(
@@ -169,10 +175,12 @@ def create_agent(
 
 
 def _run_baml_preflight(
-    llm_config: LLMConfig,
+    llm_config: "LLMConfig",
     strict_override: bool = False,
     required_override: Optional[list[str]] = None,
 ) -> None:
+    from .model_adaptation import BAMLBridge
+
     if not bool(getattr(llm_config, "enable_baml_standardizer", True)):
         return
     if not bool(getattr(llm_config, "enable_baml_preflight", True)):
@@ -219,7 +227,7 @@ def chat(
     no_color: bool = typer.Option(False, "--no-color", help="纯文本模式：不输出颜色（默认在老终端就是纯文本）"),
     color: bool = typer.Option(False, "--color", help="强制上色（确认终端支持 ANSI 时用）"),
     max_turns: int = typer.Option(0, "--max-turns", help="单任务最大轮次（0 表示用配置默认值）"),
-    refresh_catalog: bool = typer.Option(True, "--refresh-catalog/--no-refresh-catalog", help="启动前增量刷新数据目录"),
+    refresh_catalog: bool = typer.Option(False, "--refresh-catalog/--no-refresh-catalog", help="启动时同步扫全数据目录（默认不扫：改由首个任务后台扫描，启动更快）"),
     continue_last: bool = typer.Option(False, "--continue/--no-continue", help="接续上一次会话"),
     resume: str = typer.Option("", "--resume", help="接续指定会话 id"),
 ):
@@ -725,6 +733,8 @@ def eval_loop(
     limit: int = typer.Option(30, "--limit", "-n", help="分析最近 N 个会话"),
 ):
     """运行第三阶段评测闭环并生成报告。"""
+    from .evaluation import AgentEvaluationLoop
+
     workspace_root = workspace or Path.cwd()
     memory_dir = workspace_root / ".gis_agent_memory"
     evaluation_dir = workspace_root / "workspace" / "output" / "evaluation"
@@ -769,6 +779,9 @@ def benchmark_models(
     workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="工作空间目录"),
 ):
     """运行跨模型基准评测并输出成功率差、解析错误率和时延指标。"""
+    from .evaluation import MultiModelBenchmark
+    from .llm import LLMConfig
+
     workspace_root = workspace or Path.cwd()
     selected_models = [m.strip() for m in models.split(",") if m.strip()]
     if not selected_models:
@@ -815,6 +828,9 @@ def baml_check(
     require: str = typer.Option("intent,task_refine,planning,recovery", "--require", help="严格模式下必需能力（逗号分隔）"),
 ):
     """检查 BAML client 可用性与函数映射绑定状态。"""
+    from .llm import LLMConfig
+    from .model_adaptation import BAMLBridge
+
     workspace_root = workspace or Path.cwd()
     cfg_path = workspace_root / "config" / "llm_config.json"
     try:
@@ -884,6 +900,9 @@ def status(
     session_id: Optional[str] = typer.Option(None, "--session", "-s", help="会话 ID")
 ):
     """显示 Agent 状态。"""
+    from .llm import LLMConfig
+    from .model_adaptation import BAMLBridge
+
     workspace_root = Path.cwd()
     llm_config = None
     try:

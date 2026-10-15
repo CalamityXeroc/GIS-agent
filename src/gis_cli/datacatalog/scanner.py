@@ -56,6 +56,12 @@ def discover(roots: Iterable[str | Path], *, max_items: int = 2000, include_gdb:
             mtime, size = stat.st_mtime, stat.st_size
         except OSError:
             mtime, size = 0.0, 0
+        if kind == "gdb":
+            # GDB 的“新鲜度”不能看目录 mtime：**读一下 GDB 就会新建 .sr.lock**，
+            # 目录 mtime 因此立刻变化 → 缓存永远失效（实测每次启动都重扫 133 个
+            # 要素类，耗时 158s）。改用“容器内非锁文件的最新 mtime”，读操作
+            # 不会再把它推新。
+            mtime = gdb_content_mtime(path)
         found.append(Discovery(str(path), kind, container, mtime, size))
 
     for root in roots:
@@ -89,6 +95,47 @@ def discover(roots: Iterable[str | Path], *, max_items: int = 2000, include_gdb:
         if len(found) >= max_items:
             break
     return found
+
+
+#: GDB 内属于“临时/锁”的文件（不能参与新鲜度判定）
+_GDB_IGNORE_SUFFIX = (".lock",)
+_GDB_IGNORE_PREFIX = ("_gdb.",)
+
+
+def gdb_content_mtime(path: str | Path) -> float:
+    """GDB 的“内容时间”：容器内非锁、非临时文件的最新 mtime。
+
+    为什么要这样算（实测，AM/PM 两套真题里的 GDB）：
+
+    - ArcGIS **只要读过**一个 GDB 就会在里面新建 ``*.sr.lock``，
+      目录自身的 mtime 随即被刷新；
+    - 于是“目录 mtime 变了 → 缓存失效 → 重扫”形成死循环，
+      每次启动都重扫全部 133 个要素类（实测 158.5s），而数据其实一动不动。
+
+    只用真实数据文件的 mtime，读写探测就不会再把缓存推新；
+    真正改数据（新增/重写要素类）仍能被检测到。
+    目录不可读时退回目录自身 mtime（宁可能多扫一次，不能漏扫）。
+    """
+    try:
+        newest = 0.0
+        for entry in os.scandir(path):
+            name = entry.name
+            if name.endswith(_GDB_IGNORE_SUFFIX) or name.startswith(_GDB_IGNORE_PREFIX):
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            if stat.st_mtime > newest:
+                newest = stat.st_mtime
+        if newest:
+            return newest
+    except OSError:
+        pass
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _kind_for(path: Path) -> str | None:
@@ -363,10 +410,14 @@ def refresh_catalog(
     items = discover(roots, max_items=max_items)
     stats.discovered = len(items)
 
-    # Drop entries whose files disappeared.
+    # 清理“已消失”的记录时**限定在本次扫描的根目录内**（实测坑）：
+    # 默认只扫 input/ 时，旧逻辑把 output/ 里的记录（自己刚生成的成果）
+    # 当成“文件已消失”删掉了（实测 removed=19）。数据目录应只增不误删。
+    root_prefixes = [str(Path(r).resolve()).lower() for r in roots]
     stats.removed = catalog.remove_missing(
         {d.path for d in items},
         {d.path for d in items if d.kind == "gdb"},
+        within=root_prefixes,
     )
 
     to_scan: list[Discovery] = []

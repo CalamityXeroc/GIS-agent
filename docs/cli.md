@@ -14,14 +14,38 @@ gis-agent chat --continue
 # 单次任务（不进交互）
 gis-agent loop "把 county.shp 定义坐标系并投影到 CGCS2000 111E"
 
+# 启动时就把数据目录扫全（默认不扫，见下）
+gis-agent chat --refresh-catalog
+
 # 一键启动（Windows，自动装依赖并进入对话）
 一键启动.bat
 ```
 
+### 启动为什么很快，以及数据目录何时扫
+
+**启动只加载配方与配置**（实测 0.2~0.3s），**不扫数据目录**。你发出第一条
+任务后，下面两件事在后台并行做，与首轮模型调用重叠：
+
+1. **扫描数据目录**（下次启动就命中缓存，通常 < 0.1s）；
+2. **启动 ArcPy 内核**（大头是 `import arcpy`，实测 11~17s）。
+
+这期间界面已经可用。模型需要真实字段名时会调用 `catalog_query`，它会
+等扫描完成再答（对模型透明，不会拿到“空目录”然后乱猜字段）。
+
+想恢复“启动就扫全”的旧行为：加 `--refresh-catalog`。
+
+### 流式输出
+
+模型边生成边显示：**思考与回复实时追加**，状态行同时显示字数
+（`思考中 · 340 字`），不必盯着空屏等整段生成完。
+
+实测（deepseek-v4.1-flash-intl）：首字 2~6s 到屏，此前要等整段（10~90s）。
+上游不支持流式时会自动退回非流式（功能不变，只是拿不到逐字输出）。
+
 ## 界面长什么样
 
 ```
-┌─ GIS Agent v0.8.0 ───────────────────────────────────────────────┐
+┌─ GIS Agent v0.7.1 ───────────────────────────────────────────────┐
 │     模型  glm-5.3-flash · tokenrhythm.studio                      │
 │   工作区  ./workspace                                             │
 │ 数据目录  vector 2、table 1                                        │
@@ -215,7 +239,10 @@ workspace/skills/docx/
 | `src/gis_cli/ui/session_runner.py` | 工作线程 + 纠偏注入 + 中断 |
 | `src/gis_cli/ui/session_store.py` | 会话落盘、导出、续聊前言 |
 | `src/gis_cli/agent/interactive.py` | 交互主循环与斜杠命令 |
+| `src/gis_cli/datacatalog/prewarm.py` | 数据目录后台扫描（启动不阻塞） |
+| `src/gis_cli/runtime/timing.py` | 分段计时（`[timing]` 日志，查“慢在哪”用） |
 | `scripts/preview_ui.py` | 纯渲染预览（改样式时先跑它看效果） |
+| `scripts/latency_report.py` | 从 trace 算每段耗时占比（模型等待/工具/压缩） |
 
 ## 自测
 

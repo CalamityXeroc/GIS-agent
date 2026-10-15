@@ -615,3 +615,199 @@ def test_execute_code_surfaces_stderr_warnings(tmp_path):
     assert obs.ok is True
     assert "stderr" in obs.data, "成功路径也要带上 stderr 告警"
     assert "mpl-cjk" in obs.hint, obs.hint
+
+
+# ------------------------------------------------- .spec.json 读入（崩溃回归）
+
+
+def test_shrink_json_always_yields_valid_json():
+    """超长验收材料缩水后必须是合法 JSON。
+
+    实测崩溃：旧代码把 json.dumps 的结果直接切到 max_chars，截在字符串中间
+    → json.loads 抛 JSONDecodeError → 整个 run 在验收阶段挂掉
+    （一个内容不完整的 .spec.json 就能把任务拖死）。
+    """
+    import json
+
+    from gis_cli.engine.verifier import _shrink_json
+
+    big = {
+        "class_bounds": [0, 1, 2, 3, 4, 5],
+        "title": "标题" * 3000,
+        "decisions": ["说明" * 400] * 30,
+        "renderer": {"type": "graduated", "ramp": "Reds", "extra": "x" * 5000},
+    }
+    for budget in (50, 200, 1181, 4000, 24000, 200000):
+        shrunk = _shrink_json(big, budget)
+        text = json.dumps(shrunk, ensure_ascii=False)
+        parsed = json.loads(text)  # 不抛即通过
+        assert isinstance(parsed, dict)
+        assert "class_bounds" in parsed, "关键字段不能丢"
+
+
+def test_spec_contents_survives_broken_and_huge_spec(tmp_path):
+    """_read_spec_contents 面对超大/畸形 .spec.json 都不能抛异常。"""
+    import json
+
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output"
+    out.mkdir(parents=True)
+    # 超大但合法
+    (out / "big.spec.json").write_text(
+        json.dumps({"class_bounds": [0, 1, 2], "title": "x" * 8000}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    # 畸形（不是合法 JSON）
+    (out / "broken.spec.json").write_text("{not json at all", encoding="utf-8")
+
+    verifier = Verifier(workspace=tmp_path)
+    result = verifier._read_spec_contents()
+    assert isinstance(result, list)
+    paths = [item.get("path") for item in result]
+    # 超大那个要能读到，且里面是合法结构
+    assert any("big.spec.json" in str(p) for p in paths), paths
+    for item in result:
+        assert isinstance(item.get("content"), (dict, str))
+
+
+# ------------------------------------------------- 识图质检（批量 + 缓存）
+
+
+class _VisionLLM:
+    """假的多模态客户端：记录调用次数，返回可预测的 JSON。"""
+
+    def __init__(self, *, vision=True, per_image_ok=True):
+        self.calls: list[list[dict]] = []
+        self.vision_rejected = False
+        self.config = type("C", (), {"vision": vision})()
+
+        # 需要一个能被 from_file 之类读到的 config.model
+        class _Resp:
+            content = ""
+            model = "vision-stub"
+
+        self._per_image_ok = per_image_ok
+
+    def chat(self, messages, **kwargs):
+        self.calls.append(messages)
+        # 数一下这次请求带了几张图
+        images = 0
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                images += sum(
+                    1 for part in content if isinstance(part, dict) and part.get("type") == "image_url"
+                )
+        import json as _json
+
+        class _R:
+            model = "vision-stub"
+
+        _R.content = _json.dumps(
+            {"images": [{"index": i + 1, "text_ok": True, "issues": [], "summary": f"ok{i+1}"} for i in range(images)]}
+        )
+        return _R()
+
+
+def _make_images(tmp_path, count=3):
+    from PIL import Image
+
+    paths = []
+    out = tmp_path / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        path = out / f"图{index + 1}.jpg"
+        Image.new("RGB", (60, 40), (index * 40 % 255, 90, 140)).save(path)
+        paths.append(path)
+    return paths
+
+
+def test_vision_batch_checks_all_images_in_one_call(tmp_path):
+    """多张图应一次调用看完（实测逐张串行时 5 张图要 200s+）。"""
+    from gis_cli.engine.verifier import Verifier
+
+    paths = _make_images(tmp_path, 3)
+    llm = _VisionLLM()
+    verifier = Verifier(workspace=tmp_path, llm_client=llm, vision_mode="warn")
+    verdicts = verifier.vision_check_images(paths)
+    assert len(llm.calls) == 1, f"应只调用一次，实际 {len(llm.calls)} 次"
+    assert set(verdicts) == {0, 1, 2}
+    assert all(v["ok"] for v in verdicts.values())
+
+
+def test_vision_verdict_is_cached_between_verify_calls(tmp_path):
+    """同一批产物验两次时，第二遍必须命中缓存（不再看图）。
+
+    一个 run 里 verify() 会被调两次（verify_outputs 与 finish），
+    没有缓存就要把每张图看两遍。
+    """
+    from gis_cli.engine.verifier import Verifier
+
+    paths = _make_images(tmp_path, 2)
+    llm = _VisionLLM()
+    verifier = Verifier(workspace=tmp_path, llm_client=llm, vision_mode="warn")
+    records = [{"path": str(p), "image": {"ok": True}} for p in paths]
+
+    verifier._vision_verdicts(records)
+    assert len(llm.calls) == 1, "第一遍应只调一次（批量）"
+    assert all("vision" in r for r in records)
+
+    # 第二遍（模拟 finish 再次验收）：命中缓存，不应再发请求
+    records2 = [{"path": str(p), "image": {"ok": True}} for p in paths]
+    verifier._vision_verdicts(records2)
+    assert len(llm.calls) == 1, "第二遍应命中缓存"
+    assert all("vision" in r for r in records2)
+
+
+def test_vision_cache_invalidates_when_image_changes(tmp_path):
+    """图片重出（mtime 变了）后缓存要失效，否则新图的问题看不出来。"""
+    import os
+    import time
+
+    from gis_cli.engine.verifier import Verifier
+
+    paths = _make_images(tmp_path, 1)
+    llm = _VisionLLM()
+    verifier = Verifier(workspace=tmp_path, llm_client=llm, vision_mode="warn")
+    records = [{"path": str(paths[0]), "image": {"ok": True}}]
+    verifier._vision_verdicts(records)
+    assert len(llm.calls) == 1
+
+    future = time.time() + 60
+    os.utime(paths[0], (future, future))
+    verifier._vision_verdicts([{"path": str(paths[0]), "image": {"ok": True}}])
+    assert len(llm.calls) == 2, "图片变了必须重新看"
+
+
+def test_vision_check_skipped_when_disabled(tmp_path):
+    """关掉识图 / 模型不支持识图时，不应产生任何请求，且不能报错。"""
+    from gis_cli.engine.verifier import Verifier
+
+    paths = _make_images(tmp_path, 2)
+    llm = _VisionLLM(vision=False)
+    verifier = Verifier(workspace=tmp_path, llm_client=llm, vision_mode="warn")
+    assert verifier.vision_check_images(paths) == {}
+    assert llm.calls == []
+    verdict = verifier.vision_check_image(paths[0])
+    assert verdict.get("skipped") is True
+
+
+def test_vision_check_returns_empty_on_bad_reply(tmp_path):
+    """模型回复不是预期 JSON 时不能抛异常（退回逐张路径）。"""
+    from gis_cli.engine.verifier import Verifier
+
+    paths = _make_images(tmp_path, 2)
+
+    class _BadLLM(_VisionLLM):
+        def chat(self, messages, **kwargs):
+            self.calls.append(messages)
+
+            class _R:
+                model = "vision-stub"
+                content = "这不是 JSON"
+
+            return _R()
+
+    verifier = Verifier(workspace=tmp_path, llm_client=_BadLLM(), vision_mode="warn")
+    assert verifier.vision_check_images(paths) == {}
