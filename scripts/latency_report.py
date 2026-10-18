@@ -62,6 +62,8 @@ class RunReport:
     segments: list[Segment] = field(default_factory=list)
     compactions: int = 0
     llm_calls: int = 0
+    #: ``run_end`` 里带的 token 用量汇总（含缓存命中率）；旧 trace 没有则为空
+    usage: dict[str, Any] = field(default_factory=dict)
 
     def add(self, kind: str, seconds: float, label: str = "") -> None:
         if seconds > 0:
@@ -140,6 +142,9 @@ def read_run(path: Path) -> RunReport:
             report.turns = int(payload.get("turns") or 0)
             report.tool_calls = int(payload.get("tool_calls") or 0)
             report.total_tokens = int(payload.get("total_tokens") or 0)
+            raw_usage = payload.get("usage")
+            if isinstance(raw_usage, dict):
+                report.usage = raw_usage
             report.total_seconds = max(0.0, ts - started) if ts and started else 0.0
 
         last_ts = ts or last_ts
@@ -160,6 +165,43 @@ def _bar(seconds: float, total: float, width: int = 28) -> str:
         return ""
     filled = int(round(width * seconds / total))
     return "█" * max(0, min(width, filled))
+
+
+def print_cost(report: RunReport) -> None:
+    """打印 token 用量与缓存命中率（``--cost``）。
+
+    命中率 = 命中缓存的 prompt token / 全部 prompt token。它直接对应钱：
+    命中的部分通常按更低价格计费；命中率跌下来就说明提示词前缀在变
+    （系统提示 / 数据目录摘要 / 日志摘要被改动），值得回查。
+    """
+    usage = report.usage or {}
+    if not usage:
+        print("\n（这条 trace 没有用量数据：旧版本跑的，或客户端不支持统计）")
+        return
+    print("\n=== 用量与成本 ===")
+    print(
+        f"共 {int(usage.get('calls') or 0)} 次调用 · "
+        f"prompt {int(usage.get('prompt_tokens') or 0):,} · "
+        f"completion {int(usage.get('completion_tokens') or 0):,} · "
+        f"缓存命中 {int(usage.get('cached_tokens') or 0):,}"
+    )
+    rate = float(usage.get("cache_hit_rate") or 0.0)
+    print(f"缓存命中率 {rate * 100:.1f}%  {_bar(rate, 1.0)}")
+    by_model = usage.get("by_model") or {}
+    if isinstance(by_model, dict) and by_model:
+        print("\n  按模型:")
+        for model, item in sorted(
+            by_model.items(), key=lambda kv: -int((kv[1] or {}).get("prompt_tokens") or 0)
+        ):
+            item = item or {}
+            prompt = int(item.get("prompt_tokens") or 0)
+            cached = int(item.get("cached_tokens") or 0)
+            hit = (cached / prompt * 100) if prompt else 0.0
+            print(
+                f"  {model:32} {int(item.get('calls') or 0):3} 次  "
+                f"in {prompt:>9,}  out {int(item.get('completion_tokens') or 0):>8,}  "
+                f"命中 {hit:5.1f}%"
+            )
 
 
 def print_report(report: RunReport) -> None:
@@ -195,6 +237,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="汇总全部 run")
     parser.add_argument("--trace-dir", default=str(DEFAULT_TRACE_DIR), help="trace 目录")
     parser.add_argument("--limit", type=int, default=8, help="--all 时最多看几个")
+    parser.add_argument("--cost", action="store_true", help="额外打印 token 用量与缓存命中率")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     trace_dir = Path(args.trace_dir)
@@ -216,6 +259,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     reports = [read_run(path) for path in targets]
     for report in reports:
         print_report(report)
+        if args.cost:
+            print_cost(report)
 
     if len(reports) > 1:
         grand = sum(r.by_kind().get(k, 0.0) for r in reports for k in ("模型等待", "工具执行", "上下文压缩"))
@@ -229,6 +274,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"  {kind:6} {seconds:9.1f}s  {share:5.1f}%  {_bar(seconds, grand)}")
         total_compactions = sum(r.compactions for r in reports)
         print(f"  压缩共 {total_compactions} 次")
+        if args.cost:
+            prompt_all = sum(int((r.usage or {}).get("prompt_tokens") or 0) for r in reports)
+            cached_all = sum(int((r.usage or {}).get("cached_tokens") or 0) for r in reports)
+            calls_all = sum(int((r.usage or {}).get("calls") or 0) for r in reports)
+            if prompt_all:
+                print(
+                    f"  共 {calls_all} 次调用 · prompt {prompt_all:,} · "
+                    f"缓存命中 {cached_all:,}（{cached_all / prompt_all * 100:.1f}%）"
+                )
     return 0
 
 

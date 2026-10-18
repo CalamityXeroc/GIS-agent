@@ -168,3 +168,67 @@ def test_sanitize_messages_converts_orphan_tool_messages(tmp_path: Path):
     loop._sanitize_messages()
     assert [m["role"] for m in loop._messages] == ["system", "assistant", "tool", "user"]
     assert loop._messages[-1]["content"] == "孤立结果"
+
+
+def test_loop_resume_after_ask_user_does_not_crash(tmp_path: Path):
+    """ask_user 暂停后用 resume() 续跑，不能崩。
+
+    实测 bug：``_continue()`` 里引用了 ``turn_observations``，但那个变量只在
+    ``run()`` 的作用域里定义 —— 任何走 resume 的路径都会 NameError。
+    而 ask_user 是模型"关键信息缺失时才问"的合法出口，用户答完必然走 resume。
+    """
+    loop, llm = _make_loop(
+        tmp_path,
+        [
+            _tc("ask_user", {"question": "数据在哪？"}),
+            _tc("finish", {"summary": "续跑完成"}),
+        ],
+    )
+    state = loop.run("测试任务")
+    assert state.status == "awaiting_user"
+
+    state = loop.resume("数据在 input/ 下")
+    assert state.status == "completed", f"续跑失败: {state.status} / {state.error}"
+    assert state.final_summary == "续跑完成"
+
+
+def test_loop_resume_appends_user_answer_and_keeps_messages_valid(tmp_path: Path):
+    """续跑必须把用户回答作为 user 消息接进对话，且消息序列保持合法。"""
+    loop, llm = _make_loop(
+        tmp_path,
+        [
+            _tc("ask_user", {"question": "坐标系？"}),
+            _tc("finish", {"summary": "好"}),
+        ],
+    )
+    loop.run("测试任务")
+    loop.resume("CGCS2000")
+
+    roles = [m.get("role") for m in loop._messages]
+    assert "user" in roles
+    # 用户回答必须真的进了对话内容（否则模型看不到答案）
+    assert any("CGCS2000" in str(m.get("content", "")) for m in loop._messages)
+    # 消息序列合法：role=tool 不能孤立（严格端点会 400）
+    pending: set[str] = set()
+    for m in loop._messages:
+        if m.get("role") == "assistant":
+            pending = {c.get("id") for c in (m.get("tool_calls") or []) if c.get("id")}
+        elif m.get("role") == "tool":
+            assert m.get("tool_call_id") in pending, "出现了孤立的 tool 消息"
+
+
+def test_loop_resume_records_observations_of_resumed_turns(tmp_path: Path):
+    """续跑轮的工具观察也要进对话（曾经因为变量未定义而整段丢失）。"""
+    loop, llm = _make_loop(
+        tmp_path,
+        [
+            _tc("ask_user", {"question": "继续？"}),
+            _tc("update_tasklist", {"items": [{"id": "t1", "title": "续跑步骤", "status": "done"}]}),
+            _tc("finish", {"summary": "完成"}),
+        ],
+    )
+    loop.run("测试任务")
+    state = loop.resume("继续")
+    assert state.status == "completed"
+    assert any("续跑步骤" in str(m.get("content", "")) for m in loop._messages), \
+        "续跑轮的工具结果没进对话"

@@ -76,8 +76,19 @@ class RunRecorder:
         }
 
     # ------------------------------------------------------------------ write
+    def _ensure_open(self) -> None:
+        """重新打开 trace 文件（``finish()`` 关掉后 resume 还要接着写）。
+
+        踩过的坑：``finish()`` 会 close 文件句柄，而 ask_user 暂停 → 用户回答 →
+        ``resume()`` 是**同一个 run 的第二段**，此时再 record 就抛
+        ``ValueError: I/O operation on closed file``，把续跑直接搞崩。
+        """
+        if getattr(self, "_fh", None) is None or getattr(self._fh, "closed", False):
+            self._fh = open(self.jsonl_path, "a", encoding="utf-8")
+
     def record(self, event: str, payload: dict[str, Any] | None = None, duration_ms: int = 0) -> TraceEvent:
         self._seq += 1
+        self._ensure_open()
         evt = TraceEvent(
             seq=self._seq,
             ts=_now_iso(),
@@ -109,6 +120,7 @@ class RunRecorder:
 
     # ------------------------------------------------------------------ close
     def finish(self, status: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._ensure_open()
         self._summary["status"] = status
         self._summary["finished_at"] = _now_iso()
         self._summary["duration_seconds"] = round(time.time() - self._started_at, 2)

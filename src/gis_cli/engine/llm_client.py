@@ -269,6 +269,14 @@ class EngineLLMClient:
         self._lock = threading.Lock()
         self._semaphore = threading.BoundedSemaphore(max(1, config.max_concurrency))
         self._consecutive_429 = 0
+        #: 用量统计：``{model: {calls, prompt_tokens, completion_tokens,
+        #: cached_tokens, failures}}``。
+        #:
+        #: 为什么要聚合：以前只在日志后缀里写 ``cached=N``，跑完就没了 ——
+        #: 无法回答“这个任务花了多少 token / 前缀缓存命中率多少 / 哪个模型
+        #: 在烧钱”。聚合后由 loop 在 ``run_end`` 写进 trace，
+        #: ``scripts/latency_report.py --cost`` 可汇总。
+        self.usage_totals: dict[str, dict[str, int]] = {}
         #: 上游拒过图（400）后置位：调用方据此不再附图，省下每轮的无效请求
         self.vision_rejected = False
         #: 上游不吃流式（代理忽略 stream 或直接报错）后置位：后续一律走非流式
@@ -350,6 +358,7 @@ class EngineLLMClient:
                     task_type=task_type,
                 )
                 self._record_success(candidate)
+                self._record_usage(candidate, response)
                 return response
             except LLMError as exc:
                 last_error = exc
@@ -381,6 +390,47 @@ class EngineLLMClient:
         self._failures.pop(model, None)
         self._cooldown_until.pop(model, None)
         self._cooldown_strikes.pop(model, None)
+
+    # -------------------------------------------------------------- 用量统计
+    def _record_usage(self, model: str, response: Any) -> None:
+        """把一次成功调用的 token 用量累加到 ``usage_totals``。"""
+        usage = getattr(response, "usage", None)
+        if not isinstance(usage, dict):
+            usage = {}
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        completion = int(usage.get("completion_tokens", 0) or 0)
+        cached = int(
+            usage.get("prompt_cache_hit_tokens") or usage.get("cached_tokens") or 0
+        )
+        with self._lock:
+            slot = self.usage_totals.setdefault(
+                model,
+                {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0},
+            )
+            slot["calls"] += 1
+            slot["prompt_tokens"] += prompt
+            slot["completion_tokens"] += completion
+            slot["cached_tokens"] += cached
+
+    def usage_summary(self) -> dict[str, Any]:
+        """汇总用量（含缓存命中率）。无数据时返回空结构。
+
+        命中率 = 命中缓存的 prompt token / 全部 prompt token。
+        它直接对应钱：命中的部分通常按更低的价计费，命中率跌下来就说明
+        提示词前缀在变（系统提示、数据目录摘要、日志摘要被改动）。
+        """
+        with self._lock:
+            totals = {name: dict(values) for name, values in self.usage_totals.items()}
+        prompt_all = sum(item["prompt_tokens"] for item in totals.values())
+        cached_all = sum(item["cached_tokens"] for item in totals.values())
+        return {
+            "by_model": totals,
+            "prompt_tokens": prompt_all,
+            "completion_tokens": sum(i["completion_tokens"] for i in totals.values()),
+            "cached_tokens": cached_all,
+            "calls": sum(i["calls"] for i in totals.values()),
+            "cache_hit_rate": (cached_all / prompt_all) if prompt_all else 0.0,
+        }
 
     def _record_failure(self, model: str, exc: Exception) -> None:
         """连续超时/连接失败达阈值后冷却该模型（网关卡死时不再白等）。

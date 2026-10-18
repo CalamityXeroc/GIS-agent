@@ -32,6 +32,66 @@ logger = logging.getLogger(__name__)
 
 _RESULT_VAR = "__arcpy_engine_result__"
 
+#: 取结果的哨兵（一行前缀，避免与用户自己的 print 撞车）
+_RESULT_MARKER = "__ENGINE_RESULT__"
+
+#: 拼在用户代码后面的“取结果”尾巴。
+#:
+#: 为什么这么做：以前 ``execute()`` 先跑用户代码、再发一条消息跑
+#: ``_fetch_result()`` —— 每次执行要两趟 ZMQ 往返（发消息 + 收 iopub +
+#: 等 idle，每趟都有固定开销）。把取结果拼进同一次执行后只需一趟。
+#:
+#: **执行前先把结果置 None**：结果变量是持久命名空间里的全局量，上一步
+#: ``set_result`` 的值会留到这一步 —— 不重置的话，“这次没调 set_result”
+#: 会静默返回**上一步的旧结果**（实测：``x=1`` 返回了上一次的 ``[1,2,3]``），
+#: 模型会拿着过期数据继续干活。
+#:
+#: 用 ``try`` 包住：结果里有不可序列化对象时，不能让“取结果”反过来把一次
+#: 成功的执行变失败（旧路径里这一步失败也只是返回 None）。
+#: 用 ``sys.stdout`` 直写而不是 print：用户代码可能重定向了 sys.stdout，
+#: 直写拿到的才是真正的 iopub 流。
+_RESULT_TAIL = (
+    "\n"
+    "try:\n"
+    "    import json as _json, sys as _sys\n"
+    f"    _sys.stdout.write('{_RESULT_MARKER}' + _json.dumps("
+    f"globals().get('{_RESULT_VAR}'), default=str) + '\\n')\n"
+    "    _sys.stdout.flush()\n"
+    "except Exception:\n"
+    "    pass\n"
+    "finally:\n"
+    f"    globals()['{_RESULT_VAR}'] = None\n"
+)
+
+#: 拼在用户代码**前面**的“清结果”头（避免读到上一步的旧结果）。
+_RESULT_HEAD = f"globals()['{_RESULT_VAR}'] = None\n"
+
+#: 哨兵没出现时的标记（与“结果就是 None”区分开）
+_RESULT_MISSING = object()
+
+
+def _split_result(stdout: str) -> tuple[Any, str]:
+    """从 stdout 里剖出结果行，返回 ``(结果, 去掉结果行后的 stdout)``。
+
+    结果行取**最后一次**出现的哨兵：用户代码自己 print 里如果恰好含同样
+    字样，后面拼的那行才是真正的结果。
+    """
+    idx = stdout.rfind(_RESULT_MARKER)
+    if idx < 0:
+        return _RESULT_MISSING, stdout
+    head = stdout[:idx]
+    line_end = stdout.find("\n", idx)
+    payload = stdout[idx + len(_RESULT_MARKER): line_end if line_end >= 0 else len(stdout)].strip()
+    tail = stdout[line_end + 1:] if line_end >= 0 else ""
+    if not payload or payload == "null":
+        return None, head + tail
+    try:
+        return json.loads(payload), head + tail
+    except Exception:
+        # 非 JSON（理论上有 default=str 不会发生）：原样当字符串返回
+        return payload, head + tail
+
+
 _PRELUDE = f'''
 import builtins as _bi
 {_RESULT_VAR} = None
@@ -337,6 +397,11 @@ class ArcpyKernel:
 
         ``set_result(value)`` inside the code is captured and returned.
         整个“执行 + 取结果”过程是**串行的**（见 ``_exec_lock`` 的说明）。
+
+        取结果**并入同一次执行**（少一次 ZMQ 往返，实测每步省 0.1~0.3s）。
+        做法：在用户代码后面拼一段“把结果打成一行哨兵文本”，从同一条
+        stdout 里剖出来；剖不到就退回旧的 ``_fetch_result()``（兼容
+        用户代码自己 print 干扰、或结果非 JSON 可序列化的情况）。
         """
         ws = workspace or self.workspace
         prefix = ""
@@ -354,10 +419,18 @@ class ArcpyKernel:
         with self._exec_lock:
             if not self.is_alive():
                 self.start()
-            outcome = self._execute_raw(prefix + code, timeout=timeout)
+            combined = prefix + _RESULT_HEAD + code + _RESULT_TAIL
+            outcome = self._execute_raw(combined, timeout=timeout)
             outcome.duration_ms = int((time.time() - started) * 1000)
             if outcome.ok:
-                outcome.result = self._fetch_result()
+                result, stdout = _split_result(outcome.stdout or "")
+                outcome.stdout = stdout
+                if result is _RESULT_MISSING:
+                    # 兜底：哨兵没出现（用户代码可能重定向了 stdout / 提前 return），
+                    # 走旧的两趟路径，行为与以前完全一致。
+                    outcome.result = self._fetch_result()
+                else:
+                    outcome.result = result
         return outcome
 
     def _execute_raw(self, code: str, *, timeout: float) -> ExecResult:

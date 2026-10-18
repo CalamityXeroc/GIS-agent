@@ -687,3 +687,61 @@ def test_chat_sends_effort_for_the_given_task_type():
     client._client = _Client()
     client.chat([{"role": "user", "content": "hi"}], task_type="agent")
     assert seen.get("extra_body", {}).get("reasoning_effort") == "low"
+
+
+# ------------------------------------------------------- 用量与缓存命中率统计
+def test_usage_summary_aggregates_and_computes_hit_rate():
+    """一次成功调用就要把 token 用量累加进来，并能算出缓存命中率。
+
+    以前只在日志后缀里写 cached=N，跑完就没了 —— 无法回答"这个任务花了
+    多少 token / 缓存命中率多少 / 哪个模型在烧钱"。
+    """
+    from gis_cli.engine.llm_client import EngineLLMClient, EngineLLMConfig, LLMResponse
+
+    client = EngineLLMClient(EngineLLMConfig(model="m", api_key="k", api_base="http://x"))
+    client._record_usage(
+        "m",
+        LLMResponse(
+            content="hi",
+            model="m",
+            usage={"prompt_tokens": 1000, "completion_tokens": 50, "prompt_cache_hit_tokens": 800},
+        ),
+    )
+    client._record_usage(
+        "m",
+        LLMResponse(
+            content="hi",
+            model="m",
+            usage={"prompt_tokens": 500, "completion_tokens": 20, "cached_tokens": 0},
+        ),
+    )
+    summary = client.usage_summary()
+    assert summary["calls"] == 2
+    assert summary["prompt_tokens"] == 1500
+    assert summary["completion_tokens"] == 70
+    assert summary["cached_tokens"] == 800
+    assert abs(summary["cache_hit_rate"] - 800 / 1500) < 1e-9
+    assert summary["by_model"]["m"]["calls"] == 2
+
+
+def test_usage_summary_separates_models():
+    """按模型分开累计（熔断切换后能看清是哪个模型在烧 token）。"""
+    from gis_cli.engine.llm_client import EngineLLMClient, EngineLLMConfig, LLMResponse
+
+    client = EngineLLMClient(EngineLLMConfig(model="a", api_key="k", api_base="http://x"))
+    client._record_usage("a", LLMResponse(content="", model="a", usage={"prompt_tokens": 100}))
+    client._record_usage("b", LLMResponse(content="", model="b", usage={"prompt_tokens": 300}))
+    summary = client.usage_summary()
+    assert summary["by_model"]["a"]["prompt_tokens"] == 100
+    assert summary["by_model"]["b"]["prompt_tokens"] == 300
+    assert summary["prompt_tokens"] == 400
+
+
+def test_usage_summary_empty_is_safe():
+    """没有任何调用时不能除零，返回结构化空值。"""
+    from gis_cli.engine.llm_client import EngineLLMClient, EngineLLMConfig
+
+    summary = EngineLLMClient(EngineLLMConfig(model="m", api_key="k", api_base="http://x")).usage_summary()
+    assert summary["calls"] == 0
+    assert summary["cache_hit_rate"] == 0.0
+    assert summary["by_model"] == {}

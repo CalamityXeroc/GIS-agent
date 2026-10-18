@@ -44,6 +44,9 @@ class LoopConfig:
     verbose: bool = False
     max_diagnosis_turns: int = 3
     escalate_after_failures: int = 2
+    #: 一轮里最多并发几个**只读**工具（catalog_query / read_file …）。
+    #: 1 = 完全串行（旧行为）。只并连续的只读动作，写操作与 execute_code 仍串行。
+    max_parallel_readonly: int = 3
     # 整跑截止时间：网关半死不活时，单轮 LLM 调用可能反复重试几十分钟，
     # 若无总截止，一次 run 会整夜空转（实测 11.7h/22 轮）。到时后置 deadline_exceeded。
     run_deadline_seconds: float = 7200.0
@@ -109,9 +112,10 @@ class AgentLoop:
         self.state: TaskState | None = None
         self._messages: list[dict[str, Any]] = []
         self._finish_rejections = 0
-        self._nudges = 0
         self._diagnosis_streak = 0
         self._consecutive_failures = 0
+        #: ``_run_actions`` 中“本动作导致应停止”的标记（ask_user / finish）
+        self._stopped_on: Action | None = None
 
     # ------------------------------------------------------------------ public
     def run(
@@ -239,21 +243,12 @@ class AgentLoop:
 
             stop = False
             turn_observations: list[Observation] = []
-            for action in actions:
-                if action.parse_error:
-                    observation = Observation(
-                        ok=False,
-                        summary=f"工具参数解析失败: {action.parse_error}",
-                        error={"type": "ArgumentParseError", "message": action.parse_error},
-                        hint="请重新输出合法的 JSON 参数。",
-                    )
+            for action, observation in self._run_actions(actions):
+                if observation is not None:
                     turn_observations.append(observation)
                     self._append_observation(observation, action)
-                    continue
-                observation, stop = self._handle_action(action)
-                turn_observations.append(observation)
-                self._append_observation(observation, action)
-                if stop:
+                if self._stopped_on is action:
+                    stop = True
                     break
 
             self._append_turn_images(turn_observations)
@@ -299,9 +294,114 @@ class AgentLoop:
             self._consecutive_failures += 1
 
     # ------------------------------------------------------------------ actions
+    def _run_actions(
+        self, actions: list[Action]
+    ) -> list[tuple[Action, Observation | None]]:
+        """执行本轮所有动作，**按原顺序**返回 ``(action, observation)``。
+
+        并行的理由：模型一轮里经常同时发多个只读查询（如一次查三个数据集），
+        串行时每个都要等一次完整的“读文件/查目录”。多个只读工具之间没有
+        依赖，并发能省下真实等待。
+
+        只并**连续的**一段只读动作（不跨越写操作），因为写操作可能依赖前面
+        只读动作的结果，且顺序不能动。
+
+        顺序保证：结果按 ``actions`` 的下标回填，而 ``_append_observation`` 在
+        调用方按同一顺序做 —— 否则 tool_call_id 与结果会错配，模型会看到
+        “参数是 A 的结果却是 B”。
+        """
+        results: list[tuple[Action, Observation | None]] = []
+        self._stopped_on: Action | None = None
+        index = 0
+        total = len(actions)
+        while index < total:
+            action = actions[index]
+            # 参数解析失败：不执行，直接给一条失败观察
+            if action.parse_error:
+                results.append(
+                    (
+                        action,
+                        Observation(
+                            ok=False,
+                            summary=f"工具参数解析失败: {action.parse_error}",
+                            error={"type": "ArgumentParseError", "message": action.parse_error},
+                            hint="请重新输出合法的 JSON 参数。",
+                        ),
+                    )
+                )
+                index += 1
+                continue
+
+            # 收集一段连续的只读动作
+            batch: list[Action] = []
+            while (
+                index + len(batch) < total
+                and not actions[index + len(batch)].parse_error
+                and self._is_parallelizable(actions[index + len(batch)])
+            ):
+                batch.append(actions[index + len(batch)])
+
+            if len(batch) > 1:
+                results.extend(self._run_readonly_batch(batch))
+                index += len(batch)
+                continue
+
+            # 单个动作（或写操作）：串行
+            observation, should_stop = self._handle_action(action)
+            results.append((action, observation))
+            index += 1
+            if should_stop:
+                self._stopped_on = action
+                break
+        return results
+
+    def _is_parallelizable(self, action: Action) -> bool:
+        """这个动作能否与其他只读动作并发。"""
+        if action.kind != "tool":
+            return False
+        checker = getattr(self.registry, "is_readonly", None)
+        return bool(checker and checker(action.tool))
+
+    def _run_readonly_batch(
+        self, batch: list[Action]
+    ) -> list[tuple[Action, Observation | None]]:
+        """并发执行一组只读动作，结果按原顺序返回。"""
+        if len(batch) <= 1:
+            observation, _ = self._handle_action(batch[0])
+            return [(batch[0], observation)]
+
+        ordered: list[Observation | None] = [None] * len(batch)
+        workers = max(1, min(int(self.config.max_parallel_readonly), len(batch)))
+
+        def _work(position: int, action: Action) -> None:
+            try:
+                observation, _ = self._handle_action(action)
+            except Exception as exc:  # pragma: no cover - 防御
+                logger.exception("parallel tool %s crashed", action.tool)
+                observation = Observation(
+                    ok=False,
+                    summary=f"工具 {action.tool} 内部异常: {exc}",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            ordered[position] = observation
+
+        if workers == 1:
+            for position, action in enumerate(batch):
+                _work(position, action)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gis-agent-ro") as pool:
+                for future in [pool.submit(_work, i, a) for i, a in enumerate(batch)]:
+                    future.result()
+        return [(action, ordered[i]) for i, action in enumerate(batch)]
+
     def _handle_action(self, action: Action) -> tuple[Observation, bool]:
         """Execute one action; returns (observation, should_stop)."""
-        self.recorder.record("tool_call", {"tool": action.tool, "args": self._safe_args(action.args)})
+        # recorder 是可选的（未传时 `run()` 才惰性建；单测也可能不建）。
+        # 这里曾直接调 self.recorder.record(...) —— 没有 recorder 时直接崩。
+        if self.recorder is not None:
+            self.recorder.record("tool_call", {"tool": action.tool, "args": self._safe_args(action.args)})
         self._emit("tool_call", {"tool": action.tool, "args": self._safe_args(action.args)})
 
         if action.tool == "finish":
@@ -309,7 +409,8 @@ class AgentLoop:
         if action.tool == "ask_user":
             observation = self.registry.execute("ask_user", action.args, self.context)
             self.state.status = "awaiting_user"
-            self.recorder.record("tool_result", {"tool": action.tool, "observation": observation.to_dict()})
+            if self.recorder is not None:
+                self.recorder.record("tool_result", {"tool": action.tool, "observation": observation.to_dict()})
             return observation, True
 
         if action.tool == "execute_code":
@@ -323,15 +424,16 @@ class AgentLoop:
                 self.state.add_artifact(path)
         self._check_workspace_hygiene(observation)
         self._collect_design_note(observation)
-        self.recorder.record(
-            "tool_result",
-            {
-                "tool": action.tool,
-                "ok": observation.ok,
-                "summary": observation.summary,
-                "artifacts": observation.artifacts,
-            },
-        )
+        if self.recorder is not None:
+            self.recorder.record(
+                "tool_result",
+                {
+                    "tool": action.tool,
+                    "ok": observation.ok,
+                    "summary": observation.summary,
+                    "artifacts": observation.artifacts,
+                },
+            )
         self._emit("tool_result", {"tool": action.tool, "ok": observation.ok, "summary": observation.summary})
         return observation, False
 
@@ -586,9 +688,12 @@ class AgentLoop:
         text = ""
         if self.use_project_log:
             try:
-                from .project_log import digest as _log_digest
+                from .project_log import relevant_digest as _log_digest
 
-                recent = _log_digest(self.workspace)
+                # 按**相关性**挑历史结论（而不只是最近几条）：
+                # 同一个 workspace 里可能已跑过几十个任务，只取最近会把
+                # “上次同类任务踩过的坑”挤出窗口（详见 relevant_digest）。
+                recent = _log_digest(self.workspace, goal)
                 if recent:
                     text += recent + "\n\n"
             except Exception as exc:  # pragma: no cover
@@ -972,11 +1077,24 @@ class AgentLoop:
                     "goal": self.state.goal,
                     "artifacts": self.state.artifacts,
                     "turns": self.state.turn,
+                    # token 用量与缓存命中率：以前只在日志后缀里一闪而过，
+                    # 跑完就无法回答“这次花了多少 / 缓存命中率如何”。
+                    "usage": self._usage_summary(),
                 },
             )
         if self.use_project_log:
             self._write_project_log()
         self._emit("run_end", self.state.to_dict())
+
+    def _usage_summary(self) -> dict[str, Any]:
+        """本次 run 的 token 用量汇总（客户端不支持时返回空结构）。"""
+        try:
+            getter = getattr(self.llm, "usage_summary", None)
+            if callable(getter):
+                return getter()
+        except Exception as exc:  # pragma: no cover - 统计不能影响收尾
+            logger.debug("usage summary failed: %s", exc)
+        return {}
 
     def _write_project_log(self) -> None:
         """把本次运行的事实结论追加到项目日志（确定性，不调用模型）。"""
@@ -1023,10 +1141,17 @@ class AgentLoop:
                 break
             self._append_assistant(response.content, response.tool_calls, actions)
             stop = False
-            for action in actions:
-                observation, stop = self._handle_action(action)
-                self._append_observation(observation, action)
-                if stop:
+            # 每轮都新建：续跑轮的工具观察也要附图/进对话。
+            # 踩过的坑：这里曾经直接引用 ``turn_observations``，而它只在 ``run()``
+            # 的作用域里定义 —— 任何走 resume 的路径都 NameError，ask_user
+            # （模型“关键信息缺失时才问”的合法出口）用户答完必崩。
+            turn_observations: list[Observation] = []
+            for action, observation in self._run_actions(actions):
+                if observation is not None:
+                    turn_observations.append(observation)
+                    self._append_observation(observation, action)
+                if self._stopped_on is action:
+                    stop = True
                     break
             self._append_turn_images(turn_observations)
             if stop:

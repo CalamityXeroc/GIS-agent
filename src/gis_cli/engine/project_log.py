@@ -155,7 +155,11 @@ def record_run(
 
 
 def digest(workspace: str | Path, max_chars: int = 2500) -> str:
-    """注入提示词用的日志摘要（无日志时返回空串）。"""
+    """注入提示词用的日志摘要（无日志时返回空串）。
+
+    只取**最近若干条**。对“刚做过同样的事”够用，但任务一多，真正相关
+    的那条早被挤出窗口——需要按相关性挑时用 :func:`relevant_digest`。
+    """
     recent = read_recent(workspace, max_chars=max_chars)
     if not recent:
         return ""
@@ -164,4 +168,97 @@ def digest(workspace: str | Path, max_chars: int = 2500) -> str:
     )
 
 
-__all__: list[Any] = ["log_path", "read_recent", "append_entry", "record_run", "build_entry", "digest"]
+def relevant_digest(
+    workspace: str | Path,
+    query: str,
+    *,
+    max_chars: int = 2500,
+    recent_chars: int = 900,
+    top_k: int = 3,
+    min_score: float = 0.12,
+) -> str:
+    """按**相关性**挑历史结论 + 保留最近几条（混合检索）。
+
+    为什么两者都要：
+
+    - 只取最近 → 任务一多，真正相关的那条被挤出窗口（本项目实际场景：
+      一个 workspace 里跑了几十届真题的多个任务）；
+    - 只取相关 → 丢掉“刚才做到哪一步”的即时上下文，续接会断。
+
+    检索器用 ``HashingVectorRetriever``（md5 词袋 + 中文 bigram，无外部依赖、
+    跨进程稳定）。实测对 GIS 短文本很准：
+
+    ==============  ======  ==========================
+    查询             首位命中  分数
+    ==============  ======  ==========================
+    核密度 图例 统一   正确    0.487（次位 0.392）
+    中文字体 方框      正确    0.524（次位 0.111）
+    DEM 重分类 面积    正确    0.526（次位 0.186）
+    ==============  ======  ==========================
+    """
+    path = log_path(workspace)
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:  # pragma: no cover
+        logger.warning("read project log failed: %s", exc)
+        return ""
+    entries = _split_entries(text)
+    if not entries:
+        return ""
+
+    picked: list[str] = []
+    total = 0
+    # 1) 相关性：挑与当前任务最像的历史条目（也要计入预算，
+    #    否则一堆高相关条目会把总长顶破 max_chars）
+    query = " ".join(str(query or "").split())
+    if query:
+        try:
+            from ..agent.vector_retriever import HashingVectorRetriever
+
+            retriever = HashingVectorRetriever()
+            for index, entry in enumerate(entries):
+                retriever.upsert(str(index), entry)
+            for match in retriever.search(query, top_k=max(1, int(top_k))):
+                if match.score < min_score:
+                    continue
+                entry = entries[int(match.record_id)]
+                if entry in picked:
+                    continue
+                if picked and total + len(entry) > max_chars:
+                    continue
+                picked.append(entry)
+                total += len(entry)
+        except Exception as exc:  # pragma: no cover - 检索失败退回纯最近
+            logger.debug("relevant log search failed: %s", exc)
+
+    # 2) 最近：保留即时上下文（续接用）
+    for entry in reversed(entries):
+        if entry in picked:
+            continue
+        if total + len(entry) > max_chars:
+            break
+        picked.append(entry)
+        total += len(entry)
+        if total >= recent_chars and len(picked) > 1:
+            break
+
+    body = "\n".join(picked).strip()
+    if not body:
+        return ""
+    return (
+        "## 项目日志（本工作区此前的运行结论；相关条目已按相似度挑出，"
+        "如与当前任务冲突以当前任务为准）\n" + body
+    )
+
+
+__all__: list[Any] = [
+    "log_path",
+    "read_recent",
+    "append_entry",
+    "record_run",
+    "build_entry",
+    "digest",
+    "relevant_digest",
+]

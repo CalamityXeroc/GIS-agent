@@ -196,12 +196,24 @@ def extract_outputs(value: Any, workspace: str | Path, *, limit: int = 30) -> li
 # ------------------------------------------------------------------ registry
 @dataclass
 class EngineTool:
-    """A tool the engine loop can call."""
+    """A tool the engine loop can call.
+
+    ``readonly`` 标记 = 这个工具**不产生副作用、也不碰内核**，可以与其他
+    readonly 工具并发执行。判定标准要严：
+
+    - 只读文件/目录/数据库；
+    - **不跑 arcpy 代码**（内核已串行化，并发进去只会排队，徒增复杂度）；
+    - **不调 LLM**（会打满并发配额，反而拖慢主链路）；
+    - 不改任务状态（tasklist/finish/ask_user）。
+
+    默认 False（保守）：新加工具忘了标记只是退回串行，不会错。
+    """
 
     name: str
     description: str
     parameters: dict[str, Any]
     handler: Callable[[dict[str, Any], "EngineContext"], Observation]
+    readonly: bool = False
 
     def openai_schema(self) -> dict[str, Any]:
         return {
@@ -225,6 +237,11 @@ class EngineToolRegistry:
 
     def get(self, name: str) -> EngineTool | None:
         return self._tools.get(name)
+
+    def is_readonly(self, name: str) -> bool:
+        """该工具能否与其他只读工具并发（未注册的工具一律当 False）。"""
+        tool = self._tools.get(name)
+        return bool(tool is not None and tool.readonly)
 
     def names(self) -> list[str]:
         return list(self._tools)
@@ -367,6 +384,7 @@ def build_default_registry() -> EngineToolRegistry:
                 },
             },
             handler=_catalog_query,
+            readonly=True,
         )
     )
 
@@ -494,6 +512,7 @@ def build_default_registry() -> EngineToolRegistry:
                 "required": ["path"],
             },
             handler=_read_document,
+            readonly=True,
         )
     )
 
@@ -547,6 +566,7 @@ def build_default_registry() -> EngineToolRegistry:
                 "required": ["path"],
             },
             handler=_read_file,
+            readonly=True,
         )
     )
 
@@ -832,6 +852,7 @@ def build_default_registry() -> EngineToolRegistry:
                 "properties": {"query": {"type": "string", "description": "关键词；留空表示全部"}},
             },
             handler=_list_recipes,
+            readonly=True,
         )
     )
 

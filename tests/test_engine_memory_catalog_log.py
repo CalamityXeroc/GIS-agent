@@ -811,3 +811,74 @@ def test_vision_check_returns_empty_on_bad_reply(tmp_path):
 
     verifier = Verifier(workspace=tmp_path, llm_client=_BadLLM(), vision_mode="warn")
     assert verifier.vision_check_images(paths) == {}
+
+
+# ---------------------------------------------------------------- 相关性检索
+def _write_log(workspace: Path, entries: list[str]) -> None:
+    from gis_cli.engine import project_log
+
+    path = project_log.log_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(entries), encoding="utf-8")
+
+
+def test_relevant_digest_finds_old_relevant_entry(tmp_path: Path):
+    """**核心场景**：相关的那条早就被挤出"最近 N 条"窗口，仍要能捞回来。
+
+    实测背景：同一个 workspace 里跑过几十个任务，而 ``read_recent`` 只取尾部
+    —— "上次同类任务踩过的坑"因此永远注入不进提示词，模型反复踩同一个坑。
+    """
+    from gis_cli.engine.project_log import digest, relevant_digest
+
+    entries = [
+        "## 2026-09-01 · r1 · 已完成\n- 目标: 把动物点位做核密度，出四张统一图例的图\n"
+        "- 踩过的坑: 四张图的 class_bounds 不一致，图例对不上\n",
+    ]
+    # 后面塞一堆无关任务，把上面那条挤出"最近"窗口
+    for index in range(12):
+        entries.append(
+            f"## 2026-09-{index + 2:02d} · r{index + 2} · 已完成\n"
+            f"- 目标: 无关任务 {index}（统计数据导出）\n- 结论: 完成\n"
+        )
+    _write_log(tmp_path, entries)
+
+    # 用较小的窗口模拟“日志已积累很多”：默认 2500 会把全部 13 条都装下。
+    old = digest(tmp_path, max_chars=400)
+    assert "核密度" not in old, "前置条件：最近窗口里确实没有那条"
+
+    new = relevant_digest(tmp_path, "核密度 统一图例 分级", max_chars=1200)
+    assert "class_bounds" in new, f"相关性检索没捞回旧条目:\n{new}"
+
+
+def test_relevant_digest_keeps_recent_context(tmp_path: Path):
+    """相关性检索不能把"刚才做到哪"挤掉（续接会断）。"""
+    from gis_cli.engine.project_log import relevant_digest
+
+    entries = [
+        "## 2026-09-01 · r1 · 已完成\n- 目标: 核密度 图例 统一\n- 踩过的坑: class_bounds\n",
+        "## 2026-09-02 · r2 · 失败\n- 目标: 刚才这一步（紧接着的上下文）\n",
+    ]
+    _write_log(tmp_path, entries)
+    out = relevant_digest(tmp_path, "核密度 图例")
+    assert "class_bounds" in out, out
+    assert "刚才这一步" in out, f"最近的即时上下文丢了:\n{out}"
+
+
+def test_relevant_digest_empty_when_no_log(tmp_path: Path):
+    from gis_cli.engine.project_log import relevant_digest
+
+    assert relevant_digest(tmp_path, "任何任务") == ""
+
+
+def test_relevant_digest_respects_max_chars(tmp_path: Path):
+    """总长度受 max_chars 约束（相关条目与最近条目共用预算）。"""
+    from gis_cli.engine.project_log import relevant_digest
+
+    entries = [
+        f"## 2026-09-{i:02d} · r{i} · 已完成\n- 目标: 核密度任务 {i}\n- 结论: {'x' * 300}\n"
+        for i in range(1, 10)
+    ]
+    _write_log(tmp_path, entries)
+    out = relevant_digest(tmp_path, "核密度", max_chars=800, recent_chars=200)
+    # 头部说明文字不计入预算，给 200 字余量
+    assert len(out) <= 800 + 200, f"超出预算: {len(out)}"
