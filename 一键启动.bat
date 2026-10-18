@@ -99,12 +99,12 @@ REM --- subroutine: install a package only if its import is missing -----------
 :ensure
 "%PYTHON_PATH%" -c "import %~1" >nul 2>&1
 if errorlevel 1 (
-    echo [INFO] Installing %~2 ...
-    "%PYTHON_PATH%" -m pip install %~2 --quiet
+    echo [INFO] Installing %~1 ...
+    "%PYTHON_PATH%" -m pip install "%~2" --quiet
     if errorlevel 1 (
-        echo [WARN] Could not install %~2 (startup continues, related feature degrades)
+        echo [WARN] Could not install %~1 (startup continues, related feature degrades)
     ) else (
-        echo [OK] %~2 installed
+        echo [OK] %~1 installed
     )
 )
 exit /b 0
