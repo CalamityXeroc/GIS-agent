@@ -9,6 +9,7 @@ data awareness, methodology reuse, and verification.
 from __future__ import annotations
 
 import json
+import time
 import logging
 import re
 from dataclasses import dataclass, field
@@ -390,7 +391,7 @@ def build_default_registry() -> EngineToolRegistry:
 
     # ------------------------------------------------------------ execute_code
     def _execute_code(args: dict[str, Any], ctx: EngineContext) -> Observation:
-        from ..runtime.code_runner import backup_paths, looks_destructive
+        from ..runtime.code_runner import backup_paths, backup_targets
 
         code = str(args.get("code", "") or "")
         if not code.strip():
@@ -398,12 +399,23 @@ def build_default_registry() -> EngineToolRegistry:
         description = str(args.get("description", "") or "")
         timeout = float(args.get("timeout_seconds", ctx.exec_timeout) or ctx.exec_timeout)
 
-        if ctx.auto_backup and looks_destructive(code):
-            candidates = _referenced_existing_paths(code, ctx.workspace, ctx)
-            if candidates:
-                created = backup_paths(candidates, ctx.backup_dir)
-                if created:
-                    logger.info("backed up before destructive code: %s", created)
+        # 备份判据分两类（详见 backup_targets）：
+        # 1) 显式删除（Delete/rmtree/remove）；
+        # 2) **写工具的输出已存在** —— 内核里 overwriteOutput=True 是全局开着的，
+        #    正常写产出也会静默覆盖原数据，以前这类完全不备份。
+        backed_up: list[str] = []
+        if ctx.auto_backup:
+            targets = backup_targets(code, ctx.workspace)
+            # GDB 里的要素类不是文件系统路径：``Path.exists()`` 对它们返回 False，
+            # 只有 ``arcpy.Exists()`` 为真。而这里跑在**主进程**（venv，通常没有
+            # arcpy），所以纯靠文件系统判断会漏掉整个 GDB 内的覆盖 —— 而 GDB
+            # 正是本项目最常见的产物形态。没找到目标时再问一次内核。
+            if not targets and ".gdb" in code.lower() and ctx.code_runner is not None:
+                targets = _gdb_targets_via_kernel(code, ctx)
+            if targets:
+                backed_up = _backup_via_kernel(targets, ctx) or backup_paths(targets, ctx.backup_dir)
+                if backed_up:
+                    logger.info("backed up before overwriting: %s", backed_up)
 
         result = ctx.code_runner.run(code, timeout=timeout, workspace=str(ctx.workspace))
         artifacts = extract_outputs(result.result, ctx.workspace) if result.ok else []
@@ -416,6 +428,10 @@ def build_default_registry() -> EngineToolRegistry:
                     ctx.state.add_artifact(path)
             soft_hint = _recipe_soft_hint(ctx, description, code)
             data: dict[str, Any] = {"stdout": result.stdout[-4000:], "result": result.result}
+            # 覆盖前做了备份要让模型知道：它才知道自己刚改掉了什么、
+            # 以及需要时可以怎么回滚。
+            if backed_up:
+                data["backed_up"] = backed_up
             # 预警也要能看见：matplotlib 缺字形、UserWarning 之类只写 stderr，
             # 之前成功路径只回传 stdout，导致“中文全变方框”的图一路通过验收。
             warning_hint = ""
@@ -1183,60 +1199,107 @@ def build_default_registry() -> EngineToolRegistry:
     return registry
 
 
-_QUOTED_PATH = re.compile(r"""["']([A-Za-z]:[\\/][^"'<>|*?\n]+|\.{0,2}[\\/][^"'<>|*?\n]+)["']""")
 
+def _gdb_targets_via_kernel(code: str, ctx: Any) -> list[str]:
+    """在**内核里**用 ``arcpy.Exists`` 确认哪些 GDB 路径会被覆盖。
 
-# 不做自动备份的目录名（只读输入数据；备份它既无意义又极占空间）
-_BACKUP_SKIP_DIRS = {"input", "skills", "config", ".git", ".venv"}
-# 单个目录备份体积上限（MB）：超限则跳过并告警，避免 copytree 拖垮磁盘
-_BACKUP_DIR_MAX_MB = 200
+    为什么必须走内核：``Path.exists('x.gdb/study_area')`` 返回 **False**，
+    只有 ``arcpy.Exists()`` 为真。而 ``backup_targets`` 跑在主进程（venv，
+    通常没有 arcpy），纯文件系统判断会漏掉整个 GDB 内的覆盖 —— 而 GDB 正是
+    本项目最常见的产物形态。
 
+    实测教训：覆盖 ``study_area`` 后旧数据静默消失、零备份，就是因为
+    ``_gdb_exists`` 在 venv 里恒为 False。
 
-def _dir_size_mb(path: Path) -> float:
-    total = 0
-    try:
-        for item in path.rglob("*"):
-            if item.is_file():
-                total += item.stat().st_size
-            if total > _BACKUP_DIR_MAX_MB * 1024 * 1024:
-                return total / 1024 / 1024
-    except OSError:
-        return 0.0
-    return total / 1024 / 1024
-
-
-def _referenced_existing_paths(code: str, workspace: Path, ctx: Any = None) -> list[str]:
-    """Best-effort: existing paths referenced by destructive code.
-
-    只备份"可能被改写的结果文件"，不备份只读输入与超大目录：
-    - ``input/``（及 skills/config/.git/.venv）是只读数据，备份无意义
-    - 目录体积超过 ``_BACKUP_DIR_MAX_MB`` 时跳过（实测整目录备份一次 300 MB）
-
-    ``ctx`` 可选：有的话走 :func:`_resolve_path`（能处理“路径里多写了工作区名”
-    的情况）；没有就按 workspace 拼。注意 **不能**直接引用 ``ctx.workspace``——
-    本函数签名只有 (code, workspace)，之前那样写会在破坏性代码路径上抛
-    NameError（14 届 4a-1 实测），而备份失败会直接中断整个 execute_code。
+    代价：一次极轻量的内核往返（只做 exists 判断）。只在代码里出现 ``.gdb``
+    且文件系统没找到目标时才触发。
     """
-    found: list[str] = []
-    for match in _QUOTED_PATH.finditer(code):
-        raw = match.group(1)
-        candidate = Path(raw)
-        if not candidate.is_absolute():
-            resolved = _resolve_path(ctx, raw)[0] if ctx is not None else None
-            candidate = resolved or (workspace / raw)
-        if not candidate.exists() or str(candidate) in found:
-            continue
-        if candidate.is_dir():
-            name = candidate.name.lower()
-            if name in _BACKUP_SKIP_DIRS:
-                logger.info("skip backup of read-only dir: %s", candidate)
-                continue
-            size_mb = _dir_size_mb(candidate)
-            if size_mb > _BACKUP_DIR_MAX_MB:
-                logger.warning(
-                    "skip backup of large dir (%.0f MB > %s MB): %s",
-                    size_mb, _BACKUP_DIR_MAX_MB, candidate,
-                )
-                continue
-        found.append(str(candidate))
-    return found
+    from ..runtime.code_runner import backup_targets as _candidates
+
+    candidates = _candidates(code, ctx.workspace, ignore_exists=True)
+    if not candidates:
+        return []
+    payload = ", ".join(repr(str(item)) for item in candidates)
+    probe = (
+        "import arcpy as _a\n"
+        f"_c = [{payload}]\n"
+        "set_result([p for p in _c if _a.Exists(p)])\n"
+    )
+    try:
+        outcome = ctx.code_runner.run(probe, timeout=60, workspace=str(ctx.workspace))
+    except Exception as exc:  # pragma: no cover - 探测失败不能阻断执行
+        logger.warning("gdb existence probe failed: %s", exc)
+        return []
+    if not outcome.ok or not isinstance(outcome.result, list):
+        return []
+    out_root = str((Path(ctx.workspace) / "output").resolve()).lower()
+    kept: list[str] = []
+    for item in outcome.result:
+        text = str(item)
+        try:
+            resolved = str(Path(text).resolve())
+        except OSError:
+            resolved = text
+        if resolved.lower().startswith(out_root):
+            kept.append(resolved)
+    return kept
+
+
+def _backup_via_kernel(targets: list[str], ctx: Any) -> list[str]:
+    """在**内核里**做备份（GDB 成员必须走 arcpy，主进程没有 arcpy）。
+
+    普通文件/目录也能处理：能 copy 的走 shutil，GDB 成员走 CopyFeatures/
+    CopyRows/CopyRaster 导成独立备份库。
+
+    返回创建的备份路径；失败/无内核时返回空列表（由调用方退回主进程备份）。
+    """
+    if ctx.code_runner is None or not targets:
+        return []
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    root = str(Path(ctx.backup_dir) / stamp)
+    payload = ", ".join(repr(str(item)) for item in targets)
+    probe = f'''
+import os as _os, shutil as _sh
+import arcpy as _a
+_root = r"{root}"
+_os.makedirs(_root, exist_ok=True)
+_created = []
+for _src in [{payload}]:
+    try:
+        _desc = _a.Describe(_src)
+        _kind = getattr(_desc, "dataType", "") or ""
+        _name = _os.path.basename(_src.rstrip("\\/"))
+        if _kind in ("FeatureClass", "Table", "RasterDataset", "Raster"):
+            _gdb = _os.path.join(_root, _name + "_backup.gdb")
+            if not _a.Exists(_gdb):
+                _a.management.CreateFileGDB(_root, _name + "_backup.gdb")
+            _dst = _os.path.join(_gdb, _name)
+            if _kind in ("FeatureClass",):
+                _a.management.CopyFeatures(_src, _dst)
+            elif _kind == "Table":
+                _a.management.CopyRows(_src, _dst)
+            else:
+                _a.management.CopyRaster(_src, _dst)
+            _created.append(_gdb)
+        elif _os.path.isdir(_src):
+            _dst = _os.path.join(_root, _name)
+            if _os.path.isdir(_dst):
+                _sh.rmtree(_dst, ignore_errors=True)
+            _sh.copytree(_src, _dst, ignore=_sh.ignore_patterns("*.lock", "*.lockfile"))
+            _created.append(_dst)
+        elif _os.path.isfile(_src):
+            _dst = _os.path.join(_root, _name)
+            _sh.copy2(_src, _dst)
+            _created.append(_dst)
+    except Exception as _exc:
+        pass
+set_result(_created)
+'''
+    try:
+        outcome = ctx.code_runner.run(probe, timeout=300, workspace=str(ctx.workspace))
+    except Exception as exc:  # pragma: no cover - 备份失败不能阻断执行
+        logger.warning("kernel backup failed: %s", exc)
+        return []
+    if not outcome.ok or not isinstance(outcome.result, list):
+        return []
+    return [str(item) for item in outcome.result]

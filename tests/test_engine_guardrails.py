@@ -318,42 +318,39 @@ def test_backup_skips_arcgis_lock_files(tmp_path):
 
 def test_backup_skips_readonly_and_large_dirs(tmp_path):
     """备份不能把只读输入目录整份复制（实测 input/ 被备份 100 次共 2 GB）。"""
-    from gis_cli.engine.tools import _referenced_existing_paths
+    from gis_cli.runtime.code_runner import backup_targets
 
     (tmp_path / "input").mkdir()
     (tmp_path / "input" / "big.tif").write_bytes(b"x" * 1024)
     (tmp_path / "output").mkdir()
     (tmp_path / "output" / "result.gdb").mkdir()
-    code = f'p = r"{tmp_path / "input"}"\nq = r"{tmp_path / "output" / "result.gdb"}"\narcpy.management.Delete(q)\n'
-    found = _referenced_existing_paths(code, tmp_path)
+    code = (
+        f'p = r"{tmp_path / "input"}"\n'
+        f'q = r"{tmp_path / "output" / "result.gdb"}"\n'
+        "arcpy.management.Delete(q)\n"
+    )
+    found = backup_targets(code, tmp_path)
     assert str(tmp_path / "input") not in found  # 只读输入目录跳过
     assert str(tmp_path / "output" / "result.gdb") in found  # 结果目录仍备份
 
 
-def test_backup_handles_relative_paths_without_ctx(tmp_path):
-    """回归：备份扫描碰到以 / 开头的引号串不能抛 NameError。
+def test_backup_handles_relative_paths_and_non_path_strings(tmp_path):
+    """回归：备份扫描碰到以 / 开头的引号串不能抛异常。
 
-    实测 bug（14 届 4a-1）：_referenced_existing_paths 签名只有 (code, workspace)，
-    内部却引用了不存在的 ctx。_QUOTED_PATH 会把 ``'/query'`` 这类以 / 开头的
-    普通字符串当成路径，于是 _resolve_path(ctx, ...) 直接抛 NameError——
-    而它跑在“破坏性代码先备份”这一步，报错会中断整个 execute_code。
-    旧测试全用绝对路径，恰好绕过了那一行。
+    实测 bug（14 届 4a-1）：旧实现把 ``'/query'`` 这类以 / 开头的普通字符串
+    当成路径，在“破坏性代码先备份”这一步抛 NameError，直接中断整个
+    execute_code。旧测试全用绝对路径，恰好绕过了那一行。
     """
-    from gis_cli.engine.tools import _referenced_existing_paths
+    from gis_cli.runtime.code_runner import backup_targets
 
     (tmp_path / "output").mkdir()
     (tmp_path / "output" / "keep.gdb").mkdir()
-    # 以 / 开头的引号串（模型代码里很常见，如请求路径、正则）就会落到那一行
+    # 以 / 开头的引号串（模型代码里很常见，如请求路径、正则）
     code = 'url = "/query"\narcpy.management.Delete("output/keep.gdb")\n'
 
-    found = _referenced_existing_paths(code, tmp_path)  # 不传 ctx：以前这里就崩
+    found = backup_targets(code, tmp_path)  # 不能抛
     assert isinstance(found, list)
-
-    class _Ctx:
-        workspace = tmp_path
-
-    # 传 ctx 也不能崩（走 _resolve_path 分支）
-    assert isinstance(_referenced_existing_paths(code, tmp_path, _Ctx()), list)
+    assert str(tmp_path / "output" / "keep.gdb") in found, found
 
 
 # ------------------------------------------------ 上下文压缩（抖动回归）
