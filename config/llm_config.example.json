@@ -65,7 +65,8 @@
       "hygiene_check": "交付卫生检查：warn（默认，验收时仅提醒过程库重做残留/过程文件）| block（计入验收失败）| off。",
       "model_failure_threshold": "主模型连续超时/连断达到该次数就冷却，直接走备用模型（写在本段或 llm 根段都行）。",
       "model_cooldown_seconds": "首次冷却时长；同一模型反复失败会指数升级（上限 model_cooldown_max_seconds=3600）。",
-      "vision_check": "图面识图质检：warn（默认，让识图模型看图并提醒中文是否可读/图面是否被裁）| block（计入验收失败）| off。需在配置里设 \"vision\": true 且模型支持识图。"
+      "vision_check": "图面识图质检：warn（默认，让识图模型看图并提醒中文是否可读/图面是否被裁）| block（计入验收失败）| off。需在配置里设 \"vision\": true 且模型支持识图。",
+      "reasoning_effort": "思考档位（minimal/low/medium/high/xhigh/max），部分推理模型不传就没有思考内容。留空则不传该字段；换到不认此参数的网关时必须留空。"
     },
     "vision_check": "warn"
   },

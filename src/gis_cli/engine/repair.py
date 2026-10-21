@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,10 +61,21 @@ class CodeRepairer:
         llm_client: Any,
         code_runner: Any,
         max_attempts: int = 4,
+        llm_budget_seconds: float = 150.0,
+        max_repair_seconds: float = 600.0,
     ):
         self.llm_client = llm_client
         self.code_runner = code_runner
         self.max_attempts = max(1, int(max_attempts))
+        #: 单次失败允许的**总**修复时长（墙钟）。修复是加速手段：一直修不好说明
+        #: 方向错了，该把错误原样交回主循环让模型换思路（例如先去 print 看数据），
+        #: 而不是把整跑预算耗在同一个错上。实测 14 届任务二a：3000s 里 2700s
+        #: 花在同一个 CSV 解析失败的反复修复上，最后撞时限。
+        self.max_repair_seconds = float(max_repair_seconds or 0)
+        #: 单次修复调用的 LLM 预算上限（含重试/退避）。
+        #: 修复只是加速手段：修不好就退回主循环让模型看错误，不值得等满
+        #: 420s + 8 次退避（实测一次能烧 950s，14 届任务四a 第 7 轮）。
+        self.llm_budget_seconds = float(llm_budget_seconds or 0) or None
 
     # ------------------------------------------------------------------ public
     def run(
@@ -83,10 +95,14 @@ class CodeRepairer:
         current_code = code
         current_obs = observation
         seen_fingerprints: set[str] = set()
+        started = time.monotonic()
 
         for attempt in range(1, self.max_attempts + 1):
             if current_obs.ok:
                 return current_obs, current_code, attempts
+            if self.max_repair_seconds and time.monotonic() - started > self.max_repair_seconds:
+                logger.info("repair stopped: exceeded %.0fs wall clock", self.max_repair_seconds)
+                break
             fingerprint = self._fingerprint(current_obs)
             if fingerprint in seen_fingerprints:
                 logger.info("repair stopped: repeated identical failure")
@@ -197,6 +213,7 @@ class CodeRepairer:
             ],
             task_type="code_repair",
             temperature=0.1,
+            budget_seconds=self.llm_budget_seconds,
         )
         payload = extract_json_object(response.content)
         if isinstance(payload, dict):
@@ -215,6 +232,7 @@ class CodeRepairer:
                     task_type="code_repair",
                     temperature=0.1,
                     max_tokens=32000,
+                    budget_seconds=self.llm_budget_seconds,
                 )
                 payload = extract_json_object(retry.content)
                 if isinstance(payload, dict):

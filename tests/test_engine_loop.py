@@ -232,3 +232,114 @@ def test_loop_resume_records_observations_of_resumed_turns(tmp_path: Path):
     assert state.status == "completed"
     assert any("续跑步骤" in str(m.get("content", "")) for m in loop._messages), \
         "续跑轮的工具结果没进对话"
+
+
+# --------------------------------------------------------- 断点续跑
+def _write_checkpoint(workspace: Path, *, status="llm_unavailable", turn=7, with_messages=True):
+    runs = workspace / ".gis_agent" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": "run_broken",
+        "goal": "把气象站清洗并插值",
+        "workspace": str(workspace),
+        "status": status,
+        "turn": turn,
+        "requirements": [],
+        "tasklist": [{"id": "t1", "title": "解析 CSV", "status": "completed"}],
+        "artifacts": [str(workspace / "output" / "result_data.gdb")],
+        "methodology": "",
+        "final_summary": "",
+        "error": "LLM 不可用",
+        "created_at": "2026-01-01T00:00:00",
+    }
+    (runs / "run_broken.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    if with_messages:
+        messages = [
+            {"role": "system", "content": "你是 GIS 助手"},
+            {"role": "user", "content": "把气象站清洗并插值"},
+            {"role": "assistant", "content": "先解析 CSV"},
+        ]
+        (runs / "run_broken.messages.json").write_text(json.dumps(messages, ensure_ascii=False), encoding="utf-8")
+
+
+def test_find_checkpoint_requires_messages(tmp_path: Path):
+    """没有消息历史的旧断点不能续（续了也没有上下文）。"""
+    loop, _ = _make_loop(tmp_path, [])
+    _write_checkpoint(tmp_path, with_messages=False)
+    assert loop.find_checkpoint() is None
+
+    _write_checkpoint(tmp_path, with_messages=True)
+    found = loop.find_checkpoint()
+    assert found is not None and found[0].endswith("run_broken.json")
+
+
+def test_find_checkpoint_skips_completed(tmp_path: Path):
+    loop, _ = _make_loop(tmp_path, [])
+    _write_checkpoint(tmp_path, status="completed")
+    assert loop.find_checkpoint() is None, "已完成的运行不该被当成断点"
+
+
+def test_resume_from_checkpoint_continues_and_finishes(tmp_path: Path):
+    """续跑要把断点里的消息历史接上，而不是从头重来。"""
+    _write_checkpoint(tmp_path)
+    loop, llm = _make_loop(tmp_path, [_tc("finish", {"summary": "续跑完成"})])
+
+    state = loop.resume_from_checkpoint()
+
+    assert state.status == "completed", state.status
+    # 断点里的 turn=7 应当被继承（不是从 0 重新数）
+    assert state.turn >= 7, state.turn
+    # 旧消息必须还在（模型靠它知道前面做过什么）
+    assert any("先解析 CSV" in str(m.get("content")) for m in loop._messages)
+    # 续跑会追加一条系统提示，告诉模型别重做
+    assert any("从断点恢复" in str(m.get("content")) for m in loop._messages)
+
+
+def test_output_residue_is_warned_mid_run(tmp_path: Path):
+    """output/ 下的下划线临时件要在运行中提醒，不能等最终验收。
+
+    实测 14 届任务二a：模型把 _mp_fix.shp/.dbf 落在 output/ 里，一直到交付
+    卫生断言才被抓住——那时 60 轮已用尽，想清也来不及。
+    """
+    from gis_cli.engine.state import Observation
+
+    loop, _ = _make_loop(tmp_path, [])
+    out = tmp_path / "output"
+    (out / "成果图").mkdir(parents=True)
+    (out / "_mp_fix.shp").write_text("x", encoding="utf-8")
+    (out / "成果图" / "_m0.jpg").write_text("x", encoding="utf-8")
+    (out / "正常交付.jpg").write_text("x", encoding="utf-8")
+    # GDB 内部不该被扫（里面成千上万个文件）
+    (out / "result_data.gdb").mkdir()
+    (out / "result_data.gdb" / "_a0001.gdbtable").write_text("x", encoding="utf-8")
+
+    obs = Observation(ok=True, summary="执行成功")
+    loop._check_workspace_hygiene(obs)
+
+    hint = obs.hint or ""
+    assert "_mp_fix.shp" in hint, hint
+    assert "成果图/_m0.jpg" in hint, hint
+    assert "正常交付.jpg" not in hint, hint
+    assert "gdbtable" not in hint, "GDB 内部不该被当残留"
+
+    # 同一批不重复提醒
+    obs2 = Observation(ok=True, summary="执行成功")
+    loop._check_workspace_hygiene(obs2)
+    assert not (obs2.hint or ""), obs2.hint
+
+
+def test_resume_extends_turn_budget_when_exhausted(tmp_path: Path):
+    """撞 max_turns 的断点续跑时必须追加预算，否则续跑等于空转。
+
+    实测 14 届任务二a：断点 turn=60 / max_turns=60，续跑后 while 条件
+    直接不成立，只把旧总结又打印了一遍。
+    """
+    _write_checkpoint(tmp_path, status="max_turns", turn=60)
+    loop, _ = _make_loop(tmp_path, [_tc("finish", {"summary": "续跑真的跑了"})])
+    loop.config.max_turns = 60
+
+    state = loop.resume_from_checkpoint()
+
+    assert loop.config.max_turns > 60, loop.config.max_turns
+    assert state.turn > 60, f"续跑没真正推进：turn={state.turn}"
+    assert state.status == "completed", state.status

@@ -228,3 +228,25 @@ class TaskState:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str) -> "TaskState":
+        """从 ``save()`` 写出的 JSON 还原任务状态（用于断点续跑）。"""
+        from pathlib import Path
+
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        state = cls(
+            run_id=str(data.get("run_id") or ""),
+            goal=str(data.get("goal") or ""),
+            workspace=str(data.get("workspace") or ""),
+            status=str(data.get("status") or "running"),
+        )
+        state.turn = int(data.get("turn") or 0)
+        state.requirements = [Requirement.from_dict(x) for x in (data.get("requirements") or []) if isinstance(x, dict)]
+        state.tasklist = [TaskItem.from_dict(x) for x in (data.get("tasklist") or []) if isinstance(x, dict)]
+        state.artifacts = [str(x) for x in (data.get("artifacts") or [])]
+        state.methodology = str(data.get("methodology") or "")
+        state.final_summary = str(data.get("final_summary") or "")
+        state.error = str(data.get("error") or "")
+        state.created_at = str(data.get("created_at") or "")
+        return state

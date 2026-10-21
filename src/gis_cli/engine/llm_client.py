@@ -108,6 +108,9 @@ class EngineLLMConfig:
     # 流式输出：模型边生成边把正文/思考推给界面（用户不必盯着空屏等整段跑完）。
     # 组装后的返回值与非流式完全一致，调用方无感；网关不支持时自动降级。
     stream: bool = True
+    #: 单次流式请求的最短预算。太短的预算会被上游的慢启动误判成卡死，
+    #: 所以即使外层只剩几秒也至少给这么久（测试里可调小以免拖慢 CI）。
+    min_stream_budget_seconds: float = 30.0
 
     @classmethod
     def from_file(cls, path: str | Path) -> "EngineLLMConfig":
@@ -327,8 +330,14 @@ class EngineLLMClient:
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
         on_delta: Any = None,
+        budget_seconds: float | None = None,
     ) -> LLMResponse:
         """Send a chat completion, retrying transient failures.
+
+        ``budget_seconds`` 只给这一次调用封顶（含重试与退避）。自动修复这类
+        “能修就快、修不了就算了”的场景需要它：默认 420s 预算叠上 8 次退避，
+        一次修复能吃掉 16 分钟（实测 14 届任务四a：第 7 轮卡了 950s），
+        而修复失败本来就会退回主循环让模型看错误，不值得等这么久。
 
         ``on_delta(kind, text)`` 在流式模式下被逐块调用（``kind`` 为
         ``"content"``/``"reasoning"``），供界面边生成边显示；不传则静默累积。
@@ -356,6 +365,7 @@ class EngineLLMClient:
                     response_format=response_format,
                     on_delta=on_delta,
                     task_type=task_type,
+                    budget_seconds=budget_seconds,
                 )
                 self._record_success(candidate)
                 self._record_usage(candidate, response)
@@ -468,6 +478,7 @@ class EngineLLMClient:
         response_format: dict[str, Any] | None,
         on_delta: Any = None,
         task_type: str | None = None,
+        budget_seconds: float | None = None,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": model,
@@ -489,6 +500,9 @@ class EngineLLMClient:
         last_error: Exception | None = None
         conn_failures = 0
         budget = float(self.config.total_timeout)
+        if budget_seconds and budget_seconds > 0:
+            # 调用方显式封顶（如自动修复）：见 chat() 的说明
+            budget = min(budget, float(budget_seconds))
         if self._cooldown_strikes.get(model):
             # 该模型本回合已经超时/断连过 → 缩短单次尝试预算，快速失败换下一个模型
             budget = min(budget, float(self.config.reduced_timeout_seconds or budget))
@@ -616,10 +630,28 @@ class EngineLLMClient:
         上游忽略 ``stream`` 参数（当成非流式返回）时抬 ``_StreamUnsupported``，
         由调用方回退到非流式重试。
         """
-        remaining = max(30.0, deadline - time.monotonic())
+        remaining = max(self.config.min_stream_budget_seconds, deadline - time.monotonic())
+        # httpx 的 read timeout 是“每次读”的超时：上游只要持续发心跳或慢速吐字，
+        # 它永远不会触发。实测 workbuddy 反代卡死时，420s 预算的调用挂了 2700s+，
+        # 整个任务就此静默（14 届任务二a 实测）。注意在 chunk 循环里检查时间
+        # 也没用——SDK 的 SSE 解析器会丢弃注释心跳行，循环根本不转。
+        # 所以用看门狗线程到点强制关流，让阻塞中的读取报错退出。
+        stream_deadline = time.monotonic() + remaining
         stream = self.client.chat.completions.create(
             **payload, stream=True, timeout=remaining
         )
+        stream_done = threading.Event()
+        stream_timed_out = threading.Event()
+
+        def _stream_guard() -> None:
+            if not stream_done.wait(remaining):
+                stream_timed_out.set()
+                try:
+                    stream.close()
+                except Exception:  # pragma: no cover - best effort
+                    pass
+
+        threading.Thread(target=_stream_guard, daemon=True).start()
 
         if _looks_like_complete_response(stream):
             # 上游把 stream 参数忽略了，直接返回完整响应。
@@ -638,46 +670,59 @@ class EngineLLMClient:
         usage: dict[str, int] = {}
         emitted = 0
         saw_chunk = False
-        for chunk in stream:
-            saw_chunk = True
-            raw_usage = getattr(chunk, "usage", None)
-            if raw_usage is not None:
-                usage = _usage_dict(raw_usage)
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            choice = choices[0]
-            if getattr(choice, "finish_reason", None):
-                finish_reason = str(choice.finish_reason)
-            delta = getattr(choice, "delta", None)
-            if delta is None:
-                continue
-            text = getattr(delta, "content", None)
-            if text:
-                content_parts.append(str(text))
-                emitted += len(str(text))
-                _emit_delta(on_delta, "content", str(text))
-            think = getattr(delta, "reasoning_content", None)
-            if think:
-                reasoning_parts.append(str(think))
-                emitted += len(str(think))
-                _emit_delta(on_delta, "reasoning", str(think))
-            for raw_call in getattr(delta, "tool_calls", None) or []:
-                index = int(getattr(raw_call, "index", 0) or 0)
-                slot = calls.setdefault(
-                    index, {"id": "", "name": "", "arguments": ""}
-                )
-                call_id = getattr(raw_call, "id", None)
-                if call_id:
-                    slot["id"] = str(call_id)
-                fn = getattr(raw_call, "function", None)
-                if fn is not None:
-                    name = getattr(fn, "name", None)
-                    if name:
-                        slot["name"] = str(name)
-                    args = getattr(fn, "arguments", None)
-                    if args:
-                        slot["arguments"] += str(args)
+        try:
+            for chunk in stream:
+                if time.monotonic() > stream_deadline:
+                    raise TimeoutError(
+                        f"流式响应超过预算 {remaining:.0f}s 仍未结束（上游疑似卡死）"
+                    )
+                saw_chunk = True
+                raw_usage = getattr(chunk, "usage", None)
+                if raw_usage is not None:
+                    usage = _usage_dict(raw_usage)
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = str(choice.finish_reason)
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+                text = getattr(delta, "content", None)
+                if text:
+                    content_parts.append(str(text))
+                    emitted += len(str(text))
+                    _emit_delta(on_delta, "content", str(text))
+                think = getattr(delta, "reasoning_content", None)
+                if think:
+                    reasoning_parts.append(str(think))
+                    emitted += len(str(think))
+                    _emit_delta(on_delta, "reasoning", str(think))
+                for raw_call in getattr(delta, "tool_calls", None) or []:
+                    index = int(getattr(raw_call, "index", 0) or 0)
+                    slot = calls.setdefault(
+                        index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    call_id = getattr(raw_call, "id", None)
+                    if call_id:
+                        slot["id"] = str(call_id)
+                    fn = getattr(raw_call, "function", None)
+                    if fn is not None:
+                        name = getattr(fn, "name", None)
+                        if name:
+                            slot["name"] = str(name)
+                        args = getattr(fn, "arguments", None)
+                        if args:
+                            slot["arguments"] += str(args)
+        except Exception:
+            if stream_timed_out.is_set():
+                raise TimeoutError(
+                    f"流式响应超过预算 {remaining:.0f}s 仍未结束（上游疑似卡死）"
+                ) from None
+            raise
+        finally:
+            stream_done.set()
         if not saw_chunk:
             # 一个 chunk 都没收到：上游可能把 stream 忽略了。交给非流式重试。
             raise _StreamUnsupported("stream returned no chunks (upstream may ignore 'stream')")

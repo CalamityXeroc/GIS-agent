@@ -113,6 +113,18 @@ def build_engine(
         llm_client=llm,
         hygiene_mode=str(engine_cfg.get("hygiene_check", "warn")),
         vision_mode=str(engine_cfg.get("vision_check", "warn")),
+        # 卫生判据参数：与配方侧 deliverable_hygiene_ok 用同一套键，
+        # 避免“同一份交付物配方判不过、验收判过”的两套口径。
+        hygiene_max_duplicate_families=int(
+            engine_cfg.get("hygiene_max_duplicate_families", 0) or 0
+        ),
+        hygiene_ratio_limit=float(engine_cfg.get("hygiene_ratio_limit", 5.0) or 0.0),
+        hygiene_forbid_suffixes=[
+            str(item)
+            for item in (engine_cfg.get("hygiene_forbid_suffixes") or [])
+            if str(item).strip()
+        ]
+        or None,
     )
     registry = build_default_registry()
 
@@ -131,6 +143,7 @@ def build_engine(
     loop_config = LoopConfig(
         max_turns=int(engine_cfg.get("max_turns", 60)),
         max_repairs=int(engine_cfg.get("max_repairs", 4)),
+        max_repair_seconds=float(engine_cfg.get("max_repair_seconds", 600.0)),
         exec_timeout=float(engine_cfg.get("kernel_exec_timeout_seconds", 600)),
         tool_protocol=str(engine_cfg.get("tool_protocol", "auto")),
         context_soft_limit_tokens=int(engine_cfg.get("context_soft_limit_tokens", 120_000)),

@@ -46,11 +46,16 @@ def test_hygiene_flags_process_files_and_ratio_warning():
 
 
 def test_hygiene_flags_probe_artifacts():
-    """回归：模型“试一下”留下的探查件要提醒删。
+    """回归：模型“试一下”留下的探查件要判**问题**（不只是提醒）。
 
     实测（14 届 4a-2）：为验证 create_map 能不能用，模型在成果目录里建了
     ``_test.jpg`` / ``_test1.jpg`` / ``_test2.jpg``，出完图忘了删。
     考卷明确要求“提交时删除非必要过程数据”。
+
+    以前只记 warning，而基准断言只把 problems 判失败 —— 结果 14 届四a
+    那次交付目录里躺着 14 个 ``_m0.aprx`` / ``_q1.jpg`` / ``_r1.jpg``，
+    卫生检查照样报“无问题”。下划线开头不是正常交付物的命名习惯，判问题。
+
     真实数据名不能误伤（test_area.shp 不报）。
     """
     problems, warnings, _detail = hygiene_report(
@@ -58,8 +63,8 @@ def test_hygiene_flags_probe_artifacts():
             "分布中心迁移.jpg", "_test1.jpg", "_test2.jpg", "test_area.shp",
         ])
     )
-    assert not problems, problems
-    assert any("_test1.jpg" in w for w in warnings), warnings
+    assert any("_test1.jpg" in p for p in problems), problems
+    assert not any("test_area" in p for p in problems), ("真数据不该被误报", problems)
     assert not any("test_area" in w for w in warnings), ("真数据不该被误报", warnings)
 
 
@@ -610,3 +615,16 @@ def test_raster_range_falls_back_when_describe_min_missing():
     assert lib._raster_range("x.gdb/kde") == (0.0, 6.012)
     result = lib.run_assertions([{"type": "raster_not_constant", "path": "x.gdb/kde"}])[0]
     assert result.ok is True, result.detail
+
+
+def test_hygiene_sees_files_in_subdirectories():
+    """交付图常放 output/成果图/ 下，只扫顶层会漏掉里面的过程残留。
+
+    实测 14 届四a：顶层只有 2 个文件，成果图/ 里还有 14 个
+    ``_m0.aprx`` / ``_q1.jpg`` / ``_r1.jpg``，卫生检查报“无问题、散文件=2”。
+    """
+    problems, _warnings, detail = hygiene_report(
+        _inventory(["landcover"], files=["成果图/_m0.aprx", "成果图/密度_1982_1986.jpg"])
+    )
+    assert any("_m0.aprx" in p for p in problems), problems
+    assert "散文件=2" in detail, detail

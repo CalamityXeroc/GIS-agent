@@ -142,6 +142,27 @@ _RULES: list[tuple[str, list[str], str, str]] = [
         "或用 `PYTHONUTF8=1` 运行；写文件显式 `encoding='utf-8'`。",
     ),
     (
+        "gbk-decode",
+        [r"UnicodeDecodeError", r"codec can't decode byte"],
+        "读文件时编码猜错（中文数据常见 GBK/GB18030）",
+        "国内竞赛数据（气象站表、统计表）多为 GBK。不要默认 utf-8："
+        "`open(p, encoding='gbk')`，不行再 `gb18030`（超集，能兜住生僻字）；"
+        "拿不准就先 `open(p,'rb').read(200)` 看一眼再决定。",
+    ),
+    (
+        "csv-header-in-data",
+        [
+            r"Cannot locate value columns",
+            r"Value columns resolved to same field",
+            r"未解析出有效经纬度",
+            r"字段.*不存在.*表头",
+        ],
+        "CSV 表头被当成数据行 / 列名没拆开",
+        "先用 `csv.reader` 读前 3 行 `print` 出来看清楚再写解析代码（不要直接猜分隔符）。"
+        "分隔符不是逗号就显式 `delimiter='\\t'`；Excel 转存过的文件可能同时存在"
+        "逗号分隔与字段内制表符，需先把整行拼回再按真实分隔符拆。表头行要跳过。",
+    ),
+    (
         "zone-field",
         [r"ZonalStatistics[\s\S]{0,120}zone[\s\S]{0,60}(invalid|错误)", r"ERROR 000865"],
         "分区字段类型不合适",

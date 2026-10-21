@@ -137,6 +137,9 @@ class Verifier:
         min_image_bytes: int = 8_000,
         hygiene_mode: str = "warn",
         vision_mode: str = "warn",
+        hygiene_max_duplicate_families: int = 0,
+        hygiene_ratio_limit: float = 5.0,
+        hygiene_forbid_suffixes: list[str] | None = None,
     ):
         self.workspace = Path(workspace)
         self.code_runner = code_runner
@@ -144,6 +147,15 @@ class Verifier:
         self.min_image_bytes = min_image_bytes
         # 交付卫生：warn（默认，仅提醒）| block（重复中间件/过程文件算验收不通过）| off
         self.hygiene_mode = str(hygiene_mode or "warn").lower()
+        # 卫生判据参数（与配方侧的 deliverable_hygiene_ok 用同一套键，
+        # 以前这里硬编码 0 / 5.0，导致同一份交付物“配方判不过、验收判过”）。
+        self.hygiene_max_duplicate_families = max(0, int(hygiene_max_duplicate_families or 0))
+        self.hygiene_ratio_limit = max(0.0, float(hygiene_ratio_limit or 0.0))
+        self.hygiene_forbid_suffixes = (
+            [str(item).lower() for item in hygiene_forbid_suffixes]
+            if hygiene_forbid_suffixes
+            else None
+        )
         # 图面识图质检：让识图模型看图，判定中文是否可读/图面是否被裁；warn|block|off
         self.vision_mode = str(vision_mode or "warn").lower()
         #: 识图结论缓存：``(路径, mtime) -> 结论``。
@@ -348,7 +360,10 @@ class Verifier:
             if inventory is None:
                 return {**empty, "warnings": [f"卫生检查跳过: {err}"]}
             problems, warnings_out, detail = hygiene_report(
-                inventory, max_duplicate_families=0, ratio_limit=5.0
+                inventory,
+                max_duplicate_families=self.hygiene_max_duplicate_families,
+                forbid_suffixes=self.hygiene_forbid_suffixes,
+                ratio_limit=self.hygiene_ratio_limit,
             )
             return {
                 "ok": not problems,
@@ -553,9 +568,22 @@ class Verifier:
             problems.append("没有任何产出文件")
         # 结构体检要在剔除外部路径**之后**做，否则会去读 Blank.aprx 之类的无关文件。
         structural = self.structural_check(artifacts)
+        # 内核（有 arcpy）才判得准 GDB 内的要素类/栅格是否存在。模型中途建的
+        # 中间产物（tmp_train / idw_p1 之类）删掉后仍留在 artifacts 里，若在此
+        # 报“产出不存在”，验收就永远不过 —— 14 届任务二a 实测：模型被逼着重建
+        # 已删的中间件，空转到 60 轮上限后改去建 result_data_v2.gdb。
+        # 正确做法：以内核结论为准静默剔除，缺的交付物交给语义验收去点名。
+        alive: list[str] = []
+        for record in structural:
+            if record.get("exists"):
+                alive.append(str(record.get("path", "")))
+        if state is not None and hasattr(state, "artifacts"):
+            state.artifacts = alive
+        if artifacts and not alive:
+            # 登记过的产出全都不在了：这不是“中间件被清理”，是真的什么都没交。
+            problems.append("没有任何产出文件（登记的产出均已不存在）")
         for record in structural:
             if not record.get("exists"):
-                problems.append(f"产出不存在: {record.get('path')}")
                 continue
             if record.get("feature_count") == 0:
                 problems.append(f"产出为空（0 要素）: {record.get('path')}")

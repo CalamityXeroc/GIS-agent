@@ -745,3 +745,122 @@ def test_usage_summary_empty_is_safe():
     assert summary["calls"] == 0
     assert summary["cache_hit_rate"] == 0.0
     assert summary["by_model"] == {}
+
+
+# ------------------------------------------------ 上游卡死不能无限挂起
+def test_stream_stall_is_bounded_by_deadline():
+    """上游持续发 SSE 心跳（注释行）时，httpx 的 read timeout 永不触发。
+
+    实测 workbuddy 反代卡死：420s 预算的调用挂了 2700s+，整个任务静默
+    （14 届任务二a 实测）。看门狗必须到点强制关流。
+    """
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    client = EngineLLMClient(EngineLLMConfig(model="m", total_timeout=30, min_stream_budget_seconds=0.5))
+
+    class _StallingStream:
+        """无限产心跳注释行的流——SDK 会丢弃注释，for 循环拿不到 chunk。"""
+
+        def __init__(self):
+            self.closed = threading.Event()
+
+        def __iter__(self):
+            while not self.closed.is_set():
+                time.sleep(0.05)
+            raise RuntimeError("stream closed")
+
+        def close(self):
+            self.closed.set()
+
+    stall = _StallingStream()
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kw: stall
+    )))
+    client._client = fake
+
+    started = time.monotonic()
+    try:
+        client._stream_once({"model": "m"}, "m", deadline=time.monotonic() + 1.0)
+        raise AssertionError("应当超时抛出，而不是返回")
+    except TimeoutError as exc:
+        assert "预算" in str(exc)
+    elapsed = time.monotonic() - started
+    assert elapsed < 15, f"卡了 {elapsed:.1f}s，说明看门狗没生效"
+
+
+# ------------------------------------------------- 修复调用要能单独封顶
+def test_budget_seconds_caps_a_single_call():
+    """自动修复是加速手段：修不好就退回主循环，不该烧满 420s + 8 次退避。
+
+    实测 14 届任务四a：第 7 轮卡在修复里 950s（420s 预算 + 长退避），
+    整跑预算被一次修复吃掉。
+    """
+    import time
+    from types import SimpleNamespace
+
+    from gis_cli.engine.llm_client import EngineLLMClient, EngineLLMConfig
+
+    cfg = EngineLLMConfig(
+        model="m", total_timeout=600.0, retry_count=2,
+        backoff_seconds=0.2, max_backoff_seconds=0.2, min_stream_budget_seconds=0.5,
+    )
+    client = EngineLLMClient(cfg)
+
+    class _Slow:
+        """每次都抛 429，逼它走退避重试。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("429 rate limited")
+
+    slow = _Slow()
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=slow))
+
+    started = time.monotonic()
+    try:
+        client.chat([{"role": "user", "content": "x"}], task_type="code_repair", budget_seconds=1.0)
+        raise AssertionError("应当抛错")
+    except Exception:
+        pass
+    elapsed = time.monotonic() - started
+    assert elapsed < 15, f"封顶失效，耗时 {elapsed:.1f}s"
+
+
+# ------------------------------------------- 修复不能把整跑预算吃光
+def test_repair_stops_after_wall_clock_cap():
+    """修不好就该回主循环换思路，而不是在同一个错上反复烧预算。
+
+    实测 14 届任务二a：3000s 里 2700s 花在同一个 CSV 解析失败的反复修复上。
+    """
+    import time
+    from types import SimpleNamespace
+
+    from gis_cli.engine.repair import CodeRepairer
+    from gis_cli.engine.state import Observation
+
+    calls = {"llm": 0, "run": 0}
+
+    class _LLM:
+        def chat(self, *a, **kw):
+            calls["llm"] += 1
+            return SimpleNamespace(content='{"thought": "再试一次", "code": "print(1)"}')
+
+    class _Runner:
+        def run(self, *a, **kw):
+            calls["run"] += 1
+            time.sleep(0.2)  # 每次修复都慢
+            return SimpleNamespace(
+                ok=False, stdout="", stderr="", result=None, display_images=[],
+                error={"type": "E", "message": f"fail-{calls['run']}"},
+            )
+
+    r = CodeRepairer(llm_client=_LLM(), code_runner=_Runner(), max_attempts=10,
+                     max_repair_seconds=1.0, llm_budget_seconds=5.0)
+    obs = Observation(ok=False, summary="boom", error={"type": "E", "message": "fail-0"})
+    _, _, attempts = r.run(intent="x", code="print(0)", observation=obs)
+    assert len(attempts) < 10, f"墙钟上限没生效，跑满 {len(attempts)} 次"

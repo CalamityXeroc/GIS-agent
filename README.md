@@ -2,126 +2,102 @@
 
 面向 ArcGIS Pro 工作流的通用 GIS 任务求解平台脚手架。
 
-## 架构概览（v0.4.0 - Agent 架构）
+## 架构概览
 
-本项目采用完整的 AI Agent 架构，参考 Claude Code 的设计模式：
+单一引擎：**有界观察-决策-执行循环** + 原生 tool calling + 代码自修复 + 强制验收。
+（早期那套 plan-then-execute 引擎已从本包移除。）
 
 ```
 src/gis_cli/
-├── agent/                   # 🤖 AI Agent 核心模块 (NEW)
-│   ├── agent.py            # GISAgent 主类 - 集成 Memory/Planner/Executor
-│   ├── memory.py           # 会话记忆系统 - 对话历史、上下文存储
-│   ├── planner.py          # 任务规划器 - 规则推理 + LLM 推理
-│   ├── executor.py         # 计划执行器 - 步骤执行、错误处理
-│   ├── llm.py              # LLM 客户端抽象 - OpenAI/本地/Mock
-│   ├── prompts.py          # 系统提示词 - 中英文双语、规划模板
-│   └── cli.py              # Agent CLI 接口 - 交互式会话
-├── core/                    # 核心架构模块
-│   ├── tool.py             # Tool 基类、验证、权限、执行管道
-│   ├── task.py             # Task 状态机、生命周期管理
-│   ├── registry.py         # 工具注册与发现系统
-│   └── context.py          # 系统/用户/工作空间上下文注入
-├── tools/                   # 模块化工具实现
-│   ├── scan_layers.py      # 扫描 GIS 图层
-│   ├── merge_layers.py     # 合并图层
-│   ├── project_layers.py   # 坐标系投影变换
-│   ├── export_map.py       # 地图导出 (PDF/PNG)
-│   └── quality_check.py    # 数据质量检查
-├── skills/                  # 高级工作流技能
-│   ├── base.py             # Skill 基类与注册
-│   └── bundled.py          # 内置技能 (专题图制作、数据集成、质量保证)
-├── runner/                  # 执行引擎
-│   └── arcpy_runner.py     # ArcGIS 执行器
-├── cli.py                   # CLI 入口
-├── planner.py              # 意图识别与计划生成
-└── orchestrator.py         # 任务生命周期编排
+├── engine/              # 新引擎：循环 / 工具 / 验收 / 自修复
+│   ├── loop.py          # 有界循环：观察 → 决策 → 执行，含预算与守卫
+│   ├── tools.py         # 16 个工具（含 web_search / create_map / run_recipe）
+│   ├── llm_client.py    # 模型客户端：流式 / 熔断 / 降级 / 用量统计
+│   ├── tool_codec.py    # 工具协议自适应（原生 tool calling ↔ JSON）
+│   ├── repair.py        # 代码自修复（traceback 回喂）
+│   ├── verifier.py      # 验收：结构断言 + 语义核对 + 图面识图
+│   ├── project_log.py   # 项目日志（相关性 + 最近 混合检索）
+│   └── runner.py        # 装配入口 build_engine()
+├── runtime/             # ArcPy 运行时
+│   ├── kernel.py        # 持久 Jupyter 内核（一次 import，跨步状态）
+│   ├── code_runner.py   # 内核优先 + 子进程兜底 + 覆盖前自动备份
+│   ├── error_memory.py  # 常见故障 → 修复建议
+│   └── hygiene.py       # 交付卫生（过程文件 / 重做残留）
+├── cartography/         # 制图：facts → design → render → qc
+├── datacatalog/         # SQLite 数据目录（字段名 / 坐标系 / 范围）
+├── recipes/             # 48 个 GIS 方法论配方（自带验证断言）
+├── ui/                  # 终端界面（转录 / 状态行 / 输入框 / 命令）
+├── trace/               # 每次 run 的 JSONL + Markdown 报告
+├── requirements/        # 需求抽取（任务书 → 可验收清单）
+├── skills/              # SKILL.md 技能（渐进披露，run_skill 读全文）
+└── agent/               # CLI 入口（chat / loop）
 ```
 
-### Agent 核心组件
+### 一次任务的执行链路
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        GISAgent                             │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │  Memory  │  │ Planner  │  │ Executor │  │   LLM    │   │
-│  │  对话记忆 │  │ 任务规划  │  │ 计划执行  │  │  大模型   │   │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │
-│         ↓           ↓            ↓             ↓           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │              ToolRegistry + SkillRegistry           │   │
-│  │     5 Tools + 3 Skills = GIS 工具库                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+用户任务
+   ↓
+需求抽取（任务书 → 可验收清单）
+   ↓
+┌─ 有界循环（max_turns / 整跑截止）──────────────┐
+│  模型决策 → 工具调用 → 观察结果 → 再决策        │
+│    ↑                      ↓                      │
+│    └── 代码失败自动修复（traceback 回喂）        │
+└─────────────────────────────────────────────────┘
+   ↓
+强制验收（结构断言 + 语义核对 + 图面识图）
+   ↓ 不过 → 带缺口反馈继续修（有次数上限）
+交付 + trace + 项目日志
 ```
 
-### 核心设计模式
+### 设计要点
 
-- **GISAgent**: 主控制器，协调 Memory/Planner/Executor 组件
-- **Memory**: 会话记忆，存储对话历史和执行上下文
-- **Planner**: 双路规划器（规则推理 + LLM 推理），生成执行计划
-- **Executor**: 计划执行器，处理步骤依赖和错误恢复
-- **Tool**: 单一职责工具，含输入/输出 Schema 验证、权限检查、执行管道
-- **Skill**: 多工具组合的高级工作流，如"专题图制作"
+- **不依赖 ArcGIS 也能启动/规划/验收**：只有真正跑 GP 时才需要 ArcPy
+- **有界**：轮次、诊断次数、修复次数、整跑截止时间都有上限，不会无限空转
+- **可验证**：验收不通过就不算完成（`completed` ≠ 过验收）
+- **可归因**：每次 run 都有 trace，`scripts/latency_report.py --cost` 看耗时与用量
+- **可恢复**：`ask_user` 暂停后 `resume()` 续跑（含 trace 续写）
 
 ## 当前已实现能力
 
-- **流式输出**：模型边生成边显示（思考/回复实时追加，状态行显示字数），
-  首字 2~6s 到屏而不是等整段；上游不支持时自动回退非流式
-- **启动不阻塞**：启动只加载配方与配置（实测 0.3s），数据目录扫描与 ArcPy
-  内核预热改在首个任务时后台并行；`--refresh-catalog` 可恢复启动就扫全
-- **耗时可归因**：`[timing]` 分段日志 + `scripts/latency_report.py`
-  按“模型等待 / 工具执行 / 上下文压缩”算占比（见 docs/performance.md）
-- 自然语言优先的任务输入
-- 基于可配置意图库的意图识别
-- 结构化任务计划生成
-- 风险评估与执行护栏（高风险操作标记）
-- 本地任务持久化与执行回放元数据
-- CLI 命令：创建、规划、执行、查看、重跑建议与修复建议
-- FastAPI 服务接口，支持 Web 控制台接入
-- ArcPy-first 执行器（首批数据整合链路）
-- ArcPy 不可用时自动降级（输入发现 + 执行报告）
-- BOUA/BOUL/AGNP 整合增强：
-	- BOUA 按 `PAC` + `NAME` 融并
-	- BOUA 结果字段保留 `PAC` 与 `NAME`
-	- 结果投影到 `Asia_North_Albers_Equal_Area_Conic`
-	- 生成面向评分核查的 checklist JSON 证据
-	- BOUA 海洋面清理钩子（基于 `NAME` 关键词启发）
-	- 几何检查与修复钩子（CheckGeometry/RepairGeometry）
-- 地图导出与制图增强：
-	- **export_map_layout** 节点：导出地图版式为 JPG（无版式时降级 PNG）（新增）
-	- **apply_symbology** 节点：应用符号化规则（新增）
-	- **apply_layout_template** 节点：应用版式模板（新增）
-	- **build_quality_report** 节点：生成质量检查报告（新增）
-- 节点化重跑与恢复策略：
-	- 失败/待处理节点自动建议重跑
-	- `implementation_pending` 节点可自动跳过
-	- `arcpy_unavailable` 场景可自动强制 `dry-run`
-	- 执行详情写入 `strategy_applied`、`strategy`、`effective_dry_run` 便于审计
-- 完整的端到端集成测试（25+ 单元测试 + 9+ 集成测试）
+**执行与可靠性**
+- 有界观察-决策-执行循环，原生 tool calling（不支持的模型自动降级 JSON 协议）
+- 代码失败自动修复：traceback + 数据目录 + 配方提示一起回喂
+- 持久 Jupyter 内核：一次 import arcpy，跨步保留变量（每步 ~60ms）
+- ZMQ 执行串行化（修过并发写坏 wire 协议的崩溃）
+- 覆盖写入前自动备份（GDB 成员走 `CopyFeatures` 导出，普通文件走 `shutil`）
+- 模型熔断：连续失败进冷却、冷却时长指数升级；`fallback_models` 自动切换
 
-## 项目结构
+**验收**
+- 结构断言：存在性 / 坐标系 WKID / 字段 / 要素数 / 栅格非常量 / 图片非空白
+- 语义核对：对照需求清单逐条判定（带证据，可 PARTIAL）
+- 图面识图：批量调用识图模型看地图（中文是否方框、图例是否被裁、图面是否空白）
+- 交付卫生：过程文件（`.pkl/.tmp/.bak`）、重做残留（同前缀重复件）、体积比
 
-```
-src/gis_cli/
-├── agent/                   # 🤖 AI Agent (NEW)
-├── core/                    # 核心架构 (Tool/Task/Registry/Context)
-├── tools/                   # 模块化工具 (5个已实现)
-├── skills/                  # 高级技能 (3个内置)
-├── runner/                  # ArcPy 执行器
-├── web/                     # FastAPI + Streamlit UI
-├── cli.py                   # CLI 入口
-├── planner.py              # 意图识别
-└── orchestrator.py         # 任务编排
-tests/
-├── test_agent.py           # Agent 测试 (38个) (NEW)
-├── test_planner.py         # 规划器测试 (56个)
-├── test_integration.py     # 集成测试 (9个)
-└── test_architecture.py    # 架构测试 (34个)
-config/
-├── intents.json            # 意图配置
-├── llm_rag_config.json     # LLM/RAG 配置
-└── recovery_strategies.json # 恢复策略
-```
+**制图**
+- rules-based 设计引擎：采集数据事实 → 出 LayoutSpec → 渲染 → 版面体检
+- 自动决定纸张/朝向/图名/图例位置/比例尺刻度/指北针/配色
+- 统一图例分级、迁移图叠加层（方向箭头 + 年份标注）
+- 版面体检不合格会带原因重渲；必须交付可编辑 `.aprx`
+
+**数据与方法论**
+- SQLite 数据目录：真实字段名 / 坐标系 / 范围 / 要素数（懒扫描，启动不阻塞）
+- 48 个配方：投影 / 缓冲 / 空间连接 / 核密度 / 局部莫兰 / 可达性 / 栅格运算…
+  每个配方自带 validation 断言
+- SKILL.md 技能：启动只注入名字+描述，`run_skill` 读全文（渐进披露）
+
+**可观测**
+- 流式输出：首字 2~6s 到屏，状态行显示实时字数
+- `[timing]` 分段日志 + `latency_report.py`：模型等待 / 工具执行 / 压缩占比
+- token 用量与**前缀缓存命中率**写入 trace，`--cost` 可汇总
+- 项目日志：相关性 + 最近混合检索，把"上次同类任务踩过的坑"注入下次
+
+**界面与工程**
+- 交互式终端：转录 / 状态行 / 输入框 / `@` 文件补全 / `/` 命令 / Esc 中断
+- 运行中再输入 = 排队，本轮结束自动合并继续
+- 会话可续（`--continue` / `--resume`）、导出 Markdown
+- CI：只跑不依赖 ArcGIS 的部分（`pytest -m "not arcpy"`，约 35s）
 
 ## 快速开始
 
@@ -223,7 +199,7 @@ gis-agent chat --continue
 3. **Agent 会自动识别数据**：
    ```
    📁 工作区状态
-   工作区路径: workspace
+   工作区路径: E:\BST_lab\GIS CLI\workspace
    
    输入数据 (3 个文件):
    - province.shp (shapefile, 2.5 MB)
@@ -304,191 +280,6 @@ cp config/llm_config.example.json config/llm_config.json
   实测交互轮用 `low`：首字 5.11s→2.37s、总耗时 8.72s→5.80s，输出质量相当；
   规划/验收类任务刻意保留 `medium`。
 
-### BAML 函数映射（新架构推荐）
-
-如果你已生成 `baml_client`，建议在 `llm_config.json` 中显式配置函数映射，避免运行时函数名探测：
-
-```json
-{
-	"baml_functions": {
-		"planning": ["generate_gis_plan"],
-		"intent": ["infer_gis_intent"],
-		"task_refine": ["refine_gis_task"],
-		"recovery": ["suggest_gis_recovery"]
-	}
-}
-```
-
-也可以通过环境变量覆盖（适合多环境部署）：
-
-```powershell
-$env:GIS_BAML_FUNCTIONS='{"planning":["generate_gis_plan"],"intent":["infer_gis_intent"],"task_refine":["refine_gis_task"],"recovery":["suggest_gis_recovery"]}'
-```
-
-执行 BAML 配置自检：
-
-```powershell
-gis-agent baml-check
-gis-agent baml-check --strict --require "intent,task_refine,planning,recovery"
-```
-
-- `--strict` 会在缺少必需能力时返回非零退出码，适合 CI/启动前检查。
-- `--require` 可按环境裁剪必需能力集合。
-
-在运行 Agent 时也可开启启动前预检：
-
-```powershell
-gis-agent chat --baml-precheck
-gis-agent chat --baml-precheck --baml-strict --baml-require "intent,planning"
-gis-agent run "扫描并合并图层" --baml-precheck --baml-strict
-```
-
-- 默认是软门禁：预检失败仅告警，不阻断。
-- 指定 `--baml-strict` 或配置 `baml_preflight_strict=true` 时，预检失败会阻断启动。
-
-最终形态建议（严格真实 BAML）：
-
-```json
-{
-	"enable_baml_preflight": true,
-	"baml_preflight_strict": true,
-	"enable_baml_builtin_fallback": false
-}
-```
-
-- 当 `enable_baml_builtin_fallback=false` 时，严格模式将要求可导入的 `baml_client` 提供对应函数能力。
-- 这适合发布前门禁，避免依赖内建兼容桩。
-
-2. 重新启动 Agent，即可使用自然语言对话：
-
-```
-你: 你好，帮我处理一下数据文件夹里的东西
-Agent: 理解了，我将扫描并整合您的数据...
-
-你: 把这些图合并成一张
-Agent: 已创建合并计划...
-```
-
-详细配置请查看 [LLM 配置指南](docs/LLM_CONFIGURATION.md)
-
-### 方式二：使用传统 CLI
-
-1. 以可编辑模式安装：
-
-```powershell
-pip install -e .
-```
-
-2. 从自然语言创建任务：
-
-```powershell
-gis-cli task-create "整合9个分幅数据，统一投影并导出广西专题图"
-```
-
-2.1 从文档文本或文件创建任务：
-
-```powershell
-gis-cli task-create-doc --text "创建数据库并整合数据入库，统一投影，导出专题图"
-gis-cli task-create-doc --file path/to/task.txt
-```
-
-3. 生成或刷新计划：
-
-```powershell
-gis-cli task-plan <task-id>
-```
-
-4. 执行 dry-run：
-
-```powershell
-gis-cli task-run <task-id> --dry-run
-```
-
-4.1 局部节点重跑（覆盖节点）：
-
-```powershell
-gis-cli task-run <task-id> --dry-run --nodes check_geometry,repair_geometry
-```
-
-4.2 自动建议并重跑失败/待处理节点：
-
-```powershell
-gis-cli task-suggest-rerun <task-id>
-gis-cli task-rerun-failed <task-id> --dry-run
-gis-cli task-rerun-failed <task-id> --dry-run --no-auto-fix
-gis-cli task-suggest-fix <task-id>
-```
-
-4.3 Agent 一键自动执行（创建任务 + 执行 + 自动恢复）：
-
-```powershell
-gis-cli agent-run "整合9个分幅数据并导出专题图" --dry-run
-gis-cli agent-run-task <task-id> --exec --max-recovery-rounds 3
-```
-
-- `agent-run` / `agent-run-task` 会输出完整 `trace`：
-	- `initial_run`
-	- `recovery_round_n`
-- 每个回合都包含执行节点、策略规则和结果消息，便于审计与复盘。
-
-4.4 恢复策略查看与热重载：
-
-```powershell
-gis-cli recovery-show
-gis-cli recovery-show --profile mapping
-gis-cli recovery-reload
-gis-cli task-summary <task-id>
-```
-
-- `recovery-show` 会输出当前策略版本、来源路径、配置哈希等元信息。
-- 可通过 `--profile` 查看指定画像（如 `mapping`、`integration`）下的生效策略版本。
-- 运行中的 Agent 会在关键入口自动检测配置文件 `mtime`，有变更时自动刷新策略。
-- `task-summary` 输出任务执行统计（总运行次数、成功/失败、dry-run/exec 比例、最新策略版本）。
-
-- `task-rerun-failed` 默认开启恢复策略（`--auto-fix`）：
-	- 标记为 `implementation_pending` 的节点会优先替换为可执行降级节点（例如 `export_map_layout -> build_quality_report`），无法替换时再跳过
-	- 失败原因为 `arcpy_unavailable` 时自动切为 `dry-run`
-	- 保留准备节点（如 `scan_inputs`）与可执行失败节点
-	- 在执行详情写入 `strategy_applied`、`strategy`（含 `replaced_nodes`/`skipped_nodes`）与 `effective_dry_run`
-
-5. 启动 API 服务：
-
-```powershell
-gis-cli-api
-```
-
-6. 启动可视化 Web UI（面向非技术用户）：
-
-```powershell
-gis-cli-ui
-```
-
-也可一键运行项目根目录脚本：
-
-```powershell
-./start_ui.bat
-```
-
-如果双击脚本“打开后瞬间关闭”，通常是依赖缺失。新版脚本会保留错误提示窗口；常见修复：
-
-```powershell
-python -m pip install -e .
-```
-
-或仅安装前端依赖：
-
-```powershell
-python -m pip install streamlit
-```
-
-如果你像之前一样直接运行 Python 文件，也已支持自动拉起浏览器 UI：
-
-```powershell
-python src/gis_cli/web/streamlit_app.py
-```
-
-默认浏览器地址：`http://localhost:8501`
-
 ## 直接出图 / 自动化 ArcGIS Pro（推荐）
 
 如果你希望输出真实 GIS 成果（如 `.gdb`、地图导出 JPG/PNG），请使用 ArcGIS Pro Python 环境。
@@ -516,304 +307,59 @@ python src/gis_cli/web/streamlit_app.py
 - `--dry-run` 只做预演，主要输出 JSON/TXT；
 - `--exec` + ArcPy 可用，才会产出真实 GIS 数据。
 
-### Web UI 使用说明（带文字提示）
-
-- 进入“执行任务”页面后，直接输入自然语言需求。
-- 推荐先勾选“预览模式（dry-run）”，确认流程和输出路径。
-- 可上传 `txt/md` 任务说明文档，系统会自动解析后执行。
-- 页面会展示：任务 ID、执行状态、尝试次数、输出文件路径、完整 JSON 结果。
-
-推荐输入模板：
-
-- 我有【数据/图层】，希望【处理动作】，最终输出【格式/地图类型】。
-- 示例：我有广西行政区图层和道路图层，希望自动制图并导出专题图 JPG。
-
-## 运行说明
-
-- 当前版本重点在框架化与可扩展性，ArcPy 集成属于首批落地能力。
-- `task-run --exec` 行为：
-	- ArcPy 可用：创建工作空间 GDB，并整合 AGNP/BOUA/BOUL 输出。
-	- ArcPy 不可用：在 `outputs/<task_id>/` 输出降级报告，保证编排链可验证。
-	- 高风险提示词（如 delete/overwrite）需显式确认。
-
-## 新增节点说明（v0.1.1）
-
-### export_map_layout - 地图版式导出
-- **功能**：将 ArcGIS Pro 项目的地图版式导出为 JPG（无版式时降级 PNG）
-- **输出产物**：`map_exports/map_layout_export.jpg` 或 `map_view_export.png`
-- **适用场景**：专题图制作、制图输出
-- **触发词**：导出、制图、版式、JPG、PNG
-
-### apply_symbology - 符号化应用
-- **功能**：为地理要素应用符号化规则和样式
-- **输出产物**：符号化元数据记录
-- **适用场景**：地图美化、符号标准化
-- **触发词**：符号、颜色、样式、美化
-
-### apply_layout_template - 版式模板应用
-- **功能**：应用标准版式模板（包含标题、比例尺、指北针、图例等）
-- **输出产物**：版式应用记录
-- **适用场景**：标准制图流程
-- **触发词**：版式、模板、标题、比例尺
-
-### build_quality_report - 质量检查报告
-- **功能**：生成数据质量检查报告（几何问题统计、数据完整性、投影检查等）
-- **输出产物**：`quality_reports/quality_report.json`
-- **适用场景**：数据验收、质量评估
-- **触发词**：质量、检查、报告、验收
-
 ## 运行产物
 
-- `outputs/<task_id>/dry_run_plan.json`：输入发现与计划步骤
-- `outputs/<task_id>/checklist.json`：评分式核查清单与证据
-- `outputs/<task_id>/execution_report.txt`：执行摘要（降级模式）
-- `outputs/<task_id>/discovered_layers.json`：输入图层发现结果（降级模式）
-- `outputs/<task_id>/map_exports/map_layout_export.jpg`：地图版式 JPG 导出（新增）
-- `outputs/<task_id>/map_exports/map_view_export.png`：地图视图 PNG 导出（新增）
-- `outputs/<task_id>/quality_reports/quality_report.json`：质量检查报告（新增）
-- `outputs/<task_id>/layout_templates/layout_applied.txt`：版式应用记录（新增）
+每次 run 的产物与记录：
 
-## API 接口（含文档任务入口）
-
-- `POST /tasks`：从 prompt 创建任务
-- `POST /tasks/from-document`：从文档原文创建任务
-- `POST /tasks/from-document-file`：从本地文本文件创建任务
-- `GET /tasks/{task_id}/suggest-rerun`：获取失败/待处理节点重跑建议
-- `GET /tasks/{task_id}/summary`：获取任务执行统计摘要
-- `POST /tasks/{task_id}/rerun-failed`：重跑建议节点（请求体支持 `auto_fix`）
-- `GET /tasks/{task_id}/suggest-fix`：获取原因感知的恢复方案（节点 + 建议）
-- `POST /agent/run`：从 prompt 直接执行 Agent 主流程（创建任务 + 自动恢复）
-- `POST /agent/run/{task_id}`：对已有任务执行 Agent 主流程
-- `GET /agent/recovery-strategy`：查看当前恢复策略元信息
-- `GET /agent/recovery-strategy?profile=mapping`：查看指定 profile 的生效策略元信息
-- `POST /agent/recovery-strategy/reload`：手动重载恢复策略配置
-
-## 恢复策略配置化
-
-- 恢复策略已支持配置文件驱动：`config/recovery_strategies.json`
-- 可配置项：
-	- `reason_to_prep_nodes`：失败原因 -> 预备节点
-	- `implementation_fallback_nodes`：未实现节点 -> 降级替代节点
-	- `reason_recommendations`：失败原因 -> 建议文案模板（支持 `{node}` 占位）
-	- `rule_flags`：规则开关（例如是否允许替代/跳过/强制 dry-run）
-	- `rule_priorities`：规则优先级（冲突时选择优先级更高规则）
-- 可选 `profiles` 分组：对不同任务画像（如 `mapping`、`integration`）做规则覆盖。
-- 调整策略时优先修改配置，无需改 Python 代码；重启 CLI/API 后生效。
-- 策略会生成版本摘要并写入执行详情（`recovery_strategy.version`），用于审计与回放对齐。
-
-## LLM + RAG 规划增强（可选）
-
-项目已支持可开关的“RAG 检索 + 第三方大模型”规划增强层：
-
-- 默认关闭，不影响现有规则规划与 ArcPy 执行流程；
-- 开启后：先进行本地知识检索，再调用 OpenAI 兼容接口生成结构化计划；
-- 若 API 不可用/超时/返回异常，会自动回退到规则规划。
-
-配置文件：`config/llm_rag_config.json`
-
-关键字段：
-
-- `enabled`：是否启用（`true/false`）
-- `llm.model`：模型名称
-- `llm.api_key`：API Key
-- `llm.api_base`：OpenAI 兼容地址
-- `rag.knowledge_paths`：本地检索知识源文件
-- `rag.top_k`：召回片段数量
-- `rag.chunk_size`：切分长度
-
-建议：
-
-- 在生产环境中使用“LLM 规划层 + ArcPy 执行层”混合模式；
-- ArcPy 仍负责确定性地理处理与出图落地；
-- LLM/RAG 负责理解复杂需求、补全参数与生成更自然的人类可读规划。
-
-## 需求映射提示
-
-- 文档任务会经过 requirement mapper 后处理。
-- mapper 会提取能力提示（如 `projection_transform`、`topology_check`）并写入任务元数据。
-- 可通过以下命令查看：
-
-```powershell
-gis-cli task-show <task-id>
-```
-
-- 这些能力提示会用于后续工作流装配优化。
-
-## 双驱动工作流装配
-
-- 当前装配同时使用 `intent` 与 `required_capabilities`。
-- 装配结果包含：
-	- `runner_profile`
-	- `workflow_nodes`
-	- `unresolved_capabilities`
-- 可在以下位置查看装配节点：
-	- `task-create` / `task-create-doc` 的 CLI 输出
-	- `outputs/<task_id>/dry_run_plan.json`
-
-## 节点驱动执行
-
-- 执行器按 `workflow_nodes` 条件执行。
-- 当节点未被选中时，对应步骤会被跳过并写入执行证据。
-- ArcPy 降级模式下，`execution_report.txt` 会记录 `runner_profile` 与 `workflow_nodes` 上下文。
-
-## 执行元数据持久化
-
-- 每次运行会在任务元数据中写入 `last_execution`，包含：
-	- success / dry_run
-	- 输出产物
-	- 节点级执行详情
-	- 节点原因（`node_reasons`）与错误信息（`error_code`、`error_message`）
-- 查看命令：
-
-```powershell
-gis-cli task-show <task-id>
-```
-
-- 执行器异常会被结构化为失败结果（`error_code=runner_exception`），保证任务可恢复。
-
-## 新增功能（v0.2.0+）
-
-### 1. 任务执行统计与导出
-
-导出任务执行统计信息为 JSON 或 CSV 格式：
-
-```powershell
-# 导出所有任务统计为JSON
-gis-cli export-stats --format json
-
-# 导出为CSV格式并保存到文件
-gis-cli export-stats --format csv --output stats.csv
-
-# 导出指定任务
-gis-cli export-stats --task-ids task1,task2,task3
-```
-
-API 接口：
-- `GET /tasks/stats/export?format=json&task_ids=task1,task2`
-
-### 2. 任务列表分页与过滤
-
-支持分页、按状态和recovery profile过滤：
-
-```powershell
-# 列表任务（带分页）
-gis-cli task-list --skip 0 --limit 50
-
-# 按状态过滤
-gis-cli task-list --status COMPLETED
-
-# 按recovery profile过滤
-gis-cli task-list --profile mapping
-
-# 搜索任务（按prompt文本）
-gis-cli task-search --query "制图" --limit 20
-```
-
-API 接口：
-- `GET /tasks?skip=0&limit=100&status=COMPLETED&profile=mapping`
-- `GET /tasks/search?query=制图&skip=0&limit=100`
-
-### 3. 任务存档与清理
-
-管理旧任务和已完成任务：
-
-```powershell
-# 存档单个任务
-gis-cli task-archive <task-id>
-
-# 从存档恢复任务
-gis-cli task-restore <task-id>
-
-# 列出已存档任务
-gis-cli task-archive-list
-
-# 删除任务
-gis-cli task-delete <task-id>
-
-# 批量清理旧任务（预览）
-gis-cli task-cleanup --max-age-days 30 --status COMPLETED,FAILED --dry-run
-
-# 执行清理
-gis-cli task-cleanup --max-age-days 30 --status COMPLETED,FAILED --exec
-```
-
-API 接口：
-- `POST /tasks/{task_id}/delete`：删除任务
-- `POST /tasks/{task_id}/archive`：存档任务
-- `POST /tasks/{task_id}/restore`：恢复任务
-- `GET /tasks/archive/list`：列出存档
-- `POST /tasks/cleanup`：批量清理（请求体：`max_age_days`, `status_filter`, `dry_run`）
-
-### 4. 策略效果统计与报告
-
-生成Recovery Strategy效果分析报告：
-
-```powershell
-# 查看策略统计
-gis-cli strategy-stats
-
-# 生成JSON格式报告
-gis-cli strategy-report --format json
-
-# 生成HTML格式报告并保存
-gis-cli strategy-report --format html --output report.html
-```
-
-输出内容：
-- 总任务数
-- Recovery使用频率
-- Recovery成功率
-- Profile分布
-- 任务状态分布
-- Recovery轮次统计
-
-API 接口：
-- `GET /strategy/stats`：获取统计数据
-- `GET /strategy/report?format=json|html`：生成报告
+- `workspace/output/`：交付物（GDB / 图片 / 表格 / `.aprx`）
+- `workspace/.gis_agent/traces/<run_id>.jsonl`：完整事件流（可回放）
+- `workspace/.gis_agent/traces/<run_id>.md`：人读的 Markdown 报告
+- `workspace/.gis_agent/runs/<run_id>.json`：任务状态快照
+- `workspace/.gis_agent/backups/<时间戳>/`：覆盖写入前的自动备份
+- `workspace/.gis_agent/project_log.md`：跨任务的项目日志（注入下次提示词）
 
 ## 测试覆盖
 
-项目包含 **137 个测试**，覆盖：
-- Agent 测试 (38个): GISAgent、Memory、Planner、Executor、Prompts、集成测试
-- 架构层测试 (34个): 工具注册、状态机、技能系统、上下文注入
-- 规划器测试 (56个): 意图识别、工作流装配、恢复策略、Agent主流程
-- 集成测试 (9个): 端到端工作流、API兼容性
-
-运行测试：
+约 **460 个测试**（全量约 60s；CI 只跑不依赖 ArcGIS 的部分，约 35s）。
 
 ```powershell
-pytest -v
+# 全量
+pytest
+
+# 只跑不需要 ArcGIS 的（CI 用的就是这条）
+pytest -m "not arcpy"
+
+# 新引擎相关
+pytest tests/test_engine_*.py
 ```
+
+主要覆盖：
+- 引擎循环 / 工具协议自适应 / 代码自修复 / 验收器
+- 内核往返、ZMQ 串行化、覆盖前备份、GDB 存在性判断
+- 制图设计引擎（可用假 facts 跑，不需要 ArcGIS）
+- 数据目录增量扫描 / 项目日志相关性检索
+- 终端界面（含无 ANSI 终端的回归）
+- 依赖边界（新引擎不得依赖 langchain/litellm/chromadb/pydantic）
 
 ## 项目路线图
 
 ### 已完成 ✅
-- **完整 AI Agent 架构** (GISAgent/Memory/Planner/Executor/LLM)
-- **双语系统提示词** (中文/英文)
-- **规则 + LLM 双路规划**
-- **Agent CLI 接口** (`gis-agent` 命令)
-- Agent主流程与多轮自动恢复
-- 配置驱动的Recovery策略
-- Profile-based规则选择与覆盖
-- 规则引擎（flags/priorities/decision日志）
-- 任务执行统计与向后兼容
-- 任务导出（CSV/JSON）
-- 任务列表分页和搜索过滤
-- 任务清理、存档和恢复
-- Recovery策略效果报告（JSON/HTML）
-- **模块化工具架构** (Tool/Task/Registry)
-- **高级技能系统** (ThematicMap/DataIntegration/QualityAssurance)
-- **上下文注入系统** (System/User/Workspace Context)
-- **5个核心工具实现** (scan/merge/project/export/quality)
+- 有界观察-决策-执行循环（原生 tool calling，不支持时自动降级 JSON 协议）
+- 代码失败自动修复（traceback + 数据目录 + 配方提示一起回喂）
+- 持久 Jupyter 内核（一次 import arcpy，跨步保留变量）
+- 强制验收：结构断言 + 语义核对 + 图面识图 + 交付卫生
+- 制图设计引擎：facts → design → render → qc（含统一图例、迁移图叠加层）
+- SQLite 数据目录 + 48 个方法论配方（自带验证断言）
+- SKILL.md 技能渐进披露
+- 流式输出、模型熔断、前缀缓存命中率统计
+- 内核往返合并、只读工具并发、覆盖写入自动备份
+- 交互式终端（排队合并、会话续聊、导出）
+- CI（只跑无 ArcGIS 部分）
 
-### 进行中 🔄
-- 工具与现有编排器完全集成
-- 更多内置工具 (空间分析、拓扑检查等)
-- 技能编辑器 UI
-
-### 未来增强方向 📋
-- 机器学习辅助的策略选择
-- A/B测试不同recovery规则
-- 多用户/多项目隔离
-- Webhook集成与事件驱动
-- 指标导出与长期监控
+### 剩余候选 📋
+- 从历史成功 run 中自动沉淀配方（经验固化闭环）
+- 工具输出按类型瘦身（现在统一按字符数截断）
+- 需求抽取合流进首轮对话（省一次往返；以稳定性为前提）
+- 跨 run 的失败归因统计（哪类失败最常见）
+- 断点续跑（从 `runs/*.json` 恢复，而不只是 `ask_user` 暂停）
+- 更多配方覆盖（空间统计、网络分析）

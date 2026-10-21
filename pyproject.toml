@@ -4,24 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gis-task-cli"
-version = "0.8.0"
+version = "0.7.1"
 description = "General-purpose GIS task solving CLI for ArcGIS Pro workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "GIS CLI Team" }]
 dependencies = [
   "typer>=0.12.3",
-  "pydantic>=2.8.2",
   "rich>=13.0.0",
   "openai>=1.0.0",
-  "litellm>=1.48.0",
   "json5>=0.9.25",
-  "PyYAML>=6.0",
-  "langchain>=0.3.0",
-  "langchain-community>=0.3.0",
-  "langchain-openai>=0.2.0",
-  "langchain-text-splitters>=0.3.0",
-  "chromadb>=0.5.5",
   "prompt-toolkit>=3.0.43",
   # 持久 Jupyter 内核（ArcPyKernel）：缺了就只能退回一次性子进程，
   # 每步重导 arcpy（~15s）且丢掉跨步变量。基准/CLI 跑在 venv 里时
@@ -32,16 +24,14 @@ dependencies = [
   # 缺 numpy 时 image_not_blank **静默返回通过**（等于图面检查完全失效）。
   "pillow>=10.0.0",
   "numpy>=1.26",
-  # 制图出图前检查 ArcGIS Pro 有没有开着（同时跑 GP 会互相干扰）
-  "psutil>=5.9.0",
+  # 配方与技能都是 YAML 定义的，``recipes/schema.py`` 在**模块顶层** import yaml。
+  # 踩过的坑：这个包以前一直**没声明**，靠 langchain/litellm 的传递依赖顺带
+  # 装上；而当前开发 venv 里其实根本没装 langchain —— 等于一直在赌。
+  # 删掉重包后会直接 ImportError，新引擎起不来。
+  "pyyaml>=6.0.1",
 ]
 
 [project.optional-dependencies]
-web = [
-  "fastapi>=0.111.1",
-  "uvicorn>=0.30.5",
-  "streamlit>=1.32.0",
-]
 office = [
   "python-docx>=1.1.2",
   "pypdf>=5.1.0",
@@ -49,15 +39,64 @@ office = [
 dev = [
   "pytest>=8.3.2",
 ]
+#: 锦上添花的可选依赖：缺了能跑，只是能力降级（代码里都是 try/except）。
+#:
+#: 为什么要显式声明：这几个包以前**一个都没写**在 pyproject 里，全靠
+#: litellm/langchain 的传递依赖碰运气 —— 换台机器就可能缺，而缺了又不报错，
+#: 只是“检测不到 ArcGIS Pro / 中文字体变方框 / keepalive 失效”这类静默降级。
+#:
+#: - psutil     -> 检测 ArcGIS Pro 是否在跑（与我们的 GP 调用会互相干扰）
+#: - httpx      -> 关掉 keep-alive 的 httpx.Client（抗网关抖动）
+#: - matplotlib -> 内核里配中文字体（否则自绘图的中文变方框）
+#: - json5      -> 容忍模型输出的“近似 JSON”（尾逗号/单引号）；缺了只用严格 json
+extras = [
+  "psutil>=5.9.0",
+  "httpx>=0.27.0",
+  "matplotlib>=3.8.0",
+  "json5>=0.9.25",
+]
+#: 新引擎（`gis-agent chat` / `gis-agent loop`）真正需要的最小依赖集。
+#:
+#: 为什么单列：核心依赖里的 langchain*/chromadb/litellm 只被**旧引擎**
+#: （agent/ 下的 plan-then-execute）用到，新引擎一行都没引用（已 grep 核实）。
+#: 在 CI 里装全套重包纯属浪费（chromadb 会拉 onnxruntime 等，装一次几分钟）。
+#: 这不是要拆包，只是让“新引擎的最小依赖面”可被验证 —— 它不依赖 arcpy
+#: 就能启动/规划/验收，是新引擎相对旧引擎的硬性优势，值得用 CI 焊住。
+engine = [
+  "typer>=0.12.3",
+  "rich>=13.0.0",
+  "openai>=1.0.0",
+  "json5>=0.9.25",
+  "prompt-toolkit>=3.0.43",
+  "jupyter-client>=8.0.0",
+  "pillow>=10.0.0",
+  "numpy>=1.26",
+  "pyyaml>=6.0.1",
+]
 
 [project.scripts]
-gis-cli = "gis_cli.cli:app"
-gis-cli-api = "gis_cli.web.api:run"
-gis-cli-ui = "gis_cli.web.ui_launcher:run"
+# 只保留新引擎入口。旧引擎（plan-then-execute）已下线，其命令
+# （gis-cli / gis-cli-api / gis-cli-ui 等）不再提供。
 gis-agent = "gis_cli.agent.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.pytest.ini_options]
+# CI 只跑不需要 ArcGIS 的部分（``pytest -m "not arcpy"``）。
+#
+# 为什么需要这个边界：带 arcpy 的测试每个都要起一个子进程（实测单个 ~12s），
+# 全量跑 15 分钟以上；而 CI 机器上没有 ArcGIS Pro。区分靠 marker 而不是
+# 目录，因为同一个文件里往往两类都有。
+markers = [
+  "arcpy: 需要本机安装 ArcGIS Pro / arcpy 才能跑",
+  "slow: 耗时较长（全量 arcpy 测试）",
+]
+testpaths = ["tests"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+# 旧引擎（若开发版里存在 legacy/，仅供追溯）不参与打包：它依赖
+# pydantic/langchain/litellm，而这些包已从 dependencies 移除，
+# 装到用户环境里会导致 import 就崩。
+exclude = ["gis_cli.legacy", "gis_cli.legacy.*"]

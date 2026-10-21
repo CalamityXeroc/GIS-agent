@@ -471,3 +471,206 @@ def test_compaction_skips_when_nothing_worth_summarizing():
     ]
     loop._compact_if_needed()
     assert not calls, "只有 4 条可压消息，不值得一次 LLM 往返"
+
+
+# ------------------------------------------------ 卫生判据参数可配（P3-13）
+def test_hygiene_params_come_from_config(tmp_path):
+    """卫生判据必须可配：以前 verifier 硬编码 0 / 5.0，与配方侧两套口径。
+
+    后果：同一份交付物「配方判不过、验收判过」，模型被两边不一致的结论
+    来回拉扯（实测 14 届交付卫生阶段）。
+    """
+    from gis_cli.engine.verifier import Verifier
+
+    v = Verifier(
+        workspace=tmp_path,
+        hygiene_max_duplicate_families=2,
+        hygiene_ratio_limit=1.5,
+        hygiene_forbid_suffixes=[".PKL", ".Tmp"],
+    )
+    assert v.hygiene_max_duplicate_families == 2
+    assert v.hygiene_ratio_limit == 1.5
+    assert v.hygiene_forbid_suffixes == [".pkl", ".tmp"], "后缀应统一小写"
+
+
+def test_hygiene_params_default_unchanged(tmp_path):
+    """不配时行为与以前完全一致（0 个重复家族、5 倍体积比）。"""
+    from gis_cli.engine.verifier import Verifier
+
+    v = Verifier(workspace=tmp_path)
+    assert v.hygiene_max_duplicate_families == 0
+    assert v.hygiene_ratio_limit == 5.0
+    assert v.hygiene_forbid_suffixes is None
+
+
+def test_hygiene_params_read_from_engine_config(tmp_path):
+    """engine 配置段里的键要真正传到 Verifier。"""
+    from gis_cli.engine.runner import build_engine
+
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "llm_config.json").write_text(
+        '{"model": "m", "api_key": "k", "api_base": "http://x",'
+        ' "engine": {"hygiene_check": "block",'
+        ' "hygiene_max_duplicate_families": 3,'
+        ' "hygiene_ratio_limit": 2.5,'
+        ' "hygiene_forbid_suffixes": [".pkl", ".log"]}}',
+        encoding="utf-8",
+    )
+    bundle = build_engine(workspace=tmp_path, refresh_catalog=True)
+    try:
+        v = bundle.verifier
+        assert v.hygiene_mode == "block"
+        assert v.hygiene_max_duplicate_families == 3
+        assert v.hygiene_ratio_limit == 2.5
+        assert v.hygiene_forbid_suffixes == [".pkl", ".log"]
+    finally:
+        bundle.close()
+
+
+# ------------------------------------------------- 已删的中间件不该拖死验收
+def test_stale_artifacts_are_pruned_not_reported(tmp_path):
+    """模型中途建的中间产物（tmp_train / idw_p1…）删掉后仍留在 artifacts 里。
+
+    验收器跑在**无 arcpy 的 venv** 里时判不了 GDB 内路径，一律"假设存在"，
+    随后跑在内核里的 structural_check 又报"产出不存在"——两边打架的结果是
+    验收永远不过，agent 空转到轮次上限（14 届任务二a 实测：60 轮耗尽后
+    模型改去建 result_data_v2.gdb，产物全对但路径违约）。
+    """
+    from types import SimpleNamespace
+
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output"
+    out.mkdir()
+    real = out / "报告.md"
+    real.write_text("ok", encoding="utf-8")
+    gdb = out / "result_data.gdb"
+    gdb.mkdir()
+
+    stale = str(gdb / "tmp_train")
+    alive = str(gdb / "meteo_points")
+
+    class _Runner:
+        """模拟内核：GDB 内只有 meteo_points，tmp_train 已删。"""
+
+        def run(self, code, timeout=None, workspace=None):
+            records = [
+                {"path": stale, "exists": False},
+                {"path": alive, "exists": True},
+                {"path": str(real), "exists": True},
+            ]
+            return SimpleNamespace(ok=True, result={"records": records})
+
+    v = Verifier(workspace=tmp_path, code_runner=_Runner())
+    state = SimpleNamespace(
+        artifacts=[stale, alive, str(real)],
+        requirements=[],
+        methodology="",
+        final_summary="",
+        tasklist=[],
+        goal="test",
+    )
+    verdict = v.verify(state)
+
+    joined = " ".join(verdict.get("problems") or [])
+    assert "产出不存在" not in joined, f"不该把已删中间件报成缺失: {joined}"
+    assert state.artifacts == [alive, str(real)], f"应静默剔除失效产物: {state.artifacts}"
+
+
+def test_all_artifacts_stale_is_still_a_failure(tmp_path):
+    """全都失效 != 清理中间件，必须报“没有产出”。"""
+    from types import SimpleNamespace
+
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output"
+    out.mkdir()
+    gone = str(out / "result_data.gdb" / "tmp_raster")
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            return SimpleNamespace(ok=True, result={"records": [{"path": gone, "exists": False}]})
+
+    v = Verifier(workspace=tmp_path, code_runner=_Runner())
+    state = SimpleNamespace(
+        artifacts=[gone], requirements=[], methodology="",
+        final_summary="", tasklist=[], goal="test",
+    )
+    verdict = v.verify(state)
+    assert any("没有任何产出文件" in p for p in (verdict.get("problems") or []))
+
+
+def test_finish_nudge_fires_near_turn_limit(tmp_path):
+    """轮次用到 80%/95% 还没 finish 时要催一次收尾。
+
+    实测 14 届任务四a：120 轮里 finish 调用 0 次——产物早就合格（断言 12/12），
+    模型却一直在打磨，最后撞 max_turns，status 只能记成 max_turns。
+    """
+    from gis_cli.engine.loop import AgentLoop, LoopConfig
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.config = LoopConfig(max_turns=100)
+    loop._finish_nudges = set()
+    loop._messages = []
+
+    class _State:
+        turn = 50
+
+    loop.state = _State()
+    loop._append_user = lambda text: loop._messages.append(text)
+
+    loop._maybe_nudge_finish()          # 50% → 不催
+    assert not loop._messages
+
+    _State.turn = 81                    # 81% → 催一次
+    loop._maybe_nudge_finish()
+    assert len(loop._messages) == 1
+    assert "finish" in loop._messages[0]
+
+    loop._maybe_nudge_finish()          # 同阈值不重复
+    assert len(loop._messages) == 1
+
+    _State.turn = 96                    # 96% → 再催一次
+    loop._maybe_nudge_finish()
+    assert len(loop._messages) == 2
+def test_repair_exception_does_not_kill_run(tmp_path):
+    """修复过程本身报错（典型：修复时网关断了）不能让整个 run 崩。
+
+    实测 14 届任务二a 独立跑：第 10 轮时反代抖动，修复里的 llm_client.chat
+    抛 LLMError，一路冒到 runner，整次运行记成 runner_error（0 轮 / 0 秒），
+    已跑出的产物白费。
+    """
+    from types import SimpleNamespace
+
+    from gis_cli.engine.loop import AgentLoop
+    from gis_cli.engine.state import Observation
+
+    class _Boom:
+        def run(self, **kw):
+            raise RuntimeError("All models failed")
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.repairer = _Boom()
+    loop.config = SimpleNamespace(exec_timeout=600.0)
+    loop.workspace = tmp_path
+    loop.state = SimpleNamespace(goal="g", add_artifact=lambda p: None)
+    loop.recorder = SimpleNamespace(record=lambda *a, **k: None)
+    loop._emit = lambda *a, **k: None
+    loop._recipes_digest = lambda text: ""
+    loop._catalog_digest = lambda: ""
+    loop.use_error_memory = False
+    loop.catalog = None
+    loop._check_workspace_hygiene = lambda obs: None
+    loop._collect_design_note = lambda obs: None
+
+    class _Registry:
+        def execute(self, tool, args, ctx):
+            return Observation(ok=False, summary="代码执行失败", error={"type": "E", "message": "x"})
+
+    loop.registry = _Registry()
+    loop.context = None
+
+    action = SimpleNamespace(kind="tool", tool="execute_code",
+                             args={"code": "print(1)", "description": "d"}, parse_error=None)
+    out = loop._run_code_with_repair(action)   # 不抛 = 通过
+    assert isinstance(out, Observation) and out.ok is False

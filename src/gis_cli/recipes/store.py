@@ -465,6 +465,16 @@ class RecipeLibrary:
             if not cfg:
                 return ValidationResult(kind, target, False, "value 需要写成 {类别: [lo,hi]} 映射")
             scale = float(raw.get("scale") or 1.0)
+            # scale 的本意是"像元面积换算"，但它把像元尺寸写死了。实测 14 届任务三b：
+            # 模型把掩膜重采样到 10 m 输出，面积算出来是对的（8.83 km²），却被
+            # 0.000225（15 m 像元）放大成 19.87 km² 而判超界。面积才是这里的判定
+            # 语义，分辨率该由专门的断言管，所以优先用栅格实测像元面积。
+            scale_source = "yaml"
+            if raw.get("use_raster_cell", True):
+                cell_m2 = self._raster_cell_area_m2(target)
+                if cell_m2:
+                    scale = cell_m2 / 1_000_000.0
+                    scale_source = f"实测像元 {cell_m2 ** 0.5:.3g}m"
             values = [int(float(k)) for k in cfg]
             counts, detail = self._raster_find_values(target, values)
             if counts is None:
@@ -478,7 +488,9 @@ class RecipeLibrary:
                 lo, hi = float(band[0]), float(band[1])
                 if not (lo <= scaled <= hi):
                     bad.append(f"{key}: {scaled:.3f} 不在 [{lo},{hi}]")
-            return ValidationResult(kind, target, not bad, f"values={report} 不符={bad}")
+            return ValidationResult(
+                kind, target, not bad, f"values={report}（{scale_source}）不符={bad}"
+            )
 
         if kind == "deliverable_hygiene_ok":
             # 交付卫生：过程库里的**重做残留**（同前缀重复件）与禁止的过程文件。
@@ -697,6 +709,46 @@ class RecipeLibrary:
     def _field_sum(self, path: str, field: str) -> float | None:
         """Sum a numeric field via the kernel."""
         return self._field_stat(path, field, "sum")
+
+    def _raster_cell_area_m2(self, path: str) -> float | None:
+        """读栅格的实际像元面积（m²）。内核优先，进程内兜底。
+
+        只认投影坐标系；地理坐标系返回 None，让调用方退回 yaml 里的 scale
+        —— 用度算面积没有意义。
+        """
+        code = "\n".join(
+            [
+                "import arcpy",
+                f"_p = {path!r}",
+                "try:",
+                "    _d = arcpy.Describe(_p)",
+                "    _cx = abs(float(_d.meanCellWidth)); _cy = abs(float(_d.meanCellHeight))",
+                "    _sr = _d.spatialReference",
+                "    _proj = bool(getattr(_sr, 'projectionCode', 0))",
+                "    set_result({'area': _cx * _cy if _proj else None})",
+                "except Exception as _e:",
+                "    set_result({'area': None, 'reason': str(_e)[:120]})",
+            ]
+        )
+        if self.code_runner is not None:
+            try:
+                outcome = self.code_runner.run(code, timeout=120)
+                payload = outcome.result if outcome.ok and isinstance(outcome.result, dict) else None
+                area = (payload or {}).get("area")
+                if area and float(area) > 0:
+                    return float(area)
+            except Exception:
+                pass
+        try:
+            import arcpy  # type: ignore
+
+            desc = arcpy.Describe(path)
+            if getattr(desc.spatialReference, "projectionCode", 0):
+                area = abs(float(desc.meanCellWidth)) * abs(float(desc.meanCellHeight))
+                return area if area > 0 else None
+        except Exception:
+            return None
+        return None
 
     def _raster_find_values(self, path: str, values: list[int]) -> tuple[dict[str, int] | None, str]:
         """统计栅格中指定取值各有多少像元（用 numpy 全量读取；超大数据拒绝判定）。"""

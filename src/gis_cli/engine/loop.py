@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,8 @@ class LoopConfig:
 
     max_turns: int = 60
     max_repairs: int = 4
+    #: 单次失败允许的总修复时长（墙钟秒）。修不好就该回主循环换思路。
+    max_repair_seconds: float = 600.0
     exec_timeout: float = 600.0
     tool_protocol: str = "auto"
     context_soft_limit_tokens: int = 120_000
@@ -105,6 +108,7 @@ class AgentLoop:
                 llm_client=llm_client,
                 code_runner=code_runner,
                 max_attempts=self.config.max_repairs,
+                max_repair_seconds=self.config.max_repair_seconds,
             )
             if code_runner is not None
             else None
@@ -112,6 +116,8 @@ class AgentLoop:
         self.state: TaskState | None = None
         self._messages: list[dict[str, Any]] = []
         self._finish_rejections = 0
+        #: 已发过的收尾提醒阈值（0.8 / 0.95），避免每轮重复提醒
+        self._finish_nudges: set[float] = set()
         self._diagnosis_streak = 0
         self._consecutive_failures = 0
         #: ``_run_actions`` 中“本动作导致应停止”的标记（ask_user / finish）
@@ -183,7 +189,8 @@ class AgentLoop:
                 self.state.error = (
                     f"整跑截止时间已到（run_deadline_seconds={self.config.run_deadline_seconds:g}s，"
                     f"已完成 {self.state.turn} 轮）。通常是模型网关长时间不可用导致单轮反复重试；"
-                    "可排查网关后用 resume 从 trace 续跑。"
+                    "任务状态已落盘到 .gis_agent/runs/，产物与 trace 均保留，排查网关后重跑本任务即可"
+                    "（同目录已有产物会被覆盖前备份）。"
                 )
                 self.recorder.record("deadline_exceeded", {"turns": self.state.turn, "error": self.state.error})
                 self._emit("deadline_exceeded", {"turns": self.state.turn, "error": self.state.error})
@@ -272,9 +279,97 @@ class AgentLoop:
         self._append_user(user_message)
         return self._continue()
 
+    # ------------------------------------------------------- 断点续跑
+    #: 这几种状态可以续（模型/网络中断、时限、轮次用尽），其余（completed 等）不续。
+    RESUMABLE_STATUSES = ("llm_unavailable", "deadline_exceeded", "max_turns", "stopped", "failed")
+
+    def find_checkpoint(self) -> tuple[str, str] | None:
+        """在 ``.gis_agent/runs/`` 里找最近一次可续的运行。
+
+        返回 ``(state_json, messages_json)``；没找到返回 None。
+        """
+        runs_dir = self.workspace / ".gis_agent" / "runs"
+        if not runs_dir.is_dir():
+            return None
+        candidates: list[tuple[float, Path]] = []
+        for path in runs_dir.glob("*.json"):
+            if path.name.endswith(".messages.json"):
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if str(data.get("status") or "") not in self.RESUMABLE_STATUSES:
+                continue
+            messages = runs_dir / f"{path.stem}.messages.json"
+            if not messages.exists():
+                continue  # 没有消息历史就无法续跑（旧版本留下的状态）
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        if not candidates:
+            return None
+        _mtime, latest = max(candidates, key=lambda item: item[0])
+        return str(latest), str(runs_dir / f"{latest.stem}.messages.json")
+
+    def resume_from_checkpoint(self) -> TaskState:
+        """从最近一次未完成的运行继续跑（网关抖动 / 撞时限后不用从头再来）。
+
+        与 ``resume()`` 的区别：那个用于 ``ask_user`` 暂停（状态在内存里）；
+        这个从磁盘恢复——模型消息历史、清单、产物都在，接着往下跑。
+        """
+        found = self.find_checkpoint()
+        if found is None:
+            raise RuntimeError("没有可续跑的断点（.gis_agent/runs/ 下无未完成运行或缺少消息历史）")
+        state_path, messages_path = found
+        state = TaskState.load(state_path)
+        try:
+            messages = json.loads(Path(messages_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"断点里的消息历史读取失败: {exc}") from exc
+        if not isinstance(messages, list) or not messages:
+            raise RuntimeError("断点里的消息历史为空，无法续跑")
+
+        self.state = state
+        self._messages = messages
+        if self.context is not None:
+            self.context.state = state
+        # 断点的轮次可能已经用尽（max_turns）：续跑必须再给一份预算，
+        # 否则 while turn < max_turns 直接不成立，续跑等于空转
+        # （实测 14 届任务二a：60/60 续跑只把旧总结又打印了一遍）。
+        self.config.max_turns = int(state.turn) + max(1, int(self.config.max_turns))
+        # 续跑的 trace 写新文件（带 resumed 标记），状态仍回写原 checkpoint，
+        # 这样反复续跑不会不断产生新的可续断点。
+        if self.recorder is None:
+            self.recorder = RunRecorder(new_run_id(), self.workspace / ".gis_agent" / "traces")
+        self._deadline = (
+            time.monotonic() + self.config.run_deadline_seconds
+            if self.config.run_deadline_seconds and self.config.run_deadline_seconds > 0
+            else None
+        )
+        state.status = "running"
+        state.error = ""
+        if self.recorder is not None:
+            self.recorder.record(
+                "resumed",
+                {"from_run": state.run_id, "turn": state.turn, "messages": len(messages)},
+            )
+        self._emit("resumed", {"turn": state.turn, "messages": len(messages)})
+        self._append_user(
+            "[系统提示] 上一次运行中断了（模型网关不可用或超时），已从断点恢复。"
+            "已完成的产物与清单都在，请接着未完成的步骤继续，不要从头重做。"
+        )
+        return self._continue()
+
     # ------------------------------------------------------- speed guardrails
     def _update_guards(self, actions: list[Action], observations: list[Observation]) -> None:
         """Exploration budget nudge + failure escalation counters."""
+        # 收尾提醒：轮次用到 80% 还没调 finish 就催一次。
+        # 实测 14 届任务四a：120 轮里 finish 调用 0 次——产物早就合格（断言 12/12），
+        # 模型却一直在打磨，直到撞轮次上限，status 只能记成 max_turns。
+        # 这类任务本该以 completed 收尾，预算也不该浪费在重复出图上。
+        self._maybe_nudge_finish()
         if not actions:
             return
         if all(a.kind == "tool" and a.tool in _DIAGNOSIS_TOOLS for a in actions):
@@ -292,6 +387,23 @@ class AgentLoop:
             self._consecutive_failures = 0
         elif observations:
             self._consecutive_failures += 1
+
+    def _maybe_nudge_finish(self) -> None:
+        """轮次快用尽时提醒模型收尾（每个阈值只提一次）。"""
+        limit = int(getattr(self.config, "max_turns", 0) or 0)
+        if limit <= 0 or self.state is None:
+            return
+        turn = int(self.state.turn or 0)
+        for threshold in (0.8, 0.95):
+            if turn < limit * threshold or threshold in self._finish_nudges:
+                continue
+            self._finish_nudges.add(threshold)
+            remaining = max(0, limit - turn)
+            self._append_user(
+                f"[系统提示] 已用 {turn}/{limit} 轮（剩 {remaining} 轮）。"
+                "如果交付物已经齐备，请**立刻**调用 finish 说明成果与关键数值；"
+                "不要再重复出图/重算——继续打磨会直接撞轮次上限，反而交不出结论。"
+            )
 
     # ------------------------------------------------------------------ actions
     def _run_actions(
@@ -438,7 +550,7 @@ class AgentLoop:
         return observation, False
 
     def _check_workspace_hygiene(self, observation: Observation) -> None:
-        """工作区根目录出现意外项时提醒（Windows 反斜杠转义常造出假目录）。"""
+        """根目录意外项 + output/ 下过程残留，都及时提醒。"""
         try:
             strays = sorted(
                 p.name
@@ -448,17 +560,52 @@ class AgentLoop:
         except Exception:
             return
         fresh = [name for name in strays if name not in self._hygiene_warned]
+        if fresh:
+            self._hygiene_warned.update(fresh)
+            note = (
+                "工作区根目录出现预期外的项："
+                + ", ".join(fresh[:5])
+                + "。产出必须写在 output/ 下；这通常是 Windows 路径反斜杠转义错误"
+                "（如 `\"...\\data\\...\"`）导致，请核对路径（用原始字符串或正斜杠）并清理误建目录。"
+            )
+            observation.hint = (observation.hint + "\n" + note) if observation.hint else note
+            self.recorder and self.recorder.record("workspace_hygiene", {"strays": fresh[:8]})
+        # output/ 的残留要单独扫：根目录干净不代表交付目录干净
+        self._warn_output_residue(observation)
+
+    def _warn_output_residue(self, observation: Observation) -> None:
+        """output/ 下的下划线临时件要**及时**提醒，别拖到最终验收。
+
+        实测 14 届任务二a：模型把 `_mp_fix.shp/.dbf` 落在 output/ 里，一直到
+        交付卫生断言才被抳住——那时 60 轮已经用尽，模型想清也来不及了。
+        这里每轮扫一遍（只扫两层、跳过 .gdb），把清单塞进观察提示。
+        """
+        out = self.workspace / "output"
+        if not out.is_dir():
+            return
+        found: list[str] = []
+        try:
+            for entry in os.scandir(out):
+                if entry.is_file() and entry.name.startswith("_"):
+                    found.append(entry.name)
+                elif entry.is_dir() and not entry.name.lower().endswith(".gdb"):
+                    for sub in os.scandir(entry.path):
+                        if sub.is_file() and sub.name.startswith("_"):
+                            found.append(f"{entry.name}/{sub.name}")
+        except OSError:
+            return
+        fresh = sorted(n for n in found if n not in self._hygiene_warned)
         if not fresh:
             return
         self._hygiene_warned.update(fresh)
         note = (
-            "工作区根目录出现预期外的项："
-            + ", ".join(fresh[:5])
-            + "。产出必须写在 output/ 下；这通常是 Windows 路径反斜杠转义错误"
-            "（如 `\"...\\data\\...\"`）导致，请核对路径（用原始字符串或正斜杠）并清理误建目录。"
+            "output/ 下发现过程残留（下划线开头的临时件）："
+            + "、".join(fresh[:5])
+            + "。交付前必须删除（考卷要求提交时删除非必要过程数据），"
+            "建议现在就用 arcpy.Delete_management / os.remove 清掉。"
         )
         observation.hint = (observation.hint + "\n" + note) if observation.hint else note
-        self.recorder and self.recorder.record("workspace_hygiene", {"strays": fresh[:8]})
+        self.recorder and self.recorder.record("output_residue", {"files": fresh[:8]})
 
     def _collect_design_note(self, observation: Observation) -> None:
         """把制图配方回传的"设计说明"记下来，写入项目日志（下次同主题出图可沿用）。"""
@@ -486,16 +633,26 @@ class AgentLoop:
             self.recorder.record("repair_attempt", record.to_dict())
             self._emit("repair_attempt", record.to_dict())
 
-        repaired, fixed_code, attempts = self.repairer.run(
-            intent=str(action.args.get("description", "") or self.state.goal),
-            code=str(action.args.get("code", "") or ""),
-            observation=observation,
-            catalog_digest=catalog_digest,
-            recipes_digest=recipes_digest,
-            timeout=float(action.args.get("timeout_seconds", self.config.exec_timeout) or self.config.exec_timeout),
-            workspace=str(self.workspace),
-            on_attempt=_on_attempt,
-        )
+        try:
+            repaired, fixed_code, attempts = self.repairer.run(
+                intent=str(action.args.get("description", "") or self.state.goal),
+                code=str(action.args.get("code", "") or ""),
+                observation=observation,
+                catalog_digest=catalog_digest,
+                recipes_digest=recipes_digest,
+                timeout=float(action.args.get("timeout_seconds", self.config.exec_timeout) or self.config.exec_timeout),
+                workspace=str(self.workspace),
+                on_attempt=_on_attempt,
+            )
+        except Exception as exc:
+            # 修复本身出错（最典型的是修复时模型网关断了）不能把整个 run 拖死：
+            # 以前 LLMError 会一路冒到 runner，整次运行记成 runner_error、产物作废。
+            # 修复是可选加速——交回原始失败观察，下一轮模型调用若也不通，
+            # 循环会按 llm_unavailable 优雅退出（已跑出的产物不受影响）。
+            logger.warning("repair failed: %s", exc)
+            self.recorder.record("repair_error", {"error": str(exc)[:300]})
+            self._emit("repair_error", {"error": str(exc)[:200]})
+            return observation
         if repaired.ok:
             for path in repaired.artifacts:
                 self.state.add_artifact(path)
@@ -1070,6 +1227,15 @@ class AgentLoop:
             self.state.save(str(self.workspace / ".gis_agent" / "runs" / f"{self.state.run_id}.json"))
         except Exception as exc:
             logger.warning("failed to save run state: %s", exc)
+        # 消息历史也要落盘，否则“续跑”无从恢复上下文（state 里只有清单/产物）。
+        # 单独一个文件：messages 可能上百 KB，别把状态文件撞成日志。
+        try:
+            import json as _json
+
+            target = self.workspace / ".gis_agent" / "runs" / f"{self.state.run_id}.messages.json"
+            target.write_text(_json.dumps(self._messages, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("failed to save messages: %s", exc)
         if self.recorder is not None:
             self.recorder.finish(
                 self.state.status,

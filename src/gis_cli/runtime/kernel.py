@@ -416,7 +416,14 @@ class ArcpyKernel:
         # 整段串行化（发消息→收 iopub→取结果）：ZMQ socket 不是线程安全的，
         # 与预热线程或另一个 execute 交叉操作会写坏 wire 协议（实测现象：
         # 内核侧 Invalid Signature / DELIM not in msg_list，客户端 zmq Bad address）。
-        with self._exec_lock:
+        # 等锁也要封顶：若上一次执行卡在无法中断的 GP 调用里，这里的无限等待
+        # 会让整个 run 静默（实测 14 届任务四a：第 31 轮后无事件 2400s+）。
+        lock_budget = float(timeout) + float(getattr(self, "watchdog_grace", 45.0))
+        if not self._exec_lock.acquire(timeout=lock_budget):
+            raise KernelTimeout(
+                f"等待内核空闲超过 {lock_budget:.0f}s：上一次执行可能卡在无法中断的 GP 调用里"
+            )
+        try:
             if not self.is_alive():
                 self.start()
             combined = prefix + _RESULT_HEAD + code + _RESULT_TAIL
@@ -431,6 +438,8 @@ class ArcpyKernel:
                     outcome.result = self._fetch_result()
                 else:
                     outcome.result = result
+        finally:
+            self._exec_lock.release()
         return outcome
 
     def _execute_raw(self, code: str, *, timeout: float) -> ExecResult:

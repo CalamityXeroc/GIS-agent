@@ -724,6 +724,20 @@ def build_default_registry() -> EngineToolRegistry:
             "from gis_cli.cartography import create_map\n"
             f"_r = create_map({layers!r}, {intent!r}, output_path={output_path!r}, "
             f"aprx_path={aprx_path!r}, code_runner=None)\n"
+            # 设计规格边车（同名 .spec.json）：制图配方里有这一步，create_map 没有。
+            # 后果是同一个任务两条出图路径证据不一致：模型用 create_map 出图时
+            # 验收找不到 .spec.json，判“未统一图例”并把 agent 逼去反复重做
+            # （14 届任务四a 实测：89 轮、10 次 create_map、一个 spec 也没留下）。
+            "import json as _json, os as _os\n"
+            "try:\n"
+            "    _out = str(_r.get('output') or '')\n"
+            "    if _out:\n"
+            "        _sp = _os.path.splitext(_out)[0] + '.spec.json'\n"
+            "        with open(_sp, 'w', encoding='utf-8') as _fh:\n"
+            "            _json.dump({k: v for k, v in _r.items() if k != 'spec'}, _fh, ensure_ascii=False, indent=2)\n"
+            "        _r['spec_path'] = _sp\n"
+            "except Exception as _e:\n"
+            "    _r['spec_error'] = str(_e)[:200]\n"
             "set_result(_r)\n"
         )
         # 制图引擎自己要在 ArcGIS 解释器（内核）里跑，所以固定走 code_runner；
@@ -938,6 +952,70 @@ def build_default_registry() -> EngineToolRegistry:
             description="对当前产出做结构化验收（文件存在/要素数/坐标系/字段/栅格/图片非空白），返回逐条结论。",
             parameters={"type": "object", "properties": {}},
             handler=_verify_outputs,
+        )
+    )
+
+    # ------------------------------------------------------------ web_search
+    def _web_search(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """联网搜索（查 ArcPy API / WKID / 报错信息）。
+
+        没网时不报错也不崩：返回一条明确的失败观察，模型据此改用已有知识。
+        竞赛现场常常无网，所以这是**常规路径**而不是异常路径。
+        """
+        from . import web_search as ws
+
+        query = str(args.get("query", "") or "").strip()
+        if not query:
+            return Observation(ok=False, summary="query 为空", error={"type": "BadRequest"})
+        try:
+            limit = int(args.get("max_results", 5) or 5)
+        except (TypeError, ValueError):
+            limit = 5
+        payload = ws.search(query, limit=limit)
+        results = payload.get("results") or []
+        if not results:
+            reason = payload.get("error") or "无结果"
+            return Observation(
+                ok=False,
+                summary=f"联网搜索未成功（{reason}）。可改用已有知识继续，或换关键词再试。",
+                data={"query": query, "backend": payload.get("backend", "")},
+                hint=(
+                    "搜索不可用不等于任务做不下去：先看数据目录、配方库和文档，"
+                    "不要因为搜索失败而停下来反复重试。"
+                ),
+            )
+        body = ws.format_results(payload)
+        return Observation(
+            ok=True,
+            summary=(
+                f"搜索到 {len(results)} 条结果（{payload.get('backend', '')}）。"
+                "结果只作参考，具体参数仍以本地数据和文档为准。"
+            ),
+            data={"query": query, "backend": payload.get("backend", ""), "text": body},
+        )
+
+    registry.register(
+        EngineTool(
+            name="web_search",
+            description=(
+                "联网搜索 GIS 资料（ArcPy/ArcGIS Pro 最新 API、坐标系 WKID、报错信息、ESRI 文档）。"
+                "仅在本地数据目录、配方、文档都查不到时使用；没网时会明确告诉你不可用，"
+                "请改用已有知识继续，不要反复重试。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "max_results": {
+                        "type": "integer",
+                        "description": "最多返回几条（默认 5，上限 8）",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=_web_search,
+            # 只读且无副作用，可与其他只读工具并发
+            readonly=True,
         )
     )
 

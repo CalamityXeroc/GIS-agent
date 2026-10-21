@@ -87,6 +87,15 @@ def dir_inventory(code_runner: Any, target: str) -> tuple[dict | None, str]:
                 "            _out[_e] = {'items': list(_items), 'bytes': _size}",
                 "        elif os.path.isfile(_p):",
                 "            _files.append(_e)",
+                # 子目录也要看：交付图常放在 output/成果图/ 下，只扫顶层会漏掉
+                # 里面的一堆过程残留（实测 14 届四a：顶层 2 个文件，子目录里还有
+                # 14 个 _m0/_q1/_r1，卫生检查却报“无问题”）。
+                "for _e in sorted(os.listdir(_t)):",
+                "    _p = os.path.join(_t, _e)",
+                "    if os.path.isdir(_p) and not _e.lower().endswith('.gdb'):",
+                "        for _f in sorted(os.listdir(_p)):",
+                "            if os.path.isfile(os.path.join(_p, _f)):",
+                "                _files.append(_e + '/' + _f)",
                 "set_result({'gdb': _out, 'files': _files})",
             ]
         )
@@ -134,6 +143,11 @@ def dir_inventory(code_runner: Any, target: str) -> tuple[dict | None, str]:
                 gdb[entry] = {"items": list(items), "bytes": size}
             elif os.path.isfile(path):
                 files.append(entry)
+            elif os.path.isdir(path) and not entry.lower().endswith(".gdb"):
+                # 子目录（如 output/成果图/）里也要数
+                for sub in sorted(os.listdir(path)):
+                    if os.path.isfile(os.path.join(path, sub)):
+                        files.append(f"{entry}/{sub}")
         return {"gdb": gdb, "files": files}, ""
     except Exception as exc:
         return None, f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -170,6 +184,15 @@ def hygiene_report(
         warnings_out.append(
             f"交付目录存在像探查/测试产出的文件 {'、'.join(probes[:4])}"
             "（考卷要求提交时删除非必要过程数据）"
+        )
+
+    # 下划线开头的文件几乎都是模型迭代时的临时件（_m0.aprx / _q1.jpg / _r1.jpg…）：
+    # 它们不构成“前缀族”（_m0/_m1/_m2 互相不为前缀），所以重做残留那条规则抓不到。
+    # 正常交付物不会以下划线开头，直接计入 problems。
+    underscore = sorted({f for f in files if Path(f).name.startswith("_")})
+    if underscore:
+        problems.append(
+            f"交付目录存在过程残留（下划线开头的临时件）{'、'.join(underscore[:6])}"
         )
 
     dup_families = 0

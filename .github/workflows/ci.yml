@@ -1,0 +1,58 @@
+name: CI
+
+# 只在不需要 ArcGIS 的部分跑（`-m "not arcpy"`）。
+#
+# 为什么不跑全量：带 arcpy 的测试每个都要起一个子进程（实测单个 ~12s），
+# 全量 15 分钟以上；而 GitHub 的 runner 上根本没有 ArcGIS Pro，也装不了
+# （商业授权、只支持 Windows 且要许可证）。所以 CI 的职责是守住**新引擎**
+# 的回归 —— 新引擎设计上就不依赖 arcpy 才能启动/规划/验收，这正是它相对
+# 旧引擎的硬性优势，CI 正好把这条边界焊死。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 测试（无 ArcGIS）
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 是 pyproject 声明的最低版本；3.12 是本地开发版本。
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          # CI 只需要「新引擎」能跑。核心 dependencies 里的
+          # langchain* / litellm 只被已冻结的旧引擎（agent/、planner.py）用到，
+          # chromadb 则一行都没引用（死依赖）。litellm 单个 37 MB，
+          # chromadb 会拉 onnxruntime —— 全装一次要几分钟，CI 里没有意义。
+          # 用 --no-deps 装本包 + 显式装新引擎的真实依赖，既快又把
+          # “新引擎不依赖这些重包”这条边界焊死。
+          pip install --no-deps -e .
+          pip install typer pydantic rich openai json5 prompt-toolkit jupyter-client pillow numpy pytest
+
+      - name: 跑测试（排除需要 arcpy 的）
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: pytest -m "not arcpy" -q
