@@ -38,6 +38,8 @@ office = [
 ]
 dev = [
   "pytest>=8.3.2",
+  # Python 3.10 没有 tomllib（3.11+ 才进标准库），测试要读 pyproject 就得靠它
+  "tomli>=2.0; python_version < '3.11'",
 ]
 #: 锦上添花的可选依赖：缺了能跑，只是能力降级（代码里都是 try/except）。
 #:

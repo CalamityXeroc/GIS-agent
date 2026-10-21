@@ -42,14 +42,13 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          # CI 只需要「新引擎」能跑。核心 dependencies 里的
-          # langchain* / litellm 只被已冻结的旧引擎（agent/、planner.py）用到，
-          # chromadb 则一行都没引用（死依赖）。litellm 单个 37 MB，
-          # chromadb 会拉 onnxruntime —— 全装一次要几分钟，CI 里没有意义。
-          # 用 --no-deps 装本包 + 显式装新引擎的真实依赖，既快又把
-          # “新引擎不依赖这些重包”这条边界焊死。
-          pip install --no-deps -e .
-          pip install typer pydantic rich openai json5 prompt-toolkit jupyter-client pillow numpy pytest
+          # 依赖一律从 pyproject 装，**不在 CI 里手写清单**。
+          # 以前这里手写过一份 `pip install typer pydantic rich ...`：
+          # 后来 langchain 被移除、pyyaml 变成显式依赖，这份清单没人更新，
+          # CI 直接 ModuleNotFoundError: No module named 'yaml'（实测）。
+          # 从 pyproject 装就不会再有这种漂移；顺带一提，现在 core 依赖
+          # 只有 9 个轻量包（litellm/chromadb 那些重包已删除）。
+          pip install -e ".[dev]"
 
       - name: 跑测试（排除需要 arcpy 的）
         env:

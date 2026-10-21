@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import ast
 import sys
-import tomllib
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+    import tomli as tomllib  # type: ignore
 from pathlib import Path
 
 import pytest

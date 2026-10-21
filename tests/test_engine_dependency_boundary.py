@@ -22,6 +22,11 @@ import ast
 import re
 from pathlib import Path
 
+try:  # Python 3.11+ 才有 tomllib；包声明支持 >=3.10，测试要能在那儿跑
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+    import tomli as tomllib  # type: ignore
+
 import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "gis_cli"
@@ -128,8 +133,17 @@ def test_ci_workflow_exists_and_excludes_arcpy():
     text = workflow.read_text(encoding="utf-8")
     assert 'not arcpy' in text, "CI 必须排除需要 arcpy 的测试"
     assert "windows-latest" in text, "本项目只在 Windows 上成立（ArcPy）"
-    # 不能装全量依赖：litellm/chromadb 会让 CI 慢几分钟且毫无用处
-    assert "--no-deps" in text, "CI 应跳过旧引擎的重包"
+    # 依赖必须从 pyproject 装（`-e .`），不能手工维护一份清单：
+    # 以前 CI 手写过 `pip install typer pydantic rich ...`，删掉 langchain 后
+    # pyyaml 变成显式依赖却没人更新它，CI 直接 ModuleNotFoundError（实测）。
+    assert "-e ." in text or '-e ".[dev]"' in text, "CI 必须从 pyproject 装依赖"
+    # 只看真正的命令行（注释里提到旧清单不算）
+    install_lines = [
+        l.strip() for l in text.splitlines()
+        if l.strip().startswith("pip install") or l.strip().startswith("python -m pip install")
+    ]
+    assert install_lines, "找不到安装步骤"
+    assert not any("pydantic" in l for l in install_lines), "pydantic 已不是本包依赖"
 
 
 def test_pytest_marker_registered():
@@ -271,7 +285,6 @@ def test_legacy_is_excluded_from_packaging():
     import 就崩的包；如果 ``[project.scripts]`` 还指向 legacy 模块，pip 会
     生成指向不存在模块的 .exe，用户一跑就 ImportError。
     """
-    import tomllib
 
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
