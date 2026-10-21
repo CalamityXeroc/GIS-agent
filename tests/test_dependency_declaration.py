@@ -108,7 +108,10 @@ LEGACY_OPTIONAL = {
 }
 
 #: 标准库里名字容易误判的（确保不会被当成第三方）。
-_EXTRA_STDLIB = {"sqlite3", "tkinter", "zoneinfo"}
+#: 标准库里但不在 sys.stdlib_module_names 里的（或版本间有出入的）。
+#: tomllib 是 3.11 才进标准库的；包声明支持 >=3.10，所以扫描器在
+#: 3.10 上不能把它当成"未声明的第三方包"（否则 CI 的 3.10 会误报）。
+_EXTRA_STDLIB = {"sqlite3", "tkinter", "zoneinfo", "tomllib"}
 
 
 def _stdlib_names() -> set[str]:

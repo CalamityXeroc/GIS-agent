@@ -168,7 +168,6 @@ def test_chromadb_is_not_declared_as_dependency():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     text = pyproject.read_text(encoding="utf-8")
     # 只看 [project] 的 dependencies 段，注释里提到 chromadb 是允许的
-    import tomllib
 
     data = tomllib.loads(text)
     deps = [d.lower() for d in data["project"]["dependencies"]]
