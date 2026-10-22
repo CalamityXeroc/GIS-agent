@@ -13,6 +13,7 @@ try:
     import typer
     from rich.console import Console
     from rich.panel import Panel
+    from rich.table import Table
     from rich.text import Text
 except ImportError:
     print("缺少必要的依赖包。请运行: pip install typer rich")
@@ -158,6 +159,112 @@ def resume_run_cmd(
             )
         )
         raise typer.Exit(code=0 if state.status == "completed" else 1)
+    finally:
+        bundle.close()
+
+
+@app.command("distill")
+def distill_cmd(
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="工作空间目录"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="llm_config.json 路径"),
+    run_id: str = typer.Option("", "--run", help="指定 run_id（默认取最近一次 completed）"),
+    adopt: bool = typer.Option(False, "--adopt", help="采纳进 workspace/recipes/（下次自动加载）"),
+    replay: bool = typer.Option(False, "--replay", help="回放验证：用默认参数在隔离目录重跑一遍"),
+    verify: str = typer.Option("", "--verify", help="只回放已有候选（不重新蒸馏）；加 --adopt 采纳该候选"),
+    list_only: bool = typer.Option(False, "--list", help="只看已有候选，不蒸馏"),
+    reject: str = typer.Option("", "--reject", help="删除指定候选"),
+):
+    """把一次成功运行沉淀成可复用配方（候选 → 门禁 → 可选回放 → 可选采纳）。
+
+    只有 ``completed`` 的运行才值得沉淀；蒸馏出的配方先进候选目录，
+    默认不自动进配方库。
+    """
+    from ..engine.runner import build_engine
+    from ..recipes.lifecycle import RecipeLifecycle
+
+    ws = (workspace or Path.cwd()).resolve()
+    bundle = build_engine(workspace=ws, config_path=config, refresh_catalog=False)
+    try:
+        lifecycle = RecipeLifecycle(bundle.recipes, ws, code_runner=bundle.code_runner)
+
+        if list_only:
+            rows = lifecycle.list_candidates()
+            if not rows:
+                console.print(Panel.fit("还没有候选配方。跑完一个任务后执行 `gis-agent distill`。", title="候选配方"))
+                raise typer.Exit(code=0)
+            table = Table(title="候选配方", show_lines=False)
+            for col in ("id", "名称", "门禁", "来源"):
+                table.add_column(col)
+            for row in rows:
+                table.add_row(
+                    str(row.get("id", "")),
+                    str(row.get("name", ""))[:28],
+                    "通过" if row.get("gate_ok") else "未通过",
+                    str(row.get("provenance", ""))[:24],
+                )
+            console.print(table)
+            raise typer.Exit(code=0)
+
+        if reject:
+            ok = lifecycle.reject(reject)
+            console.print(f"{'已删除候选' if ok else '没有这个候选'}: {reject}")
+            raise typer.Exit(code=0 if ok else 1)
+
+        if verify:
+            console.print(f"回放验证候选 {verify}…")
+            res = lifecycle.replay(verify)
+            lines = [f"回放: {'通过' if res.ok else '未通过'}"]
+            for check in res.checks:
+                lines.append(f"  [{'OK ' if check.ok else 'FAIL'}] {check.name}: {check.detail[:90]}")
+            for warn in res.warnings:
+                lines.append(f"  [警告] {warn[:100]}")
+            # `--verify X --adopt`：采纳**刚回放过的那一个**。不加这个组合，
+            # 只能先 --verify 再 --adopt，而 --adopt 会重新蒸馏出一个新候选，
+            # 等于“验的不是采的那个”（实测踩到：回放通过的没被采纳）。
+            if adopt:
+                if not res.ok:
+                    lines.append("回放未通过，不予采纳")
+                    console.print(Panel.fit("\n".join(lines), title="回放验证"))
+                    raise typer.Exit(code=1)
+                adopted_path, note = lifecycle.adopt(verify)
+                if adopted_path is None:
+                    lines.append(f"采纳失败：{note}")
+                else:
+                    lines.append(f"已采纳: {adopted_path}（{note}；下次 build_engine 自动加载）")
+            console.print(Panel.fit("\n".join(lines), title="回放验证"))
+            raise typer.Exit(code=0 if res.ok else 1)
+
+        console.print(f"正在从 {run_id or '最近一次 completed 运行'} 蒸馏配方…")
+        result = bundle.distill(run_id=run_id or None, replay=replay, adopt=adopt)
+
+        if not result.get("ok") and not result.get("recipe"):
+            console.print(Panel.fit(str(result.get("reason") or "蒸馏失败"), title="未能蒸馏"))
+            raise typer.Exit(code=1)
+
+        gate = result.get("gate") or {}
+        lines = [f"配方: {result['recipe']['id']} — {result['recipe']['name']}",
+                 f"参数: {len(result['recipe'].get('params') or {})} 个",
+                 f"门禁: {'通过' if gate.get('ok') else '未通过'}"]
+        for check in gate.get("checks") or []:
+            lines.append(f"  [{'OK ' if check['ok'] else 'FAIL'}] {check['name']}: {check['detail'][:90]}")
+        for warn in gate.get("warnings") or []:
+            lines.append(f"  [警告] {warn[:100]}")
+        for note in result.get("sanitized") or []:
+            lines.append(f"  [净化] {note[:100]}")
+
+        replay_result = result.get("replay")
+        if replay_result:
+            lines.append(f"回放: {'通过' if replay_result.get('ok') else '未通过'}")
+            for check in replay_result.get("checks") or []:
+                lines.append(f"  [{'OK ' if check['ok'] else 'FAIL'}] {check['name']}: {check['detail'][:90]}")
+
+        lines.append(f"候选文件: {result.get('candidate')}")
+        if result.get("adopted"):
+            lines.append(f"已采纳: {result['adopted']}（下次 build_engine 自动加载）")
+        elif gate.get("ok"):
+            lines.append("下一步：`gis-agent distill --replay` 回放验证，`--adopt` 采纳入库")
+        console.print(Panel.fit("\n".join(lines), title="配方蒸馏"))
+        raise typer.Exit(code=0 if result.get("ok") else 1)
     finally:
         bundle.close()
 

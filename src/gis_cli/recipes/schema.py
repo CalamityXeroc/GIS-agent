@@ -11,6 +11,11 @@ from typing import Any
 
 import yaml  # type: ignore
 
+#: 参数默认值写成它 → 运行时自动填成当前工作区路径。
+#: 蒸馏出来的配方常常需要“以工作区为根”的路径（``ws = {{workspace}}``），
+#: 但把源机器路径当默认值不可移植，写 ``.`` 又不对（内核 CWD 不是工作区）。
+WORKSPACE_SENTINEL = "@workspace@"
+
 _SLOT = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _RAW_SLOT = re.compile(r"@@\s*([A-Za-z_][A-Za-z0-9_]*)\s*@@")
 
@@ -102,6 +107,13 @@ class Recipe:
         for name, value in (params or {}).items():
             if name not in resolved:
                 resolved[name] = value
+        # 按声明类型收敛：蒸馏出的配方常把 ``decimals`` 声明成 integer 却给
+        # 默认值 ``"2"``，渲染后变成 ``round(x, '2')`` → TypeError。类型是配方的
+        # 契约，就在渲染前生效，代码与断言看到的是同一个值。
+        for name, value in list(resolved.items()):
+            spec = self.params.get(name)
+            if spec is not None:
+                resolved[name] = _coerce_param(value, spec.type)
         return resolved
 
     def to_dict(self, *, with_code: bool = False) -> dict[str, Any]:
@@ -185,6 +197,32 @@ class Recipe:
                 if token and (token in trigger_lower or trigger_lower in token):
                     score += 4
         return score
+
+
+def _coerce_param(value: Any, declared: str) -> Any:
+    """把“声明了非字符串类型、实际传了字符串”的参数转成真值。
+
+    只处理字符串输入（真 int/bool 原样保留）；转换不了就原样返回，交给代码
+    自己报错——静默改成别的值比报错更难查。
+    """
+    if not isinstance(value, str):
+        return value
+    kind = (declared or "").lower()
+    text = value.strip()
+    try:
+        if kind in {"integer", "int"}:
+            return int(text)
+        if kind in {"number", "float", "double"}:
+            return float(text)
+    except ValueError:
+        return value
+    if kind in {"boolean", "bool"}:
+        lowered = text.lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return value
 
 
 def _py_literal(value: Any) -> str:

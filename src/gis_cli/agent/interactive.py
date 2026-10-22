@@ -154,6 +154,7 @@ class InteractiveChat:
         self.view.flush()
         self.console.print()
         wiring.render_finish(self.console, self.session.tracker, state, trace_path=self.last_trace, show_trace=False)
+        self._maybe_suggest_distill(state)
         # 排队的消息 = 同一任务的补充说明 → 合并成一条新任务自动接着做
         merged = self.session.merged_task("") if self.session else ""
         if merged.strip():
@@ -161,6 +162,42 @@ class InteractiveChat:
                 Text(f"（接着处理排队的补充说明，{merged.count(chr(10)) + 1} 行）", style="gis.dim")
             )
             self._pending_followup = merged
+
+    def _maybe_suggest_distill(self, state: Any) -> None:
+        """成功后提示/自动把这次运行沉淀成配方（engine.distill_after_success）。
+
+        ``suggest``（默认）只打一行提示，不调模型；``auto`` 后台蒸馏；
+        ``off`` 完全不做。默认选 suggest：网关抖动时自动蒸馏会多一次
+        LLM 往返，不该偷偷花掉用户的时间。
+        """
+        if str(getattr(state, "status", "")) != "completed" or self.bundle is None:
+            return
+        try:
+            mode = str(getattr(self.bundle.loop.config, "distill_after_success", "suggest") or "suggest").lower()
+        except Exception:
+            mode = "suggest"
+        if mode == "off":
+            return
+        if mode == "auto":
+            import threading
+
+            def _worker() -> None:
+                try:
+                    result = self.bundle.distill()
+                    text = (
+                        f"已自动沉淀配方：{result['recipe']['id']}（门禁{'通过' if result.get('gate', {}).get('ok') else '未过'}）"
+                        if result.get("recipe")
+                        else f"自动沉淀跳过：{result.get('reason')}"
+                    )
+                except Exception as exc:  # pragma: no cover - 后台任务不能影响主流程
+                    text = f"自动沉淀失败：{exc}"
+                self.console.print(Text(text, style="gis.dim"))
+
+            threading.Thread(target=_worker, name="gis-agent-distill", daemon=True).start()
+            return
+        self.console.print(
+            Text("（本次运行可沉淀为可复用配方：输入 /distill 试试，/distill adopt 直接入库）", style="gis.dim")
+        )
 
     def _emit_queued(self, count: int) -> None:
         """把“已排队”同时推进状态行（事件流）与转录。"""
@@ -199,6 +236,7 @@ class InteractiveChat:
                 "tools": self._cmd_tools,
                 "skills": self._cmd_skills,
                 "recipes": self._cmd_recipes,
+                "distill": self._cmd_distill,
                 "trace": self._cmd_trace,
                 "session": self._cmd_session,
                 "resume": self._cmd_resume,
@@ -358,6 +396,90 @@ class InteractiveChat:
         self._print_inventory("recipes")
         return True
 
+    def _cmd_distill(self, arg: str) -> bool:
+        """把上一次成功运行沉淀成配方：/distill [list|replay [id] [adopt]|adopt [id]|reject <id>]。"""
+        if self.bundle is None:
+            self.console.print(Text("（引擎未就绪）", style="gis.dim"))
+            return True
+        from ..recipes.lifecycle import RecipeLifecycle
+
+        lifecycle = RecipeLifecycle(self.bundle.recipes, self.bundle.workspace,
+                                    code_runner=self.bundle.code_runner)
+        sub = (arg or "").strip().split()
+        action = sub[0].lower() if sub else ""
+
+        if action == "list":
+            self._print_candidates(lifecycle)
+            return True
+        if action == "reject" and len(sub) > 1:
+            ok = lifecycle.reject(sub[1])
+            self.console.print(Text(f"{'已删除候选' if ok else '没有这个候选'}: {sub[1]}",
+                                    style="gis.ok" if ok else "gis.dim"))
+            return True
+
+        rid = sub[1] if len(sub) > 1 else ""
+        # 带 id 时只动**已有候选**：先验后采必须是同一个配方。不带 id 的
+        # replay/adopt 会重新蒸馏出一个新候选，“验的不是采的那个”（实测踩到）。
+        if action == "replay" and rid:
+            res = lifecycle.replay(rid)
+            lines = [f"回放 {rid}: {'通过' if res.ok else '未通过'}"]
+            for check in res.checks:
+                if not check["ok"]:
+                    lines.append(f"  [FAIL] {check['name']}: {check['detail'][:80]}")
+            for warn in res.warnings:
+                lines.append(f"  [警告] {warn[:80]}")
+            if res.ok and len(sub) > 2 and sub[2].lower() == "adopt":
+                path, note = lifecycle.adopt(rid)
+                lines.append(f"已采纳: {path}（{note}）" if path else f"采纳失败：{note}")
+            elif not res.ok and len(sub) > 2:
+                lines.append("回放未通过，不予采纳")
+            self.console.print(Text("\n".join(lines), style="gis.ok" if res.ok else "gis.warn"))
+            return True
+        if action == "adopt" and rid:
+            path, note = lifecycle.adopt(rid)
+            self.console.print(Text(
+                f"已采纳: {path}（{note}；下次 build_engine 自动加载）" if path else f"采纳失败：{note}",
+                style="gis.ok" if path else "gis.warn",
+            ))
+            return True
+
+        self.console.print(Text("正在蒸馏上一次成功运行…", style="gis.dim"))
+        result = self.bundle.distill(replay=action == "replay", adopt=action == "adopt")
+        if not result.get("recipe"):
+            self.console.print(Text(f"未能蒸馏：{result.get('reason')}", style="gis.warn"))
+            return True
+
+        gate = result.get("gate") or {}
+        lines = [f"配方: {result['recipe']['id']} — {result['recipe']['name']}",
+                 f"参数: {len(result['recipe'].get('params') or {})} 个 | "
+                 f"门禁: {'通过' if gate.get('ok') else '未通过'}"]
+        for check in gate.get("checks") or []:
+            if not check["ok"]:
+                lines.append(f"  [FAIL] {check['name']}: {check['detail'][:80]}")
+        for warn in gate.get("warnings") or []:
+            lines.append(f"  [警告] {warn[:80]}")
+        replay_result = result.get("replay")
+        if replay_result:
+            lines.append(f"回放: {'通过' if replay_result.get('ok') else '未通过'}")
+            for check in replay_result.get("checks") or []:
+                if not check["ok"]:
+                    lines.append(f"  [FAIL] {check['name']}: {check['detail'][:80]}")
+        if result.get("adopted"):
+            lines.append(f"已采纳: {result['adopted']}")
+        elif gate.get("ok"):
+            lines.append("下一步：/distill replay 回放验证，/distill adopt 采纳入库")
+        self.console.print(Text("\n".join(lines), style="gis.agent"))
+        return True
+
+    def _print_candidates(self, lifecycle: Any) -> None:
+        rows = lifecycle.list_candidates()
+        if not rows:
+            self.console.print(Text("（暂无候选配方；跑完一个任务后 /distill 试试）", style="gis.dim"))
+            return
+        lines = [f"  {r.get('id')} — {r.get('name')} [{'门禁通过' if r.get('gate_ok') else '门禁未过'}]"
+                 for r in rows]
+        self.console.print(Text("候选配方：\n" + "\n".join(lines[:40]), style="gis.agent"))
+
     def _cmd_session(self, arg: str) -> bool:  # noqa: ARG002
         self._print_session()
         return True
@@ -455,6 +577,17 @@ class InteractiveChat:
             except Exception as exc:
                 items = [f"（读取失败：{exc}）"]
             text = "\n".join(f"  {item}" for item in items[:80]) or "  （无）"
+            # 候选配方也要露一眼：否则用户不知道有东西等着采纳
+            try:
+                from ..recipes.lifecycle import RecipeLifecycle
+
+                pending = RecipeLifecycle(self.bundle.recipes, self.bundle.workspace).list_candidates()
+            except Exception:
+                pending = []
+            if pending:
+                text += "\n\n候选（未采纳，/distill list 查看）：\n" + "\n".join(
+                    f"  {r.get('id')} — {r.get('name')}" for r in pending[:10]
+                )
             self.console.print(Text(f"配方：\n{text}", style="gis.agent"))
             return
         if kind == "tools":

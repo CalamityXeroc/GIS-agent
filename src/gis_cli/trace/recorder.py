@@ -86,14 +86,20 @@ class RunRecorder:
         if getattr(self, "_fh", None) is None or getattr(self._fh, "closed", False):
             self._fh = open(self.jsonl_path, "a", encoding="utf-8")
 
-    def record(self, event: str, payload: dict[str, Any] | None = None, duration_ms: int = 0) -> TraceEvent:
+    def record(
+        self,
+        event: str,
+        payload: dict[str, Any] | None = None,
+        duration_ms: int = 0,
+        max_str: int = 4000,
+    ) -> TraceEvent:
         self._seq += 1
         self._ensure_open()
         evt = TraceEvent(
             seq=self._seq,
             ts=_now_iso(),
             event=event,
-            payload=_jsonable(payload or {}),
+            payload=_jsonable(payload or {}, max_str),
             duration_ms=duration_ms,
         )
         self._fh.write(json.dumps(evt.to_dict(), ensure_ascii=False) + "\n")

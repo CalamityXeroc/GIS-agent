@@ -43,6 +43,158 @@ class EngineBundle:
         except Exception:
             pass
 
+    # ------------------------------------------------------------ 配方沉淀
+    def _runs_dir(self) -> Path:
+        return self.workspace / ".gis_agent" / "runs"
+
+    def trace_path_for(self, run_id: str) -> str | None:
+        """按 run_id 找 trace 文件（没有就返回 None）。"""
+        if not run_id:
+            return None
+        path = self.workspace / ".gis_agent" / "traces" / f"{run_id}.jsonl"
+        return str(path) if path.exists() else None
+
+    def latest_completed_state(self, run_id: str | None = None) -> tuple[Any, str | None]:
+        """找一次 **completed** 的运行（默认取最新），返回 ``(state, trace_path)``。
+
+        为什么不用 ``loop.state``：CLI 里引擎是新建的，还没跑过任务；
+        用户想要的是“把上一次成功的活儿沉淀成配方”。
+        """
+        import json as _json
+
+        from .state import TaskState
+
+        runs = self._runs_dir()
+        if not runs.is_dir():
+            return None, None
+        candidates: list[tuple[float, Path, str]] = []
+        for path in runs.glob("*.json"):
+            if path.name.endswith(".messages.json"):
+                continue
+            try:
+                data = _json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            status = str(data.get("status") or "")
+            rid = str(data.get("run_id") or path.stem)
+            if run_id is not None and rid != run_id:
+                continue
+            if status != "completed":
+                continue
+            try:
+                candidates.append((path.stat().st_mtime, path, rid))
+            except OSError:
+                continue
+        if not candidates:
+            return None, None
+        _mtime, path, rid = max(candidates, key=lambda item: item[0])
+        try:
+            return TaskState.load(str(path)), self.trace_path_for(rid)
+        except Exception:
+            return None, None
+
+    def distill(
+        self,
+        state: Any = None,
+        *,
+        adopt: bool = False,
+        replay: bool = False,
+        extra_snippets: list[str] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """把一次**成功**运行蒸馏成候选配方。
+
+        链路：收 execute_code 片段 → 模型泛化 → 净化 → 静态门禁 → 写候选目录
+        （→ 可选回放验证 → 可选采纳）。
+
+        ``state`` 不传时从 ``.gis_agent/runs/`` 里找**最近一次 completed** 的运行
+        （``run_id`` 可指定）。返回字典（不抛异常）：
+        ``{ok, reason?, recipe, gate, candidate, replay?, adopted}``。
+        """
+        from ..recipes.distiller import RecipeDistiller
+        from ..recipes.lifecycle import RecipeLifecycle
+        from ..recipes.lifecycle import sanitize_distilled
+
+        trace: str | None = None
+        if state is None:
+            state, trace = self.latest_completed_state(run_id)
+        if state is None:
+            return {
+                "ok": False,
+                "reason": "没有可蒸馏的运行（没有 completed 状态的历史运行）"
+                if run_id is None
+                else f"找不到运行 {run_id} 的 completed 状态",
+            }
+        if str(getattr(state, "status", "")) != "completed":
+            return {
+                "ok": False,
+                "reason": f"运行状态是 {getattr(state, 'status', '?')}，只有 completed 才值得沉淀",
+            }
+
+        snippets = list(extra_snippets or [])
+        if not snippets:
+            if trace is None:
+                trace = self.trace_path_for(getattr(state, "run_id", ""))
+            if trace:
+                snippets = RecipeDistiller.collect_successful_code(trace)
+        if not snippets:
+            return {
+                "ok": False,
+                "reason": "本次运行没有可泛化的 execute_code 片段（全部走配方/工具，没什么可沉淀的）",
+            }
+
+        distiller = RecipeDistiller(self.llm, self.recipes)
+        recipe = distiller.distill(
+            goal=str(getattr(state, "goal", "") or ""),
+            methodology=str(getattr(state, "methodology", "") or ""),
+            final_summary=str(getattr(state, "final_summary", "") or ""),
+            code_snippets=snippets,
+            artifacts=list(getattr(state, "artifacts", []) or []),
+        )
+        if recipe is None:
+            return {"ok": False, "reason": "模型没有产出可解析的配方（见日志）"}
+
+        lifecycle = RecipeLifecycle(self.recipes, self.workspace, code_runner=self.code_runner)
+        # 蒸馏结果先净化（槽位多余引号 / 默认值里的源绝对路径），再过门禁。
+        # 净化不掉的（真正的硬编码）就交给门禁拦下。
+        notes = sanitize_distilled(recipe, source_workspace=str(self.workspace))
+        gate = lifecycle.static_gate(recipe, source_workspace=str(self.workspace))
+        candidate = lifecycle.save_candidate(
+            recipe,
+            provenance=f"run:{getattr(state, 'run_id', '')}",
+            gate=gate,
+            extra={
+                "goal": str(getattr(state, "goal", "") or "")[:500],
+                "artifacts": list(getattr(state, "artifacts", []) or [])[:10],
+            },
+        )
+        result: dict[str, Any] = {
+            "ok": gate.ok,
+            "recipe": recipe.to_dict(),
+            "gate": gate.to_dict(),
+            "candidate": str(candidate),
+            "adopted": None,
+            "sanitized": notes,
+        }
+
+        if replay and gate.ok:
+            replay_result = lifecycle.replay(recipe.id).to_dict()
+            result["replay"] = replay_result
+            # 回放不过就不算成功——否则调用方会以为“已通过验证”。
+            if not replay_result.get("ok"):
+                result["ok"] = False
+                result["reason"] = "回放验证未通过：" + str(
+                    next((c["detail"] for c in replay_result.get("checks", []) if not c.get("ok")), "")
+                )[:200]
+
+        if adopt and gate.ok and (not replay or (result.get("replay") or {}).get("ok")):
+            target, note = lifecycle.adopt(recipe.id)
+            result["adopted"] = str(target) if target else None
+            result["adopt_note"] = note
+            if target is None:
+                result["ok"] = False
+        return result
+
 
 def load_engine_config(workspace: str | Path, config_path: str | Path | None = None) -> tuple[EngineLLMConfig, dict[str, Any]]:
     """Load LLM + engine config, returning (llm_config, engine_dict)."""
@@ -144,6 +296,7 @@ def build_engine(
         max_turns=int(engine_cfg.get("max_turns", 60)),
         max_repairs=int(engine_cfg.get("max_repairs", 4)),
         max_repair_seconds=float(engine_cfg.get("max_repair_seconds", 600.0)),
+        distill_after_success=str(engine_cfg.get("distill_after_success", "suggest") or "suggest"),
         exec_timeout=float(engine_cfg.get("kernel_exec_timeout_seconds", 600)),
         tool_protocol=str(engine_cfg.get("tool_protocol", "auto")),
         context_soft_limit_tokens=int(engine_cfg.get("context_soft_limit_tokens", 120_000)),

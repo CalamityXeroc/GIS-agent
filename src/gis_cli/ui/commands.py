@@ -207,6 +207,17 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("tools", "列出可用工具"),
     CommandSpec("skills", "列出可用技能（可用 /skill:名字 手动加载）"),
     CommandSpec("recipes", "列出内置配方"),
+    CommandSpec(
+        "distill",
+        "把上次成功运行沉淀成配方（候选→门禁→可选回放/采纳）",
+        usage="/distill [list|replay [id] [adopt]|adopt [id]|reject <id>]",
+        args=(
+            ("list", "看候选配方"),
+            ("replay", "蒸馏 + 回放验证（带 id 则只验该候选）"),
+            ("replay <id> adopt", "验完直接采纳同一个候选"),
+            ("adopt", "蒸馏 + 采纳入库（带 id 则采纳该候选）"),
+        ),
+    ),
     CommandSpec("trace", "显示最近一次运行的追踪文件", usage="/trace [full]"),
     CommandSpec("session", "显示当前会话记录"),
     CommandSpec("resume", "切换到历史会话继续", usage="/resume [序号或 id]"),

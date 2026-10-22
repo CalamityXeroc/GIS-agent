@@ -11,11 +11,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .schema import Recipe
+from .schema import WORKSPACE_SENTINEL, Recipe
 
 logger = logging.getLogger(__name__)
 
 _SLOT = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+#: ``@@param@@``：参数嵌进文本/正则/表达式时用的原样替换（与 Recipe.render 一致）。
+#: 蒸馏出的断言常用它（如 ``value: "@@group_field@@ | 记录数"``），只认
+#: ``{{param}}`` 会让断言把 ``@@group_field@@`` 当成字面量而永远不过。
+_RAW_SLOT = re.compile(r"@@\s*([A-Za-z_][A-Za-z0-9_]*)\s*@@")
 
 
 @dataclass
@@ -147,8 +151,18 @@ class RecipeLibrary:
         if self.code_runner is None and getattr(ctx, "code_runner", None) is None:
             return Observation(ok=False, summary="没有可用的代码执行器", error={"type": "NoRunner"})
         runner = getattr(ctx, "code_runner", None) or self.code_runner
+        # 把工作区哨兵换成真实路径：蒸馏出来的配方常用 `ws = {{workspace}}`，
+        # 而内核的 CWD 不是工作区，写 `.` 会找不到 input/。
+        params = dict(params or {})
+        workspace_str = str(getattr(ctx, "workspace", "."))
+        for key, value in list(params.items()):
+            if isinstance(value, str) and value == WORKSPACE_SENTINEL:
+                params[key] = workspace_str
+        for key, spec in (recipe.params or {}).items():
+            if key not in params and isinstance(spec.default, str) and spec.default == WORKSPACE_SENTINEL:
+                params[key] = workspace_str
         try:
-            code = recipe.render(params or {})
+            code = recipe.render(params)
         except Exception as exc:
             return Observation(
                 ok=False,
@@ -171,12 +185,21 @@ class RecipeLibrary:
                 hint="可改用 execute_code 手动实现，或修正参数后重试。",
             )
 
-        resolved = recipe.resolve_params(params or {})
-        assertions = self._run_assertions(recipe, resolved, result)
+        resolved = recipe.resolve_params(params)
+        assertions = self._run_assertions(recipe, resolved, result, workspace=getattr(ctx, "workspace", None))
         failed = [a for a in assertions if not a.ok]
         from ..engine.tools import extract_outputs
 
         artifacts = extract_outputs(result.result, str(getattr(ctx, "workspace", ".")))
+        if not artifacts:
+            # 兜底：配方代码不一定调 set_result（蒸馏出来的配方常常只 print）。
+            # 但它自己的 validation 已经点名了交付物——把通过的“存在性”断言
+            # 当成产物清单，否则下游会把“没有产物”当成失败。
+            artifacts = [
+                a.target
+                for a in assertions
+                if a.ok and str(a.kind) in {"vector_exists", "raster_exists", "file_exists"} and a.target
+            ]
         summary = f"配方 {recipe.id} 执行成功"
         if assertions:
             summary += f"，断言 {len(assertions) - len(failed)}/{len(assertions)} 通过"
@@ -210,7 +233,9 @@ class RecipeLibrary:
                 out.append(ValidationResult(kind, target, False, f"断言执行异常: {exc}"))
         return out
 
-    def _run_assertions(self, recipe: Recipe, params: dict[str, Any], result: Any) -> list[ValidationResult]:
+    def _run_assertions(
+        self, recipe: Recipe, params: dict[str, Any], result: Any, *, workspace: str | Path | None = None
+    ) -> list[ValidationResult]:
         out: list[ValidationResult] = []
         for raw in recipe.validation:
             # 解析断言里所有字符串槽位（path/target/value 以及 field/reference 等自定义键）
@@ -223,11 +248,28 @@ class RecipeLibrary:
             expected = raw.get("value")
             if isinstance(expected, list):
                 expected = [_resolve(str(v), params) for v in expected]
+            target = self._absolutize(target, workspace)
             try:
                 out.append(self._check(kind, target, expected, raw, result))
             except Exception as exc:
                 out.append(ValidationResult(kind, target, False, f"断言执行异常: {exc}"))
         return out
+
+    @staticmethod
+    def _absolutize(target: str, workspace: str | Path | None) -> str:
+        """相对路径按工作区解析。
+
+        蒸馏出来的配方，参数默认值往往是 ``output/result_data.gdb`` 这种
+        工作区相对路径；而断言执行器直接交给 arcpy，内核的 CWD 并不是工作区，
+        于是 ``arcpy.Exists('output/...')`` 一律 False，四条断言全红
+        （实测：配方执行成功、断言 0/4）。
+        """
+        if not target or workspace is None:
+            return target
+        p = Path(target)
+        if p.is_absolute():
+            return target
+        return str(Path(workspace) / target)
 
     def _check(
         self,
@@ -250,6 +292,22 @@ class RecipeLibrary:
             needle = str(expected or "")
             ok = bool(needle) and needle in text
             return ValidationResult(kind, target, ok, f"contains({needle})={ok}")
+        if kind == "file_matches":
+            # 文本产物的**格式**断言（``^\d+\.\d{2}$`` 这类）。实测蒸馏时模型会
+            # 把正则写进 file_contains 的值里，子串匹配必然不过；给个明确的口子，
+            # 而不是让“包含”偷偷变成“正则”（那会把真失败放过去）。
+            if not path.exists():
+                return ValidationResult(kind, target, False, "文件不存在")
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception as exc:
+                return ValidationResult(kind, target, False, f"读取失败: {exc}")
+            pattern = str(expected or "")
+            try:
+                ok = bool(pattern) and re.search(pattern, text, re.MULTILINE) is not None
+            except re.error as exc:
+                return ValidationResult(kind, target, False, f"正则无效: {exc}")
+            return ValidationResult(kind, target, ok, f"matches({pattern})={ok}")
         if kind in {"vector_exists", "raster_exists"}:
             # GDB 要素类/栅格不是文件系统路径：用 arcpy.Exists 判断。
             # arcpy 对新写入的数据集有可见性缓存，刚 save 完可能瞬时为 False，
@@ -1364,4 +1422,4 @@ def _resolve(text: str, params: dict[str, Any]) -> str:
         value = params.get(key)
         return "" if value is None else str(value)
 
-    return _SLOT.sub(_sub, text)
+    return _RAW_SLOT.sub(_sub, _SLOT.sub(_sub, text))

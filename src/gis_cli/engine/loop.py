@@ -33,6 +33,10 @@ class LoopConfig:
     max_repairs: int = 4
     #: 单次失败允许的总修复时长（墙钟秒）。修不好就该回主循环换思路。
     max_repair_seconds: float = 600.0
+    #: 成功后要不要把这次运行沉淀成配方：
+    #: ``suggest``（默认，只提示不调模型）/ ``auto``（后台蒸馏）/ ``off``。
+    #: 默认不自动：网关抖动时多一次 LLM 往返会把成功路径拖慢。
+    distill_after_success: str = "suggest"
     exec_timeout: float = 600.0
     tool_protocol: str = "auto"
     context_soft_limit_tokens: int = 120_000
@@ -513,7 +517,13 @@ class AgentLoop:
         # recorder 是可选的（未传时 `run()` 才惰性建；单测也可能不建）。
         # 这里曾直接调 self.recorder.record(...) —— 没有 recorder 时直接崩。
         if self.recorder is not None:
-            self.recorder.record("tool_call", {"tool": action.tool, "args": self._safe_args(action.args)})
+            self.recorder.record(
+                "tool_call",
+                {"tool": action.tool, "args": self._safe_args(action.args, for_trace=True)},
+                # 代码块是 trace 里最有价值的证据（复盘 / 配方蒸馏都靠它），
+                # 不能被默认的 4000 字符上限切掉。
+                max_str=20000,
+            )
         self._emit("tool_call", {"tool": action.tool, "args": self._safe_args(action.args)})
 
         if action.tool == "finish":
@@ -1176,11 +1186,19 @@ class AgentLoop:
             logger.warning("recipes digest failed: %s", exc)
             return "（配方库读取失败）"
 
-    def _safe_args(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _safe_args(self, args: dict[str, Any], *, for_trace: bool = False) -> dict[str, Any]:
+        """记录/推送用的参数副本。
+
+        ``code`` 默认截到 400 字符——那是给**界面预览**用的。但 trace 还要被
+        事后复盘和配方蒸馏读：实测蒸馏时只能看到每个代码块的前 400 字符，
+        模型拼出来的“泛化配方”自然是垃圾。所以写 trace 时不截（由 recorder
+        的 max_str 封顶）。
+        """
+        limit = 20000 if for_trace else 400
         safe = {}
         for key, value in (args or {}).items():
             if key == "code" and isinstance(value, str):
-                safe["code"] = value[:400] + ("..." if len(value) > 400 else "")
+                safe["code"] = value[:limit] + ("..." if len(value) > limit else "")
             else:
                 safe[key] = value
         return safe
