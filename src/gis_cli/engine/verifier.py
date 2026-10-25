@@ -25,12 +25,81 @@ _PATHS = {paths}
 
 _arcpy.env.overwriteOutput = True
 
+#: 图片后缀：Describe() 对 .jpg 也回 RasterDataset，会被当成栅格去读值域
+_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
 
 def _safe(fn, default=None):
     try:
         return fn()
     except Exception:
         return default
+
+
+def _value_counts(name):
+    """分类栅格的逐值像元数（只对少数值栅格做）。
+
+    “修补后不含编码 10”这类需求，光有 min/max 证不了：验收只能回“缺直方图”，
+    模型就去跑一遍 GP 生成 CSV 自证（实测为此多调 4 次 verify_outputs 共 206s）。
+    先问 UNIQUEVALUECOUNT，<=20 才读像素；像元数 >50M 的直接跳过。
+    """
+    import numpy as _np
+
+    unique = _safe(
+        lambda: int(_arcpy.management.GetRasterProperties(name, "UNIQUEVALUECOUNT").getOutput(0))
+    )
+    if unique is None or unique < 1 or unique > 20:
+        return None
+    desc = _safe(lambda: _arcpy.Describe(name))
+    pixels = _safe(lambda: int(desc.height) * int(desc.width), 0) or 0
+    if pixels > 50_000_000:
+        return None
+    arr = _safe(lambda: _arcpy.RasterToNumPyArray(name, nodata_to_value=_np.nan))
+    if arr is None:
+        # 整型栅格不接受 nodata_to_value=NaN（"整型类型不支持 NaN"），退回裸读
+        arr = _safe(lambda: _arcpy.RasterToNumPyArray(name))
+    if arr is None:
+        return None
+    flat = arr.ravel()
+    if _np.issubdtype(flat.dtype, _np.floating):
+        flat = flat[~_np.isnan(flat)]
+    else:
+        nodata = _safe(lambda: float(_arcpy.Describe(name).noDataValue))
+        if nodata is not None:
+            flat = flat[flat != nodata]
+    values, counts = _np.unique(flat, return_counts=True)
+    return [{"value": float(v), "count": int(c)} for v, c in list(zip(values, counts))[:20]]
+
+
+def _workspace_contents(p):
+    """把 GDB 里的东西列出来。
+
+    只回一个 ``kind=Workspace`` 的壳等于什么都没证：模型把 ``output/x.gdb`` 登记成
+    产物时，验收看不见库里的栅格，就一直报“缺少仪器级证据”，逼它把栅格再导成 TIFF
+    自证（实测为此多跑 5 个 execute_code + 4 次验收）。
+    """
+    out = []
+    old = _arcpy.env.workspace
+    try:
+        _arcpy.env.workspace = p
+        for name in (_arcpy.ListFeatureClasses() or [])[:20]:
+            out.append({"name": name, "type": "FeatureClass"})
+        for name in (_arcpy.ListRasters() or [])[:20]:
+            item = {"name": name, "type": "Raster"}
+            item["cell_size"] = _safe(lambda n=name: float(_arcpy.Describe(n).meanCellWidth))
+            item["raster_min"] = _safe(
+                lambda n=name: float(_arcpy.management.GetRasterProperties(n, "MINIMUM").getOutput(0))
+            )
+            item["raster_max"] = _safe(
+                lambda n=name: float(_arcpy.management.GetRasterProperties(n, "MAXIMUM").getOutput(0))
+            )
+            item["value_counts"] = _safe(lambda n=name: _value_counts(n))
+            out.append(item)
+        for name in (_arcpy.ListTables() or [])[:10]:
+            out.append({"name": name, "type": "Table"})
+    finally:
+        _arcpy.env.workspace = old
+    return out
 
 
 records = []
@@ -41,6 +110,11 @@ for _p in _PATHS:
         records.append(rec)
         continue
     rec["size"] = _safe(lambda p=_p: _os.path.getsize(p) if _os.path.isfile(p) else None)
+    if _os.path.splitext(_p)[1].lower() in _IMAGE_EXT:
+        # 图片只报存在/字节数；当成栅格去读值域既慢又没意义
+        rec["kind"] = "Image"
+        records.append(rec)
+        continue
     if _arcpy.Exists(_p):
         desc = _safe(lambda p=_p: _arcpy.Describe(p))
         if desc is not None:
@@ -58,10 +132,13 @@ for _p in _PATHS:
                     lambda p=_p: int(_arcpy.management.GetCount(
                         _arcpy.management.MakeFeatureLayer(p, "lyr_check").getOutput(0))[0]) >= 0
                 )
+            if rec["kind"] == "Workspace":
+                rec["contents"] = _safe(lambda p=_p: _workspace_contents(p), []) or []
             if getattr(desc, "dataType", "") == "RasterDataset":
                 rec["band_count"] = _safe(lambda p=_p: int(_arcpy.Describe(p).bandCount))
                 rec["raster_min"] = _safe(lambda p=_p: float(_arcpy.management.GetRasterProperties(p, "MINIMUM").getOutput(0)))
                 rec["raster_max"] = _safe(lambda p=_p: float(_arcpy.management.GetRasterProperties(p, "MAXIMUM").getOutput(0)))
+                rec["value_counts"] = _safe(lambda p=_p: _value_counts(p))
     records.append(rec)
 
 set_result({"records": records})
@@ -102,7 +179,7 @@ def _shrink_json(value: Any, budget: int, depth: int = 0) -> Any:
 def _artifact_exists(path: str) -> bool:
     """已删除的产物不该再算产物（文件系统或 GDB 语义都试一下）。
 
-    注意：本函数可能跑在**没有 arcpy 的解释器**里（benchmark/CLI 的 venv）。
+    注意：本函数可能跑在**没有 arcpy 的解释器**里（CLI 的 venv）。
     GDB 内的要素类/栅格在文件系统上根本不存在，只有 arcpy 能判——此时
     “判不了”不能当成“不存在”，否则会把合法产物剔除（14 届 4a-1 实测：
     finish 里列的 4 个 kde_* 栅格全被剔除，验收只说“缺失栅格元数据”，
@@ -162,6 +239,15 @@ class Verifier:
         #: 同一批产物在一个 run 里会被验两次（verify_outputs + finish），
         #: 没有缓存就要把每张图看两遍（实测验图开销高达 200s+）。
         self._vision_cache: dict[tuple[str, float], dict[str, Any]] = {}
+        #: 语义验收结论缓存：``材料指纹 -> 结论``。
+        #: ``verify_outputs`` 与 finish 的 ``verification`` 走的是同一个
+        #: ``verify()``，同一批产物 + 同一份 summary 会各跑一次 45~64s 的
+        #: 语义验收（实测组合任务 4 次 verify_outputs 共 206s）。材料没变就复用。
+        self._semantic_cache: dict[str, dict[str, Any]] = {}
+        #: 结构体检缓存：``签名 -> records``。
+        #: 同一批产物一个 run 里会被验好几次（verify_outputs + 多次 finish），
+        #: 每次都要跑一趟内核（实测 25 条 14~25s）。产物没变就别再问一次内核。
+        self._structural_cache: dict[tuple, list[dict[str, Any]]] = {}
 
     # ------------------------------------------------------------- structural
     def structural_check(self, artifacts: list[str]) -> list[dict[str, Any]]:
@@ -169,6 +255,11 @@ class Verifier:
         paths = [str(p) for p in artifacts if str(p).strip()]
         if not paths:
             return []
+        cache_key = self._structural_key(paths)
+        cached = self._structural_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("structural_check 命中缓存（%d 条）", len(cached))
+            return [dict(record) for record in cached]
         results: list[dict[str, Any]] = []
         if self.code_runner is not None:
             code = _VERIFY_CODE.replace("{paths}", json.dumps(paths, ensure_ascii=False))
@@ -194,9 +285,105 @@ class Verifier:
             path = str(record.get("path", ""))
             if Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
                 record["image"] = self._check_image(Path(path))
+        # 读栅格会生成 .aux.xml，把父目录 mtime 改掉：用**读完之后**的签名当键，
+        # 否则下一次永远 miss（实测第一次读完后第二、三次验收还会各花 20s+）。
+        self._structural_cache[self._structural_key(paths)] = [dict(record) for record in results]
         return results
 
-    def _discover_outputs(self, *, limit: int = 50) -> list[str]:
+    def _structural_key(self, paths: list[str]) -> tuple:
+        """产物清单 + 每个路径的 (mtime, size) 签名。
+
+        GDB 内的要素/栅格在文件系统上不存在，退一步用其父目录（``x.gdb``）的 mtime：
+        库内增删条目会改变它。
+        """
+        parts: list[tuple[str, float, int | None]] = []
+        dir_cache: dict[str, tuple[float, int]] = {}
+        for path in paths:
+            target = Path(path)
+            try:
+                stat = target.stat()
+            except OSError:
+                stat = None
+            if stat is not None and not target.is_dir():
+                parts.append((path, round(stat.st_mtime, 3), stat.st_size))
+                continue
+            # 目录形态的产物（``output/x.gdb`` 本身就会被 _discover_outputs 当产物）：
+            # 目录自身的 mtime 不随库内数据文件变化，必须看目录里所有文件。
+            dir_target = target if stat is not None else target.parent
+            folder = str(dir_target).lower()
+            if folder not in dir_cache:
+                dir_cache[folder] = self._dir_signature(dir_target)
+            mtime, size = dir_cache[folder]
+            parts.append((path, mtime, size))
+        return tuple(sorted(parts))
+
+    @staticmethod
+    def _dir_signature(folder: Path) -> tuple[float, int]:
+        """目录内所有文件的 (最大 mtime, 总大小)。
+
+        只看目录自身的 mtime 不够：**原地改库内条目**（追加要素、改属性、重算值）
+        只改数据文件，不改目录时间戳 → 缓存命中，验收拿到的还是旧 feature_count。
+        """
+        newest = 0.0
+        total = 0
+        try:
+            items = list(folder.iterdir())
+        except OSError:
+            return (0.0, 0)
+        for item in items:
+            try:
+                stat = item.stat()
+            except OSError:
+                continue
+            if stat.st_mtime > newest:
+                newest = round(stat.st_mtime, 3)
+            total += stat.st_size
+        return (newest, total)
+
+    @staticmethod
+    def _run_started_at(state: Any) -> float | None:
+        """本次 run 的起始时间戳（只用来过滤“历史产物”）。取不到就不过滤。"""
+        from datetime import datetime
+
+        raw = str(getattr(state, "created_at", "") or "")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() - 1.0
+        except Exception:
+            return None
+
+    def artifact_signature(self, paths: list[str]) -> tuple:
+        """产物指纹（路径 + mtime/size + 库目录内文件），供 loop 判“产物有没有变”。
+
+        只比路径不够：模型原地改同一个文件（或往库里补要素）在纯路径比较下
+        等于“没改”，会让“同一理由重复拒绝”的降级判据误判。
+        """
+        return self._structural_key([str(item) for item in paths if str(item).strip()])
+
+    def _merge_discovered(self, artifacts: list[str], discovered: list[str]) -> list[str]:
+        """把 output/ 下实际存在、但没登记过的产出补进产物清单。
+
+        实测：模型用 ``csv`` 模块写的 ``output/分布中心.csv`` 从未进过 artifacts
+        （工具只从 set_result / 代码里的字面量路径提产物），验收看不到它，就一直
+        报“缺失该 CSV”，模型反复补证也无法自证——这是 4 次 finish 连拒的主因之一。
+
+        已声明库内具体条目时不再补整个 ``.gdb`` 目录：目录只是弱证据，而且会
+        把“库里有哪几个数据集”这个问题又推回给模型。
+        """
+        merged = list(artifacts)
+        have = {str(Path(item).resolve()).lower().replace("\\", "/") for item in merged}
+        for path in discovered:
+            key = str(Path(path).resolve()).lower().replace("\\", "/")
+            if key in have:
+                continue
+            if key.endswith(".gdb") and any(item.startswith(key + "/") for item in have):
+                continue
+            merged.append(path)
+            have.add(key)
+        return merged
+
+    def _discover_outputs(self, *, limit: int = 50, since: float | None = None) -> list[str]:
         """Best-effort discovery of produced files under workspace/output.
 
         扩展名清单与 tools 共用一份（以前两边各写一份，都漏了 Office 格式，
@@ -215,6 +402,17 @@ class Verifier:
             suffix = item.suffix.lower()
             if suffix in _NON_OUTPUT_EXT or name.startswith("~$"):
                 continue  # 中间产物与 Office 临时文件
+            # 过程件（tmp_/idw_/scratch_ 前缀）不是交付物
+            if name.startswith(("tmp_", "temp_", "idw_", "scratch_", "~")):
+                continue
+            # 只收**本次 run** 产出的东西：交互式 workspace/output 从不按 run 清理，
+            # 历史产物并进 artifacts 会让语义验收把“上次交过的”判成“这次有”。
+            if since is not None:
+                try:
+                    if item.stat().st_mtime < since:
+                        continue
+                except OSError:
+                    continue
             if item.is_dir() and name.endswith(".gdb"):
                 found.append(str(item))
             elif item.is_file() and suffix in GIS_OUTPUT_EXT:
@@ -271,6 +469,11 @@ class Verifier:
             # （14 届 4a-1 实测：验收 problems 明明是空的）。
             "spec_contents": self._read_spec_contents(),
         }
+        cache_key = self._semantic_key(payload)
+        cached = self._semantic_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("semantic_check 命中缓存（材料未变）")
+            return dict(cached)
         prompt = (
             "你是 GIS 成果验收专家。请对照需求清单逐条验收下面的产出。\n"
             "只输出一个 JSON 对象，格式：\n"
@@ -298,7 +501,18 @@ class Verifier:
         parsed.setdefault("per_requirement", [])
         parsed.setdefault("missing", [])
         parsed.setdefault("repair_hint", "")
+        self._semantic_cache[cache_key] = dict(parsed)
+        while len(self._semantic_cache) > 8:  # 一个 run 里产物变几次，够用
+            self._semantic_cache.pop(next(iter(self._semantic_cache)))
         return parsed
+
+    @staticmethod
+    def _semantic_key(payload: dict[str, Any]) -> str:
+        """验收材料（需求/产物/摘要/规格）的指纹。材料没变，结论就不会变。"""
+        import hashlib
+
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _read_spec_contents(self, *, limit: int = 6, max_chars: int = 1200) -> list[dict[str, Any]]:
         """读出产出目录下 ``*.spec.json`` 的关键内容，供语义验收核对。
@@ -404,7 +618,11 @@ class Verifier:
         """
         if self.vision_mode == "off" or self.llm_client is None or not paths:
             return {}
-        if not getattr(getattr(self.llm_client, "config", None), "vision", False):
+        config = getattr(self.llm_client, "config", None)
+        can_see = getattr(config, "effective_vision", None)
+        if can_see is None:
+            can_see = bool(getattr(config, "vision", False))
+        if not can_see:
             return {}
         if getattr(self.llm_client, "vision_rejected", False):
             return {}
@@ -504,7 +722,11 @@ class Verifier:
         """
         if self.vision_mode == "off" or self.llm_client is None:
             return {"ok": True, "skipped": True}
-        if not getattr(getattr(self.llm_client, "config", None), "vision", False):
+        config = getattr(self.llm_client, "config", None)
+        can_see = getattr(config, "effective_vision", None)
+        if can_see is None:
+            can_see = bool(getattr(config, "vision", False))
+        if not can_see:
             return {"ok": True, "skipped": True, "reason": "模型未开启识图"}
         try:
             from ..runtime.image_input import as_data_url
@@ -539,13 +761,18 @@ class Verifier:
         artifacts = [path for path in (getattr(state, "artifacts", []) or []) if _artifact_exists(str(path))]
         if state is not None and hasattr(state, "artifacts"):
             state.artifacts = artifacts
+        since = self._run_started_at(state)
         if not artifacts:
             # Outputs exist on disk but were never registered (e.g. code did
             # not set_result the paths) — discover them instead of failing.
-            artifacts = self._discover_outputs()
+            artifacts = self._discover_outputs(since=since)
             if artifacts and state is not None:
                 for path in artifacts:
                     state.add_artifact(path)
+        else:
+            # 登记过一部分也要补：CSV/报告这类由普通 Python IO 写出的文件
+            # 不会被工具提产物，漏了就让验收永远看不到（见 _merge_discovered）。
+            artifacts = self._merge_discovered(artifacts, self._discover_outputs(since=since))
         problems: list[str] = []
         out_root = str((self.workspace / "output").resolve()).lower()
         ws_root = str(self.workspace.resolve()).lower()

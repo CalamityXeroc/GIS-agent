@@ -38,6 +38,9 @@ class LoopConfig:
     #: 默认不自动：网关抖动时多一次 LLM 往返会把成功路径拖慢。
     distill_after_success: str = "suggest"
     exec_timeout: float = 600.0
+    #: system prompt 里最多列多少个技能（每个约 120 字符）。子代理只给少数几个：
+    #: 111 个技能全列是 13k 字符，而子任务只需要其中一两个。
+    skills_max: int = 40
     tool_protocol: str = "auto"
     context_soft_limit_tokens: int = 120_000
     keep_recent_messages: int = 24
@@ -48,6 +51,9 @@ class LoopConfig:
     #: 待压缩的消息至少这么多条才值一次 LLM 往返
     compact_min_messages: int = 8
     max_finish_rejections: int = 3
+    #: 挂在 system prompt 最前面的身份说明。子代理用它声明「你是子代理、
+    #: 内核共享、ask_user 不可用」；主代理留空。
+    role_preamble: str = ""
     verbose: bool = False
     max_diagnosis_turns: int = 3
     escalate_after_failures: int = 2
@@ -85,6 +91,7 @@ class AgentLoop:
         use_error_memory: bool = True,
         use_project_log: bool = True,
         catalog_prewarmer: Any = None,
+        should_stop: Callable[[], bool] | None = None,
     ):
         self.workspace = Path(workspace)
         self.llm = llm_client
@@ -102,6 +109,10 @@ class AgentLoop:
         self.use_project_log = use_project_log
         #: 数据目录后台预热器（启动不扫时用；``start_prewarm`` 与首轮 LLM 重叠）
         self.catalog_prewarmer = catalog_prewarmer
+        #: 外部停止条件（子代理用它继承父的「用户中断」）。每轮开头检查一次。
+        self.should_stop = should_stop
+        #: ``run()`` 的持久化开关：子代理只留 trace，不写 runs/ 与项目日志。
+        self._persist_state = True
         self._hints_seen: list[str] = []
         self._design_notes: list[str] = []
         self._hygiene_warned: set[str] = set()
@@ -120,6 +131,8 @@ class AgentLoop:
         self.state: TaskState | None = None
         self._messages: list[dict[str, Any]] = []
         self._finish_rejections = 0
+        #: 上一次被拒时的（缺失/问题签名, 产物清单）：两者都没变就说明“再拒也没用”
+        self._last_rejection: tuple[tuple, tuple] | None = None
         #: 已发过的收尾提醒阈值（0.8 / 0.95），避免每轮重复提醒
         self._finish_nudges: set[float] = set()
         self._diagnosis_streak = 0
@@ -134,8 +147,16 @@ class AgentLoop:
         *,
         requirements: list[Requirement | dict[str, Any]] | None = None,
         doc_paths: list[str] | None = None,
+        reset_runner: bool = True,
+        persist_state: bool = True,
     ) -> TaskState:
-        """Run one task to completion (or to an ``ask_user`` pause)."""
+        """Run one task to completion (or to an ``ask_user`` pause).
+
+        ``reset_runner=False``：不清内核。子代理必须传 False —— 父代理在内核里
+        攒的变量（df、投影对象）是它下一步要用的，清了就等于把父的活重做。
+        ``persist_state=False``：不写 ``.gis_agent/runs/`` 与项目日志。子运行若
+        落成正式 run，蒸馏与断点续跑会把它当成「最近一次成功运行」挑走。
+        """
         run_id = new_run_id()
         self.recorder = self.recorder or RunRecorder(run_id, self.workspace / ".gis_agent" / "traces")
         self.state = TaskState(run_id=run_id, goal=goal, workspace=str(self.workspace))
@@ -164,10 +185,11 @@ class AgentLoop:
                     {"count": len(extracted), "requirements": self.state.requirements_digest()},
                 )
 
+        self._persist_state = persist_state
         self._emit("run_start", {"goal": goal, "run_id": run_id})
         self.recorder.record("run_start", {"goal": goal, "workspace": str(self.workspace)})
 
-        if self.code_runner is not None:
+        if reset_runner and self.code_runner is not None:
             try:
                 self.code_runner.reset()
             except Exception as exc:
@@ -188,6 +210,13 @@ class AgentLoop:
         )
 
         while self.state.turn < self.config.max_turns and self.state.status == "running":
+            if self.should_stop is not None and self.should_stop():
+                # 父任务被中断（用户 Ctrl-C）：子代理不能继续跑——它会一直占着
+                # 内核与 LLM 配额，而父已经在等下一次输入了。
+                self.state.status = "stopped"
+                self.state.error = "父任务已停止"
+                self._emit("stop_requested", {"reason": self.state.error})
+                break
             if self._deadline is not None and time.monotonic() > self._deadline:
                 self.state.status = "deadline_exceeded"
                 self.state.error = (
@@ -692,15 +721,34 @@ class AgentLoop:
         )
         self._emit("tool_result", {"tool": "finish", "ok": observation.ok, "summary": observation.summary})
         verdict = self.verifier.verify(self.state) if self.verifier is not None else {"pass": True, "summary": "未配置验证器"}
+        # 同一套证据被同一个理由连拒多次时，再拒一次也不可能变好（实测：组合任务
+        # 连拒 4 次，每次 40~80s 的语义验收，产物一个字节都没变，最后 status=failed）。
+        # 产物清单没变且拒绝理由完全一致 → 降级通过，但把原因写进 summary。
+        signature = self._rejection_signature(verdict)
+        artifacts_now = self._artifact_signature()
+        repeated = bool(
+            not verdict.get("pass")
+            # 签名全空 = 没拿到任何具体理由，那就不存在“同一理由”，不许降级
+            and any(signature)
+            and self._last_rejection is not None
+            and self._last_rejection == (signature, artifacts_now)
+        )
+        self._last_rejection = (signature, artifacts_now) if not verdict.get("pass") else None
+        if repeated:
+            verdict = dict(verdict)
+            verdict["pass"] = True
+            verdict["degraded"] = True
+            verdict["summary"] = "验收降级通过（同一理由重复拒绝且产物未变）：" + str(verdict.get("summary", ""))
         self.recorder.record("verification", verdict)
         self._emit("verification", verdict)
 
         if verdict.get("pass"):
             self.state.status = "completed"
+            prefix = "验收降级通过" if verdict.get("degraded") else "验收通过"
             return (
                 Observation(
                     ok=True,
-                    summary=f"验收通过。{observation.summary}",
+                    summary=f"{prefix}。{observation.summary}",
                     data=verdict,
                 ),
                 True,
@@ -721,6 +769,40 @@ class AgentLoop:
         return feedback, False
 
     # ------------------------------------------------------------ requirements
+    @staticmethod
+    def _rejection_signature(verdict: dict[str, Any]) -> tuple:
+        """拒绝理由的指纹（缺失项 + 结构问题 + 逐条需求 FAIL/PARTIAL）。
+
+        只比 missing/problems 是不够的：验收的通过判据里 ``failed_reqs`` 单独一条
+        就能否决，而它只出现在 ``semantic.per_requirement`` 里。漏了它，
+        “第一次缺直方图、第二次坐标系不对”会是同一个签名 → 误判成同一问题而降级通过。
+        """
+        missing = tuple(sorted(str(item) for item in (verdict.get("missing") or [])))
+        problems = tuple(sorted(str(item) for item in (verdict.get("problems") or [])))
+        semantic = verdict.get("semantic") or {}
+        failed = tuple(
+            sorted(
+                f"{item.get('id')}:{str(item.get('status', '')).upper()}"
+                for item in (semantic.get("per_requirement") or [])
+                if str(item.get("status", "")).upper() in {"FAIL", "PARTIAL"}
+            )
+        )
+        return (missing, problems, failed)
+
+    def _artifact_signature(self) -> tuple:
+        """产物指纹：路径 + mtime/size（库内条目看库目录里所有文件）。
+
+        只比路径时，“原地改了同一个文件”等于“没改”，降级判据会误判。
+        """
+        paths = [str(item) for item in (getattr(self.state, "artifacts", []) or [])]
+        signer = getattr(self.verifier, "artifact_signature", None)
+        if callable(signer):
+            try:
+                return tuple(signer(paths))
+            except Exception:  # pragma: no cover - 指纹失败就退回路径比较
+                pass
+        return tuple(sorted(paths))
+
     def _extract_requirements(self, goal: str, doc_paths: list[str] | None) -> list[Requirement]:
         """Best-effort requirement extraction from the goal and documents."""
         try:
@@ -780,7 +862,8 @@ class AgentLoop:
     def _system_prompt(self) -> str:
         output_dir = self.workspace / "output"
         return (
-            "你是一个资深 GIS 智能体，目标是把用户的自然语言需求转化为可复现的 GIS 方法论并完成实际操作。\n\n"
+            (self.config.role_preamble + "\n" if self.config.role_preamble else "")
+            + "你是一个资深 GIS 智能体，目标是把用户的自然语言需求转化为可复现的 GIS 方法论并完成实际操作。\n\n"
             "## 工作环境\n"
             f"- 工作区: {self.workspace}\n"
             f"- 输入数据目录: {self.workspace / 'input'}\n"
@@ -799,7 +882,8 @@ class AgentLoop:
             "6. **自检交付**：交付前调用 verify_outputs；确认产物满足需求后再调用 finish。\n"
             "7. **少问多做**：能从数据目录/文档推断的信息不要问用户；只在关键信息确实缺失时用 ask_user。\n"
             "8. **中文输出**：与用户交流、任务清单、方法论说明全部用中文。\n\n"
-            "## 关于工具边界（省时间用）\n"
+            + self._delegate_hint()
+            + "## 关于工具边界（省时间用）\n"
             "- 每个工具的 description 就是它的全部参数说明。**不要去读 gis_cli 的源码**来猜开关——"
             "实测有任务为此白跑了 200+ 次调用。工具里没写的参数，就是没有。\n"
             "- 需要“看效果再调”时：catalog_query 看数据字段/坐标系；view_image 看自己出的图；"
@@ -831,6 +915,27 @@ class AgentLoop:
             + self._skills_section()
         )
 
+    def _delegate_hint(self) -> str:
+        """有 delegate 工具时，明说什么时候该拆（否则模型一律自己干）。
+
+        实测：glm-5.3-flash 在 28 轮的组合任务（两个互不依赖的交付）上也不会
+        主动派子代理——工具描述写在 schema 里，模型仍然倾向自己做完。
+        代价是长任务每轮重发整段历史（平方级）。所以这里给一条带门槛的指引：
+        只有「≥2 块、每块预计 >10 轮」才拆。子代理自己看不到 delegate，
+        这段对它不出现，免得它去找一个不存在的工具。
+        """
+        try:
+            if self.registry.get("delegate") is None:
+                return ""
+        except Exception:
+            return ""
+        return (
+            "9. **能拆才拆**：任务里有 **≥2 块互不依赖、每块预计 >10 轮** 的交付时"
+            "（例如“4 张密度图”和“迁移图”），先 update_tasklist 拆开，再对其中一块调用 "
+            "delegate（task 必须自包含：数据路径/字段/坐标系/输出位置/验收标准）。"
+            "3~5 步的小活儿不要派——每个子代理的固定开销约 1.5 万 token，拆小了更贵。\n\n"
+        )
+
     def _skills_section(self) -> str:
         """技能的 system prompt 段（只放名字+描述；真用时才读全文）。
 
@@ -846,7 +951,8 @@ class AgentLoop:
             if not found:
                 return ""
             logger.info("已发现 %s 个技能", len(found))
-            return "\n\n" + skills_prompt_section(found)
+            limit = int(getattr(getattr(self, "config", None), "skills_max", 40) or 40)
+            return "\n\n" + skills_prompt_section(found, max_skills=max(1, limit))
         except Exception as exc:  # pragma: no cover - 技能扫描失败不影响主流程
             logger.warning("技能发现失败: %s", exc)
             return ""
@@ -993,7 +1099,13 @@ class AgentLoop:
     def _vision_enabled(self) -> bool:
         """配置里开了识图、且客户端声明支持时才附图。"""
         try:
-            if not bool(getattr(self.llm.config, "vision", False)):
+            config = getattr(self.llm, "config", None)
+            # ``effective_vision`` 会把 vision_mode=auto 按模型名折算；
+            # 老配置没有这个属性时退回原来的布尔开关。
+            enabled = getattr(config, "effective_vision", None)
+            if enabled is None:
+                enabled = bool(getattr(config, "vision", False))
+            if not enabled:
                 return False
             # 上游拒过图（如 400 "replace the image"）就不要再附：每轮白碰一次
             # 400 不仅浪费时间，还会把当轮对话搞脏。
@@ -1241,19 +1353,20 @@ class AgentLoop:
     def _finalize(self) -> None:
         if self.state is None:
             return
-        try:
-            self.state.save(str(self.workspace / ".gis_agent" / "runs" / f"{self.state.run_id}.json"))
-        except Exception as exc:
-            logger.warning("failed to save run state: %s", exc)
-        # 消息历史也要落盘，否则“续跑”无从恢复上下文（state 里只有清单/产物）。
-        # 单独一个文件：messages 可能上百 KB，别把状态文件撞成日志。
-        try:
-            import json as _json
+        if self._persist_state:
+            try:
+                self.state.save(str(self.workspace / ".gis_agent" / "runs" / f"{self.state.run_id}.json"))
+            except Exception as exc:
+                logger.warning("failed to save run state: %s", exc)
+            # 消息历史也要落盘，否则“续跑”无从恢复上下文（state 里只有清单/产物）。
+            # 单独一个文件：messages 可能上百 KB，别把状态文件撞成日志。
+            try:
+                import json as _json
 
-            target = self.workspace / ".gis_agent" / "runs" / f"{self.state.run_id}.messages.json"
-            target.write_text(_json.dumps(self._messages, ensure_ascii=False), encoding="utf-8")
-        except Exception as exc:
-            logger.warning("failed to save messages: %s", exc)
+                target = self.workspace / ".gis_agent" / "runs" / f"{self.state.run_id}.messages.json"
+                target.write_text(_json.dumps(self._messages, ensure_ascii=False), encoding="utf-8")
+            except Exception as exc:
+                logger.warning("failed to save messages: %s", exc)
         if self.recorder is not None:
             self.recorder.finish(
                 self.state.status,
@@ -1266,7 +1379,7 @@ class AgentLoop:
                     "usage": self._usage_summary(),
                 },
             )
-        if self.use_project_log:
+        if self.use_project_log and self._persist_state:
             self._write_project_log()
         self._emit("run_end", self.state.to_dict())
 

@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+#: 真假 GDB 的判定（execute_code 预检与配方参数检查共用同一份）
+from ..runtime.gdb import GDB_MARKERS as _GDB_MARKERS, is_real_gdb as _is_real_gdb
+
 from .schema import WORKSPACE_SENTINEL, Recipe
 
 logger = logging.getLogger(__name__)
@@ -20,6 +23,43 @@ _SLOT = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 #: 蒸馏出的断言常用它（如 ``value: "@@group_field@@ | 记录数"``），只认
 #: ``{{param}}`` 会让断言把 ``@@group_field@@`` 当成字面量而永远不过。
 _RAW_SLOT = re.compile(r"@@\s*([A-Za-z_][A-Za-z0-9_]*)\s*@@")
+
+
+def _describe_code(path: str) -> str:
+    """Describe 快照的代码：内核会话与 Pro 子进程复核共用一份（口径必须一致）。"""
+    return (
+        "import arcpy, json\n"
+        f"_p = {path!r}\n"
+        "_rec = {'exists': arcpy.Exists(_p)}\n"
+        "if arcpy.Exists(_p):\n"
+        "    _d = arcpy.Describe(_p)\n"
+        "    _sr = getattr(_d, 'spatialReference', None)\n"
+        "    _rec['wkid'] = getattr(_sr, 'factoryCode', None) if _sr else None\n"
+        "    _rec['crs_name'] = getattr(_sr, 'name', '') if _sr else ''\n"
+        "    _rec['geom_type'] = getattr(_d, 'shapeType', '') or ''\n"
+        "    try:\n"
+        "        _rec['feature_count'] = int(arcpy.management.GetCount(_p)[0])\n"
+        "    except Exception:\n"
+        "        _rec['feature_count'] = None\n"
+        "    try:\n"
+        "        _rec['fields'] = [f.name for f in arcpy.ListFields(_p)]\n"
+        "    except Exception:\n"
+        "        _rec['fields'] = []\n"
+        "    try:\n"
+        "        _e = _d.extent\n"
+        "        _rec['extent'] = {'xmin': _e.XMin, 'ymin': _e.YMin, 'xmax': _e.XMax, 'ymax': _e.YMax}\n"
+        "    except Exception:\n"
+        "        _rec['extent'] = None\n"
+        "    try:\n"
+        "        _rec['raster_min'] = float(arcpy.management.GetRasterProperties(_p, 'MINIMUM').getOutput(0))\n"
+        "    except Exception:\n"
+        "        _rec['raster_min'] = None\n"
+        "    try:\n"
+        "        _rec['raster_max'] = float(arcpy.management.GetRasterProperties(_p, 'MAXIMUM').getOutput(0))\n"
+        "    except Exception:\n"
+        "        _rec['raster_max'] = None\n"
+        "set_result(_rec)\n"
+    )
 
 
 @dataclass
@@ -161,6 +201,23 @@ class RecipeLibrary:
         for key, spec in (recipe.params or {}).items():
             if key not in params and isinstance(spec.default, str) and spec.default == WORKSPACE_SENTINEL:
                 params[key] = workspace_str
+        # 假 GDB 防线：`os.makedirs("x.gdb")` 建出来的是普通目录，而
+        # `arcpy.Exists()` 对它**返回 True** —— 模型随后跳过 CreateFileGDB
+        # 直接往里写，arcpy 读库内表时把二进制当文本解码，报
+        # UnicodeDecodeError（4a 实测连挂两次，还被误判成“编码猜错”）。
+        fake_gdb = _fake_gdb_param(recipe, params, workspace_str)
+        if fake_gdb:
+            return Observation(
+                ok=False,
+                summary=(
+                    f"参数 {fake_gdb} 指向一个假的 .gdb（普通目录）：{params.get(fake_gdb)}。"
+                    "arcpy.Exists() 对它也返回 True，后续写入会被当成 GDB 读二进制表，"
+                    "表现为 UnicodeDecodeError。"
+                ),
+                error={"type": "FakeGdbPath", "message": str(params.get(fake_gdb))},
+                hint="先删掉这个目录；要建库用 arcpy.management.CreateFileGDB(父目录, '名字.gdb')；"
+                "只是放 TIFF/表格就换成普通目录（如 output/）。",
+            )
         try:
             code = recipe.render(params)
         except Exception as exc:
@@ -237,17 +294,23 @@ class RecipeLibrary:
         self, recipe: Recipe, params: dict[str, Any], result: Any, *, workspace: str | Path | None = None
     ) -> list[ValidationResult]:
         out: list[ValidationResult] = []
+        # 断言里可以用 {{output}} 引用配方自己返回的产物：多期配方的文件名带期号
+        # （kde_1982-1986.tif …），静态 path 写不出来，只能取返回值里的第一个产物。
+        slots = dict(params or {})
+        payload = getattr(result, "result", None)
+        if isinstance(payload, dict) and payload.get("output"):
+            slots.setdefault("output", payload["output"])
         for raw in recipe.validation:
             # 解析断言里所有字符串槽位（path/target/value 以及 field/reference 等自定义键）
             raw = {
-                k: (_resolve(v, params) if isinstance(v, str) else v)
+                k: (_resolve(v, slots) if isinstance(v, str) else v)
                 for k, v in raw.items()
             }
             kind = str(raw.get("type", "") or "")
             target = str(raw.get("path", "") or raw.get("target", ""))
             expected = raw.get("value")
             if isinstance(expected, list):
-                expected = [_resolve(str(v), params) for v in expected]
+                expected = [_resolve(str(v), slots) for v in expected]
             target = self._absolutize(target, workspace)
             try:
                 out.append(self._check(kind, target, expected, raw, result))
@@ -575,7 +638,7 @@ class RecipeLibrary:
             spec = raw.get("spec") or self._load_sibling_spec(target, raw.get("image"))
             image_path = str(raw.get("image") or "")
             min_font_pt = float(raw.get("min_font_pt") or 7.0)
-            # 版面体检要读 .aprx，只有 arcpy 能读。benchmark/CLI 跑在 venv 里
+            # 版面体检要读 .aprx，只有 arcpy 能读。CLI 跑在 venv 里
             # （没装 arcpy），直接 import 会报 “No module named 'arcpy'” 而判失败——
             # 实测 14 届 4a-1 就报 “版面体检失败: ...”。有 code_runner（内核/子进程）
             # 时改让它在 ArcGIS 解释器里体检，把结果回传。
@@ -1148,6 +1211,12 @@ class RecipeLibrary:
 
         刚被看门狗杀掉内核时，GDB 可能仍被残留进程占着，``arcpy.Exists`` 会瞬时为 False，
         因此这里重试一次再下结论，避免把已有数据判成"不存在"。
+
+        重试后仍是**否定**结论时，再换一路真 arcpy（ArcGIS Pro python 子进程）复核一次：
+        内核会话里 arcpy 的状态可能已经脏了——实测同一份 ``real_a.gdb`` 在同一
+        会话里 ``arcpy.Exists`` 恒 False，而全新的 Pro 进程里 exists=True、count=3。
+        这类假阴性会被读成"产出缺失"，逼 agent 重建数据、也污染基准结论。
+        子进程实测 14~25s，所以在肯定分支上不付这笔开销。
         """
         record: dict[str, Any] | None = None
         for index in range(max(1, attempts)):
@@ -1156,45 +1225,44 @@ class RecipeLibrary:
                 return record
             if index + 1 < max(1, attempts):
                 time.sleep(1.0)
-        return record
+        verified = self._describe_via_pro(path)
+        if verified is None:
+            return record
+        if verified.get("exists") and not (record or {}).get("exists"):
+            logger.warning(
+                "Describe 假阴性已纠正：%s —— 会话内判不存在，Pro 子进程判存在（count=%s）",
+                path,
+                verified.get("feature_count"),
+            )
+        return verified
+
+    @staticmethod
+    def _describe_via_pro(path: str) -> dict[str, Any] | None:
+        """用 ArcGIS Pro python 子进程复核 Describe（同会话说"不存在"时才走这里）。
+
+        不用 venv 的进程内 arcpy：那条路在基准/CLI 的 venv 里根本没有 arcpy，
+        必然返回 None，等于没复核（早期的 ``_describe_in_process`` 兜底就是这样失效的）。
+        """
+        from ..arcpy_bridge import run_arcpy_code
+
+        if not Path(path).parent.exists():
+            # 父目录都没有，数据不可能存在 —— 脏会话也只能这么判，不必付这趟 14~25s 子进程。
+            return None
+        try:
+            outcome = run_arcpy_code(_describe_code(path), timeout_seconds=120)
+        except Exception as exc:  # 复核自己失败不该改变原结论
+            logger.warning("Describe 子进程复核异常（%s）: %s", path, exc)
+            return None
+        if outcome.status != "success" or not isinstance(outcome.data, dict):
+            message = (outcome.error or {}).get("message") or outcome.stderr or ""
+            logger.warning("Describe 子进程复核无结果（%s）: %s", path, str(message)[:200])
+            return None
+        return outcome.data
 
     def _describe_once(self, path: str) -> dict[str, Any] | None:
         if self.code_runner is None:
             return self._describe_in_process(path)
-        code = (
-            "import arcpy, json\n"
-            f"_p = {path!r}\n"
-            "_rec = {'exists': arcpy.Exists(_p)}\n"
-            "if arcpy.Exists(_p):\n"
-            "    _d = arcpy.Describe(_p)\n"
-            "    _sr = getattr(_d, 'spatialReference', None)\n"
-            "    _rec['wkid'] = getattr(_sr, 'factoryCode', None) if _sr else None\n"
-            "    _rec['crs_name'] = getattr(_sr, 'name', '') if _sr else ''\n"
-            "    _rec['geom_type'] = getattr(_d, 'shapeType', '') or ''\n"
-            "    try:\n"
-            "        _rec['feature_count'] = int(arcpy.management.GetCount(_p)[0])\n"
-            "    except Exception:\n"
-            "        _rec['feature_count'] = None\n"
-            "    try:\n"
-            "        _rec['fields'] = [f.name for f in arcpy.ListFields(_p)]\n"
-            "    except Exception:\n"
-            "        _rec['fields'] = []\n"
-            "    try:\n"
-            "        _e = _d.extent\n"
-            "        _rec['extent'] = {'xmin': _e.XMin, 'ymin': _e.YMin, 'xmax': _e.XMax, 'ymax': _e.YMax}\n"
-            "    except Exception:\n"
-            "        _rec['extent'] = None\n"
-            "    try:\n"
-            "        _rec['raster_min'] = float(arcpy.management.GetRasterProperties(_p, 'MINIMUM').getOutput(0))\n"
-            "    except Exception:\n"
-            "        _rec['raster_min'] = None\n"
-            "    try:\n"
-            "        _rec['raster_max'] = float(arcpy.management.GetRasterProperties(_p, 'MAXIMUM').getOutput(0))\n"
-            "    except Exception:\n"
-            "        _rec['raster_max'] = None\n"
-            "set_result(_rec)\n"
-        )
-        outcome = self.code_runner.run(code, timeout=180)
+        outcome = self.code_runner.run(_describe_code(path), timeout=180)
         if outcome.ok and isinstance(outcome.result, dict):
             return outcome.result
         # 内核忙/卡死时不能就此判定“不存在”（那样会误报产出缺失，把 agent 逼去重建数据）。
@@ -1413,6 +1481,29 @@ def _parse_color_expectations(text: str) -> dict[str, str]:
             key, value = chunk.split("=", 1)
             out[key.strip()] = value.strip()
     return out
+
+
+
+
+def _fake_gdb_param(recipe: Recipe, params: dict[str, Any], workspace: str | Path | None) -> str | None:
+    """找出“指向假 .gdb”的参数（os.makedirs 建出来的普通目录）。
+
+    只拦**已经存在但不是真 GDB** 的目录：真 GDB 有 `gdb`/`timestamps`/
+    `a00000001.gdbtable`。不存在的不拦（配方可能正要用 CreateFileGDB 建）。
+    """
+    for name, spec in (recipe.params or {}).items():
+        value = params.get(name, spec.default)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip().rstrip("\\/")
+        if not text.lower().endswith(".gdb"):
+            continue
+        path = Path(text)
+        if not path.is_absolute() and workspace is not None:
+            path = Path(workspace) / path
+        if path.is_dir() and not _is_real_gdb(path):
+            return name
+    return None
 
 
 def _resolve(text: str, params: dict[str, Any]) -> str:

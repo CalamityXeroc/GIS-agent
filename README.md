@@ -11,16 +11,18 @@
 src/gis_cli/
 ├── engine/              # 新引擎：循环 / 工具 / 验收 / 自修复
 │   ├── loop.py          # 有界循环：观察 → 决策 → 执行，含预算与守卫
-│   ├── tools.py         # 16 个工具（含 web_search / create_map / run_recipe）
+│   ├── tools.py         # 17 个工具（含 web_search / create_map / run_recipe / delegate）
 │   ├── llm_client.py    # 模型客户端：流式 / 熔断 / 降级 / 用量统计
 │   ├── tool_codec.py    # 工具协议自适应（原生 tool calling ↔ JSON）
 │   ├── repair.py        # 代码自修复（traceback 回喂）
 │   ├── verifier.py      # 验收：结构断言 + 语义核对 + 图面识图
 │   ├── project_log.py   # 项目日志（相关性 + 最近 混合检索）
+│   ├── subagent.py      # 子代理（delegate）：子任务进独立上下文，只回结论
 │   └── runner.py        # 装配入口 build_engine()
 ├── runtime/             # ArcPy 运行时
 │   ├── kernel.py        # 持久 Jupyter 内核（一次 import，跨步状态）
 │   ├── code_runner.py   # 内核优先 + 子进程兜底 + 覆盖前自动备份
+│   ├── gdb.py           # GDB 路径识别：真库 / 假 .gdb（普通目录）
 │   ├── error_memory.py  # 常见故障 → 修复建议
 │   └── hygiene.py       # 交付卫生（过程文件 / 重做残留）
 ├── cartography/         # 制图：facts → design → render → qc
@@ -58,6 +60,8 @@ src/gis_cli/
 - **可验证**：验收不通过就不算完成（`completed` ≠ 过验收）
 - **可归因**：每次 run 都有 trace，`scripts/latency_report.py --cost` 看耗时与用量
 - **可恢复**：`ask_user` 暂停后 `resume()` 续跑（含 trace 续写）
+- **写前守卫**：往假 `.gdb`（普通目录）里写要素类会先被拦下，而不是等 arcpy 报 `UnicodeDecodeError`
+- **可隔离**：自包含子任务可交给子代理（`delegate`），不污染父会话上下文（默认关）
 
 ## 当前已实现能力
 
@@ -65,15 +69,29 @@ src/gis_cli/
 - 有界观察-决策-执行循环，原生 tool calling（不支持的模型自动降级 JSON 协议）
 - 代码失败自动修复：traceback + 数据目录 + 配方提示一起回喂
 - 持久 Jupyter 内核：一次 import arcpy，跨步保留变量（每步 ~60ms）
+- 内核 CWD 跟着工作区走，**无论成败**都回到启动目录（相对路径不会落到上一次的目录）
+- 看门狗真的能杀掉卡死的内核（`shutdown_kernel(now=True)` + 清掉 manager，不再留僵尸进程攥文件句柄）
 - ZMQ 执行串行化（修过并发写坏 wire 协议的崩溃）
 - 覆盖写入前自动备份（GDB 成员走 `CopyFeatures` 导出，普通文件走 `shutil`）
 - 模型熔断：连续失败进冷却、冷却时长指数升级；`fallback_models` 自动切换
+- 子代理（`delegate`）：把预计 >10 轮、能独立验收的子任务放进独立对话，只回结构化结论，
+  父会话峰值 prompt 降 34%；默认关，详见 `docs/subagent.md`
+
+**写前守卫**
+- 往假 `.gdb`（`os.makedirs` 留下的普通目录）写要素类：**执行前**就拦下并给修复 hint，
+  不再等 arcpy 把库里的二进制表当文本读、抛 `UnicodeDecodeError`
+- 判据是 AST 意图识别（不是字符串匹配）：`CreateFeatureclass` / `CopyFeatures` / `CopyRaster`
+  等写入目标指向假库才拦；删库 / 清库（`rmtree` / `Delete_management`）放行，
+  外壳包一层（`abspath` / `str(Path)` / `Path()/`）也认得
+- 拦的是「往库里写」，不是「库里被提到」：删库内子路径、注释里写库名都不算清理意图
 
 **验收**
 - 结构断言：存在性 / 坐标系 WKID / 字段 / 要素数 / 栅格非常量 / 图片非空白
 - 语义核对：对照需求清单逐条判定（带证据，可 PARTIAL）
 - 图面识图：批量调用识图模型看地图（中文是否方框、图例是否被裁、图面是否空白）
 - 交付卫生：过程文件（`.pkl/.tmp/.bak`）、重做残留（同前缀重复件）、体积比
+- **否定结论有复核**：内核说「不存在」时，再拿 ArcGIS Pro 子进程问一次，以它为准
+  （内核会话脏了会集体报假阴性，实测一次能误杀 4 条 GDB 断言）
 
 **制图**
 - rules-based 设计引擎：采集数据事实 → 出 LayoutSpec → 渲染 → 版面体检
@@ -244,7 +262,7 @@ Agent 支持通过 LLM API 理解任意自然语言，不局限于 GIS 关键词
 
 ```bash
 # 复制配置示例
-cp config/llm_config.example.json config/llm_config.json
+cp config/llm_config.json.example config/llm_config.json
 
 # 编辑配置，填入真实 API Key
 ```
@@ -281,6 +299,31 @@ cp config/llm_config.example.json config/llm_config.json
 - `reasoning_effort_by_task` 可按任务类型覆盖（不配则全部走全局值）。
   实测交互轮用 `low`：首字 5.11s→2.37s、总耗时 8.72s→5.80s，输出质量相当；
   规划/验收类任务刻意保留 `medium`。
+
+### 子代理（delegate）与识图开关
+
+```json
+{
+  "engine": {
+    "subagent_enabled": false,
+    "subagent_max_per_run": 3,
+    "subagent_max_turns": 30,
+    "subagent_timeout_seconds": 900,
+    "subagent_exec_timeout_seconds": 300,
+    "subagent_result_max_chars": 4000,
+    "vision_mode": "auto"
+  }
+}
+```
+
+- **子代理默认关**。它买的是上下文与轮次预算，不是 token：每个子代理要重发一份 system prompt，
+  3~5 步的小活儿反而更贵。关掉时 `delegate` 直接从工具表剔除（而不是留着报错）。
+  什么时候值得拆、实测 A/B 数据与已知限制见 [`docs/subagent.md`](docs/subagent.md)。
+- `subagent_exec_timeout_seconds` 要**比父的 `kernel_exec_timeout_seconds` 短一档**：
+  父子共享同一个内核，子代理的 GP 卡死会连带惩罚父会话。
+- `vision_mode`：`auto`（按模型名判断，默认）/ `on` / `off`。上游对看不见图的模型通常
+  **不报错**，只会白烧 token 并让模型分心解释「我看不到图」，所以默认按模型能力自动关。
+  图面质检开关是另一个键 `vision_check`（`warn` / `block` / `off`）。
 
 ## 直接出图 / 自动化 ArcGIS Pro（推荐）
 
@@ -322,7 +365,7 @@ cp config/llm_config.example.json config/llm_config.json
 
 ## 测试覆盖
 
-约 **460 个测试**（全量约 60s；CI 只跑不依赖 ArcGIS 的部分，约 35s）。
+约 **530 个测试**（全量约 60s；CI 只跑不依赖 ArcGIS 的部分，约 40s）。
 
 ```powershell
 # 全量
@@ -338,6 +381,8 @@ pytest tests/test_engine_*.py
 主要覆盖：
 - 引擎循环 / 工具协议自适应 / 代码自修复 / 验收器
 - 内核往返、ZMQ 串行化、覆盖前备份、GDB 存在性判断
+- 假 `.gdb` 写前守卫（AST 意图识别：该拦的拦、清理该放行的放行）
+- 子代理 delegate（隔离上下文、超时、结果截断、崩了不抛异常）
 - 制图设计引擎（可用假 facts 跑，不需要 ArcGIS）
 - 数据目录增量扫描 / 项目日志相关性检索
 - 终端界面（含无 ANSI 终端的回归）
@@ -355,13 +400,19 @@ pytest tests/test_engine_*.py
 - SKILL.md 技能渐进披露
 - 流式输出、模型熔断、前缀缓存命中率统计
 - 内核往返合并、只读工具并发、覆盖写入自动备份
+- 配方沉淀闭环（`distill`：候选 → 静态门禁 → 回放验证 → 采纳）
+- 假 `.gdb` 写前守卫（AST 意图识别，写入前拦 + 给修复 hint）
+- 子代理 `delegate`（上下文隔离，默认关）
+- 内核 CWD 归位（无论成败）+ 看门狗真能硬杀卡死内核
+- Describe 否定结论用 Pro 子进程复核（脏会话不再误判）
 - 交互式终端（排队合并、会话续聊、导出）
 - CI（只跑无 ArcGIS 部分）
 
 ### 剩余候选 📋
-- 从历史成功 run 中自动沉淀配方（经验固化闭环）
 - 工具输出按类型瘦身（现在统一按字符数截断）
 - 需求抽取合流进首轮对话（省一次往返；以稳定性为前提）
 - 跨 run 的失败归因统计（哪类失败最常见）
 - 断点续跑（从 `runs/*.json` 恢复，而不只是 `ask_user` 暂停）
 - 更多配方覆盖（空间统计、网络分析）
+- 验收侧两条校验路径（栅格取值 / 版面体检）也补上 Pro 子进程复核与可诊断的失败原因
+- 自动修复环加累计时长预算（目前单个 cell 可连续修到 15 分钟）

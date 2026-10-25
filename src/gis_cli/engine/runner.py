@@ -225,7 +225,7 @@ def build_engine(
 ) -> EngineBundle:
     """Assemble the engine and optionally warm the catalog.
 
-    ``engine_overrides`` 允许调用方（如 benchmark runner）按任务覆盖 engine 段配置，
+    ``engine_overrides`` 允许调用方（如跨模型基准）按任务覆盖 engine 段配置，
     例如用任务 YAML 的 ``timeout_seconds`` 覆盖 ``run_deadline_seconds``。
     """
     from ..datacatalog.scanner import refresh_catalog as do_refresh
@@ -279,6 +279,11 @@ def build_engine(
         or None,
     )
     registry = build_default_registry()
+    # 子代理默认关：它是真金白银的 token，不该偷偷开。关掉时把工具从表里
+    # **剔除**而不是留着报错——留着模型会白花一轮去调一个不可用的工具。
+    subagent_enabled = bool(engine_cfg.get("subagent_enabled", False))
+    if not subagent_enabled:
+        registry = registry.subset([name for name in registry.names() if name != "delegate"])
 
     context = EngineContext(
         workspace=ws,
@@ -333,6 +338,22 @@ def build_engine(
         catalog_prewarmer=prewarmer,
     )
     context.state = loop.state  # updated per run in loop.run
+
+    if subagent_enabled:
+        from .subagent import SubAgentRunner
+
+        subagent_runner = SubAgentRunner(
+            loop,
+            max_per_run=int(engine_cfg.get("subagent_max_per_run", 3)),
+            max_turns=int(engine_cfg.get("subagent_max_turns", 30)),
+            timeout_seconds=float(engine_cfg.get("subagent_timeout_seconds", 900)),
+            exec_timeout_seconds=float(engine_cfg.get("subagent_exec_timeout_seconds", 300)),
+            result_max_chars=int(engine_cfg.get("subagent_result_max_chars", 4000)),
+        )
+        # 工具 handler 在调用时才取工厂，所以可以在 loop 建好后再挂
+        context.extra["subagent_factory"] = subagent_runner.run
+        context.extra["subagent_runner"] = subagent_runner
+        logger.info("subagent enabled (max_per_run=%s, max_turns=%s)", subagent_runner.max_per_run, subagent_runner.max_turns)
 
     bundle = EngineBundle(
         loop=loop,

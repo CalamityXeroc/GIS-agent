@@ -128,3 +128,29 @@ def test_validation_list_values_resolve_slots():
     expected = [_resolve(str(v), resolved) for v in raw.get("value", [])]
     assert expected == ["NB_MEAN", "ABOVE_MEAN"], expected
     assert "{" not in target and "{" not in "".join(expected)
+
+
+def test_assertion_can_reference_recipe_output(tmp_path):
+    """断言可以用 ``{{output}}`` 引用配方自己返回的产物。
+
+    多期配方（kernel_density）每期文件名带期号（kde_1982-1986.tif），静态 path
+    写不出来。以前写死 ``{{out_dir}}/kde_all.tif``，多期跑法下那个文件根本不存在
+    → 每次都是「执行成功，断言 0/1 通过」，把模型引去修一个本来没坏的产物。
+    """
+    from types import SimpleNamespace
+
+    from gis_cli.recipes.store import RecipeLibrary
+
+    recipe = Recipe(
+        id="kernel_density",
+        name="核密度",
+        code_template="set_result({'output': 'x'})",
+        validation=[{"type": "file_exists", "path": "{{output}}"}],
+    )
+    lib = RecipeLibrary()
+    result = SimpleNamespace(result={"output": "output/kde_1982-1986.tif", "outputs": []})
+    out = lib._run_assertions(recipe, {}, result, workspace=tmp_path)
+
+    assert out[0].target == str(tmp_path / "output" / "kde_1982-1986.tif"), out[0].target
+    # 返回值里没有 output 时不该炸（槽位解成空串，按原有语义走）
+    lib._run_assertions(recipe, {}, SimpleNamespace(result=None), workspace=tmp_path)

@@ -8,13 +8,14 @@ data awareness, methodology reuse, and verification.
 
 from __future__ import annotations
 
+import ast
 import json
 import time
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .state import Observation
 
@@ -41,6 +42,201 @@ GIS_OUTPUT_EXT = {
 
 #: 归档/中间产物后缀：即使名字里带上面某个扩展名也不算产出
 _NON_OUTPUT_EXT = {".tmp", ".bak", ".log", ".pkl", ".pyc"}
+
+#: 代码里的 .gdb 路径（绝对或相对）。只用来做“是不是假库”的预检。
+_GDB_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\"'\n]*?\.gdb|[\w][\w./\\-]*\.gdb", re.IGNORECASE)
+
+#: 清理类调用：出现在这些调用里的路径是“要删/要挪”的，不是“要往里写”。
+_CLEANUP_FUNCS = {
+    "rmtree", "remove", "rmdir", "unlink", "rename", "replace",
+    "Delete", "Delete_management", "DeleteFeatures", "TruncateTable",
+}
+
+
+def _call_name(func: Any) -> str:
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
+
+
+def _gdb_tokens(text: str) -> list[str]:
+    return [match.group(0).rstrip("/").rstrip(chr(92)) for match in _GDB_PATH_RE.finditer(text or "")]
+
+
+def _gdb_basenames(node: Any) -> set[str]:
+    """AST 节点里出现的 .gdb 名字（只算字符串常量，注释天然不算）。"""
+    names: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            for token in _gdb_tokens(sub.value):
+                names.add(Path(token).name.lower())
+    return names
+
+
+#: ``os.path.join(...)`` 里拼不出的片段（外部变量/参数）：只用于"路径末尾是不是 .gdb"
+#: 的判断，不代表真路径。
+_UNKNOWN_PART = "{*}"
+
+
+def _join_path_parts(parts: list[set[str]]) -> set[str]:
+    """``os.path.join(...)`` 各片段拼成路径候选；拼不出的片段按通配占位（上限 16 条）。"""
+    out = {""}
+    for alternatives in parts:
+        out = {
+            f"{prev}/{alt}".lstrip("/")
+            for prev in out
+            for alt in (alternatives or {_UNKNOWN_PART})
+        }
+        if len(out) > 16:
+            break
+    return out
+
+
+#: 只剥外壳、不改变路径指向的调用（``os.path.abspath(p)`` / ``str(Path(...))`` / ``Path(...)``）。
+_PATH_UNWRAP_FUNCS = {"abspath", "normpath", "realpath", "str", "Path", "fspath"}
+
+
+def _path_literals(node: Any, known: dict[str, set[str]]) -> set[str]:
+    """常量 / 已解析变量 / ``os.path.join`` / ``Path / "x"`` 能拼出的路径候选；拼不出返回空集。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value}
+    if isinstance(node, ast.Name):
+        return set(known.get(node.id, ()))
+    if isinstance(node, (ast.List, ast.Tuple)):
+        found: set[str] = set()
+        for item in node.elts:
+            found |= _path_literals(item, known)
+        return found
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _path_literals(node.left, known), _path_literals(node.right, known)
+        if left and right:
+            return {a + b for a in left for b in right}
+        return set()
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left, right = _path_literals(node.left, known), _path_literals(node.right, known)
+        if left and right:
+            return {a.rstrip("/\\") + "/" + b for a in left for b in right}
+        return set()
+    if (
+        isinstance(node, ast.Call)
+        and len(node.args) == 1
+        and _call_name(node.func) in _PATH_UNWRAP_FUNCS
+    ):
+        # 外壳只改写法、不改指向：``p = os.path.abspath("output/x.gdb")`` 解析成
+        # ``output/x.gdb``，这样 ``rmtree(p)`` 认得出是清理；而 ``abspath("...x.gdb/probe_pts")``
+        # 解析成库内子路径，不会被当成「删的就是库本身」（曾因宽判据漏放行）。
+        return _path_literals(node.args[0], known)
+    if isinstance(node, ast.Call) and _call_name(node.func) == "join":
+        parts = [_path_literals(arg, known) for arg in node.args]
+        return _join_path_parts(parts) if parts else set()
+    return set()
+
+
+def _assigned_names(node: Any) -> list[str]:
+    """赋值语句的简单目标名（``a = ...`` / ``a: T = ...``）。"""
+    if isinstance(node, ast.Assign):
+        return [t.id for t in node.targets if isinstance(t, ast.Name)]
+    if isinstance(node, ast.AnnAssign) and node.value is not None and isinstance(node.target, ast.Name):
+        return [node.target.id]
+    return []
+
+
+def _cleanup_gdb_names(tree: Any) -> set[str]:
+    """被 rmtree / os.remove / os.rename / Delete_management 之类“点名”的 .gdb 名字。
+
+    跟着变量（含循环变量）解析出**要删的那个路径**，只有删的就是 ``x.gdb`` 本身才算清理意图：
+
+    - ``gdb = os.path.join(out, "x.gdb"); shutil.rmtree(gdb)`` —— 是清理（放行）；
+    - ``for name in ["fake_a.gdb"]: p = os.path.join("output", name); shutil.rmtree(p)``
+      —— 也是清理。以前只跟赋值、不跟循环变量，解析不出名字，agent 照 guard 自己的
+      hint 写的整改代码被误拦，又得靠 ``arcpy.Delete_management`` 绕过去（实测 trace 107→109）；
+    - ``Delete("output/fake_a.gdb/probe_pts")`` 后面跟着写 —— **不是**清理：删的是库里的
+      要素类，不是假库本身。以前按 basename 豁免，整个 cell 里对该假库的写入一起被
+      放行，假库里真写出了 shapefile（探针实测）。
+    """
+    known: dict[str, set[str]] = {}
+    for _ in range(4):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+                known.setdefault(node.target.id, set()).update(_path_literals(node.iter, known))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                found = _path_literals(node.value, known)
+                for name in _assigned_names(node):
+                    known.setdefault(name, set()).update(found)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _call_name(node.func) not in _CLEANUP_FUNCS:
+            continue
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            paths = _path_literals(arg, known)
+            if not paths:
+                # 路径被外壳包住（``os.path.abspath(...)`` / ``str(...)`` 之类）解析不出：
+                # 退回旧的宽判据——宁可放行一次清理，也不要把照 hint 清理的代码拦下。
+                names |= _gdb_basenames(arg)
+                continue
+            for path in paths:
+                target = path.rstrip("\\/")
+                if target.lower().endswith(".gdb"):
+                    names.add(Path(target).name.lower())
+    return names
+
+
+def _fake_gdb_in_code(code: str, workspace: Path | None) -> str | None:
+    """代码里出现的、**已存在但是假库**的 .gdb 路径（第一个）。
+
+    不存在的不拦（可能正要 CreateFileGDB 建）；真库也不拦；清理意图放行。
+    只扫字符串常量（``ast``），注释里提到 ``x.gdb`` 不算要写它。
+    """
+    from ..runtime.gdb import is_fake_gdb
+
+    text = code or ""
+    try:
+        tree: Any = ast.parse(text)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        cleanup = _cleanup_gdb_names(tree)
+        blobs = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+    else:
+        # 语法错（还没写完的半截代码）时退回整段扫描：宁可多拦一次，也不放过
+        cleanup = set()
+        blobs = [text]
+
+    for blob in blobs:
+        for raw in _gdb_tokens(blob):
+            path = Path(raw)
+            if path.name.lower() in cleanup:
+                continue
+            if path.is_absolute():
+                if is_fake_gdb(path):
+                    return str(path)
+                continue
+            if workspace is None:
+                continue
+            candidate = Path(workspace) / raw
+            if candidate.exists():
+                # 解析得出来就以它为准：别再去按名字 glob，否则工作区别处有个同名假库
+                # 就会把指向真库的代码拦下来，报的还是一个不相干的目录。
+                if is_fake_gdb(candidate):
+                    return str(candidate)
+                continue
+            if len(path.parts) > 1:
+                # 带目录的相对路径且不存在：可能正要建，不要按名字猜
+                continue
+            # 裸名字（``os.path.join(out_dir, "landcover.gdb")`` 这种最常见）：
+            # 在工作区里按名字找同名目录。只扫两层，不做全树 walk。
+            name = path.name.lower()
+            for pattern in ("*.gdb", "output/*.gdb", "*/*.gdb"):
+                for found in Path(workspace).glob(pattern):
+                    if found.name.lower() == name and is_fake_gdb(found):
+                        return str(found)
+    return None
 
 
 #: 自写代码标志 → 可闭环该操作的已验证配方（代码反复失败时的引导）
@@ -128,7 +324,7 @@ def extract_outputs(value: Any, workspace: str | Path, *, limit: int = 30) -> li
 
     实测两个坑：
     1. 模型习惯把读过的输入也写进 set_result，若当成产物登记，验收会报
-       “产出不在 output 目录内”而判定失败（benchmark 的 4b 就栽在这）。
+       “产出不在 output 目录内”而判定失败（实测就栽在这）。
     2. 模型会把工具回参里的**外部**工程当成产物，例如
        ``E:\\ArcGISPro3.6\\...\\Blank.aprx``、用户 Documents 下的 MyProject.aprx。
        这些是 ArcGIS 自带的模板工程，一登记就让验收永远报“产出不在 output 目录内”，
@@ -250,6 +446,19 @@ class EngineToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.openai_schema() for tool in self._tools.values()]
 
+    def subset(self, names: Iterable[str]) -> "EngineToolRegistry":
+        """只保留指定工具的新表（共享同一个 ``EngineTool`` 对象，不复制）。
+
+        用途：给子代理一份**减配**的工具表——去掉 ``delegate``（递归）与
+        ``ask_user``（子代理不能停下来等人，会把父一起拖死）。
+        """
+        keep = {str(name) for name in names}
+        out = EngineToolRegistry()
+        for name, tool in self._tools.items():
+            if name in keep:
+                out.register(tool)
+        return out
+
     def execute(self, name: str, args: dict[str, Any], ctx: "EngineContext") -> Observation:
         tool = self._tools.get(name)
         if tool is None:
@@ -285,6 +494,9 @@ class EngineContext:
     backup_dir: Path = field(default_factory=lambda: Path("workspace/.gis_agent/backups"))
     auto_backup: bool = True
     exec_timeout: float = 600.0
+    #: 单次执行的**硬上限**（0 = 不额外限制）。子代理用它兜住模型自己传的
+    #: ``timeout_seconds``——实测模型会直接写 900，把子代理那档 300s 顶掉。
+    max_exec_timeout: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -396,8 +608,30 @@ def build_default_registry() -> EngineToolRegistry:
         code = str(args.get("code", "") or "")
         if not code.strip():
             return Observation(ok=False, summary="代码为空", error={"type": "EmptyCode"})
+        fake_gdb = _fake_gdb_in_code(code, Path(ctx.workspace))
+        if fake_gdb:
+            # 实测（14 届组合任务）：arcpy.Exists() 对 os.makedirs 建出来的普通目录也回 True，
+            # 模型自己写的“库存在吗”判断放行后往假库里写栅格 → UnicodeDecodeError，
+            # 一次 382s、一次 833s，两次都耗在同一处。在跑之前 0.1s 拦下。
+            return Observation(
+                ok=False,
+                summary=(
+                    f"代码要往 {fake_gdb} 里写东西，但它是个假 .gdb（普通目录）："
+                    "arcpy.Exists() 对它也回 True，随后 arcpy 会把库里的二进制表当文本读，"
+                    "抛 UnicodeDecodeError。"
+                ),
+                error={"type": "FakeGdbPath", "message": fake_gdb},
+                hint=(
+                    "先 shutil.rmtree(该目录) 清掉；要建库用 arcpy.management.CreateFileGDB(父目录, '名字.gdb')，"
+                    "不要用 os.makedirs 建 .gdb。往库里写栅格若仍报 UnicodeDecodeError，"
+                    "改成先 NumPyArrayToRaster(...).save(临时 .tif)，再 arcpy.management.CopyRaster 拷进库。"
+                ),
+            )
         description = str(args.get("description", "") or "")
         timeout = float(args.get("timeout_seconds", ctx.exec_timeout) or ctx.exec_timeout)
+        cap = float(getattr(ctx, "max_exec_timeout", 0.0) or 0.0)
+        if cap > 0:
+            timeout = min(timeout, cap)
 
         # 备份判据分两类（详见 backup_targets）：
         # 1) 显式删除（Delete/rmtree/remove）；
@@ -741,7 +975,7 @@ def build_default_registry() -> EngineToolRegistry:
             "set_result(_r)\n"
         )
         # 制图引擎自己要在 ArcGIS 解释器（内核）里跑，所以固定走 code_runner；
-        # 不要在这里直接用 create_map（benchmark/CLI 的 venv 没有 arcpy）。
+        # 不要在这里直接用 create_map（CLI 的 venv 没有 arcpy）。
         result = ctx.code_runner.run(code, timeout=float(args.get("timeout_seconds") or 900), workspace=str(ctx.workspace))
         if not result.ok:
             detail = ""
@@ -1051,6 +1285,78 @@ def build_default_registry() -> EngineToolRegistry:
                 "required": ["question"],
             },
             handler=_ask_user,
+        )
+    )
+
+    # --------------------------------------------------------------- delegate
+    def _delegate(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        factory = ctx.extra.get("subagent_factory")
+        if factory is None:
+            return Observation(
+                ok=False,
+                summary="子代理不可用（engine.subagent_enabled 未开）",
+                error={"type": "NoSubagent", "message": "delegate is disabled in engine config"},
+            )
+        task = str(args.get("task", "") or "").strip()
+        if len(task) < 10:
+            return Observation(
+                ok=False,
+                summary="task 太短：子代理看不到你的对话，任务必须自包含",
+                error={"type": "BadParams", "message": "task must be self-contained"},
+                hint="把数据路径、字段名、坐标系、输出位置、验收标准写进 task。",
+            )
+        try:
+            result = factory(
+                task=task,
+                acceptance=str(args.get("acceptance", "") or ""),
+                max_turns=args.get("max_turns"),
+                tools=args.get("tools"),
+            )
+        except Exception as exc:  # 子代理自身的问题不能把父的 run 拖挂
+            logger.exception("delegate crashed")
+            return Observation(
+                ok=False,
+                summary=f"子代理启动失败: {exc}",
+                error={"type": type(exc).__name__, "message": str(exc)},
+                hint="可以自己接着做，或把任务改小后再派一次。",
+            )
+        return result.to_observation()
+
+    registry.register(
+        EngineTool(
+            name="delegate",
+            description=(
+                "把一个**自包含**的子任务交给子代理：它有自己的对话上下文，只把结论交回。\n"
+                "适合：预计 >10 轮、有独立产物的整块工作（例：“用 kernel_density 出 4 张共用图例的密度图”）。\n"
+                "不适合：3~5 步就能做完的活儿（每个子代理的固定开销约 1.5 万 token，拆小了更贵）、"
+                "需要你边看结果边决策的连续调试。\n"
+                "task 必须自包含：子代理看不到你的对话历史，数据路径、字段名、坐标系、输出位置、"
+                "验收标准都要写清楚。子代理没有 ask_user，也不能再派子代理。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "子任务描述（自包含：数据路径/字段/坐标系/输出位置/要交什么）",
+                    },
+                    "acceptance": {
+                        "type": "string",
+                        "description": "这段的验收标准（写进子代理的需求清单，例如“4 个 kde 栅格 + 4 张 jpg”）",
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "description": "子代理最多几轮，默认 30（夹在 5~60）",
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：只给子代理这些工具（如纯调研只给 catalog_query/read_file）",
+                    },
+                },
+                "required": ["task"],
+            },
+            handler=_delegate,
         )
     )
 

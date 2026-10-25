@@ -56,6 +56,11 @@ code_template: |
   points = {{points}}
   where = str({{where}} or "").strip()
   out_dir = {{out_dir}}
+  # 本配方输出 TIFF：out_dir 必须是普通目录。传成 xxx.gdb 时 os.makedirs
+  # 会建出一个假 GDB（arcpy.Exists 对它仍返回 True），后续写入读二进制表
+  # 报 UnicodeDecodeError（实测 4a 连挂两次）。
+  if str(out_dir).strip().lower().rstrip("\\/").endswith(".gdb"):
+      raise ValueError(f"out_dir 应该是放 TIFF 的普通目录，不是 GDB：{out_dir}。请改成 output/ 这类目录。")
   period_field = str({{period_field}} or "YEAR").strip()
   periods_spec = str({{periods}} or "").strip()
   area_km2 = float({{neighborhood_area_km2}} or 100)
@@ -93,6 +98,11 @@ code_template: |
   work = tempfile.mkdtemp(prefix="kde_")
   gdb = os.path.join(work, "kde.gdb")
   arcpy.management.CreateFileGDB(work, "kde.gdb")
+  # KernelDensity 会把中间栅格写进 env.workspace（默认是任务工作区根目录），
+  # 留下一堆 KernelD_pts_1981.tif。实测模型把它们当成产物去归档，交出错误的
+  # 密度值（max=193.97 顶掉断言）。中间件一律落在临时目录里。
+  arcpy.env.workspace = work
+  arcpy.env.scratchWorkspace = work
   stats = []
   rasters = []
   for tag, clause in periods:
@@ -151,8 +161,12 @@ code_template: |
   })
   print(f"核密度完成：{len(rasters)} 期，半径 {radius:.0f} m，分级建议 {bounds}")
 validation:
+  # 多期配方每期的文件名带期号（kde_1982-1986.tif），静态 path 写不出来：
+  # 用 {{output}} 引用返回值里的第一个产物。以前写死 kde_all.tif，多期跑法下
+  # 那个文件根本不存在 → 每次都是“执行成功，断言 0/1 通过”，把模型引去修一个
+  # 本来没坏的产物（实测 19:12 那次为此多烧了 600s 内核超时）。
   - type: raster_not_constant
-    path: "{{out_dir}}/kde_all.tif"
+    path: "{{output}}"
 pitfalls:
   - >-
     半径来自**面积**：√(面积/π)。100 km² → 约 5642 m。

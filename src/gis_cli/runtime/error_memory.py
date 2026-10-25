@@ -144,10 +144,14 @@ _RULES: list[tuple[str, list[str], str, str]] = [
     (
         "gbk-decode",
         [r"UnicodeDecodeError", r"codec can't decode byte"],
-        "读文件时编码猜错（中文数据常见 GBK/GB18030）",
-        "国内竞赛数据（气象站表、统计表）多为 GBK。不要默认 utf-8："
+        "解码失败：文本编码猜错，或路径指向假的 .gdb",
+        "① 读文本文件：国内数据（气象站表、统计表）多为 GBK，不要默认 utf-8——"
         "`open(p, encoding='gbk')`，不行再 `gb18030`（超集，能兜住生僻字）；"
-        "拿不准就先 `open(p,'rb').read(200)` 看一眼再决定。",
+        "拿不准就先 `open(p,'rb').read(200)` 看一眼再决定。"
+        "② **不是文本文件的情况**：路径指向一个假的 .gdb（`os.makedirs` 建的普通目录，"
+        "`arcpy.Exists` 对它也返回 True），arcpy 往里写时把库内二进制表当文本解码。"
+        "先看报错涉及的路径有没有 .gdb——有就删掉该目录，用 `CreateFileGDB` 建真库，"
+        "或者换成普通目录（放 TIFF/表格）。",
     ),
     (
         "csv-header-in-data",

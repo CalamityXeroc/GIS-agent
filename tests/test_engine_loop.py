@@ -75,17 +75,52 @@ def test_loop_completes_after_finish(tmp_path: Path):
     assert state.final_summary == "完成"
 
 
-def test_loop_rejects_failed_verification_then_completes(tmp_path: Path):
+def test_loop_degrades_when_same_rejection_repeats(tmp_path: Path):
+    """同一套证据被同一理由连拒两次 → 降级通过（而不是空转到 failed）。
+
+    实测：组合任务连拒 4 次，每次 40~80s 语义验收，产物一个字节没变，
+    最后 status=failed 而 20 条基准断言全过。再拒一次也不可能变好。
+    """
     loop, llm = _make_loop(
         tmp_path,
         [
             _tc("finish", {"summary": "第一次"}),
             _tc("finish", {"summary": "第二次"}),
         ],
-        verdict={"pass": False, "summary": "缺文件", "repair_hint": "补文件"},
+        verdict={"pass": False, "summary": "缺文件", "repair_hint": "补文件", "missing": ["output/a.csv"]},
     )
     state = loop.run("测试任务")
-    # Stub verifier always fails -> loop hits rejection cap and stops as failed
+
+    assert state.status == "completed"
+    assert state.error == ""
+    verdicts = [
+        json.loads(line)["payload"]
+        for line in (tmp_path / "traces" / "run_unit.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("event") == "verification"
+    ]
+    assert verdicts[-1].get("degraded") is True
+    assert "降级通过" in verdicts[-1].get("summary", "")
+
+
+def test_loop_still_fails_when_evidence_keeps_changing(tmp_path: Path):
+    """产物每次都在变就不能降级：那是“还在修”，不是“修不动了”。"""
+
+    class ChangingVerifier:
+        def __init__(self):
+            self.n = 0
+
+        def verify(self, state):
+            self.n += 1
+            state.artifacts = [f"output/a{self.n}.tif"]
+            return {"pass": False, "summary": "缺文件", "missing": ["output/a.csv"]}
+
+    loop, _ = _make_loop(
+        tmp_path,
+        [_tc("finish", {"summary": f"第{i}次"}) for i in range(1, 6)],
+    )
+    loop.verifier = ChangingVerifier()
+    state = loop.run("测试任务")
+
     assert state.status == "failed"
     assert "验收" in state.error
 
@@ -343,3 +378,60 @@ def test_resume_extends_turn_budget_when_exhausted(tmp_path: Path):
     assert loop.config.max_turns > 60, loop.config.max_turns
     assert state.turn > 60, f"续跑没真正推进：turn={state.turn}"
     assert state.status == "completed", state.status
+
+
+def test_vision_follows_model_capability(tmp_path: Path):
+    """看不见图的模型不该附图（上游不报错，只会白烧 token + 把模型带偏）。"""
+    from types import SimpleNamespace
+
+    from gis_cli.engine.llm_client import EngineLLMConfig
+
+    loop, _ = _make_loop(tmp_path, [])
+
+    loop.llm = SimpleNamespace(config=EngineLLMConfig(model="glm-5.3-flash"))
+    assert loop._vision_enabled() is False
+
+    loop.llm = SimpleNamespace(config=EngineLLMConfig(model="gpt-4o"))
+    assert loop._vision_enabled() is True
+
+    loop.llm = SimpleNamespace(config=EngineLLMConfig(model="glm-5.3-flash", vision_mode="on"))
+    assert loop._vision_enabled() is True
+
+
+def test_degrade_requires_same_requirement_failures(tmp_path: Path):
+    """两次拒绝失败的是**不同需求**，不是“同一理由”，不许降级（实测踩过）。"""
+    verdicts = [
+        {"pass": False, "summary": "缺直方图", "missing": [],
+         "semantic": {"per_requirement": [{"id": "R1", "status": "FAIL"}]}},
+        {"pass": False, "summary": "坐标系不对", "missing": [],
+         "semantic": {"per_requirement": [{"id": "R7", "status": "FAIL"}]}},
+        {"pass": False, "summary": "坐标系不对", "missing": [],
+         "semantic": {"per_requirement": [{"id": "R7", "status": "FAIL"}]}},
+    ]
+
+    class SeqVerifier:
+        def __init__(self):
+            self.i = 0
+
+        def verify(self, state):
+            v = verdicts[min(self.i, len(verdicts) - 1)]
+            self.i += 1
+            return v
+
+    loop, _ = _make_loop(tmp_path, [_tc("finish", {"summary": f"第{i}"}) for i in range(1, 6)])
+    loop.verifier = SeqVerifier()
+    state = loop.run("测试任务")
+
+    # 第 3 次与第 2 次同签名 → 降级通过（而不是一路拒到 failed）
+    assert state.status == "completed"
+
+
+def test_degrade_refuses_when_signature_is_empty(tmp_path: Path):
+    """拒绝理由完全为空时不许降级：没拿到具体理由，就谈不上“同一理由”。"""
+    loop, _ = _make_loop(
+        tmp_path,
+        [_tc("finish", {"summary": f"第{i}"}) for i in range(1, 6)],
+        verdict={"pass": False, "summary": "验收未通过"},
+    )
+    state = loop.run("测试任务")
+    assert state.status == "failed"

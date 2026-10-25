@@ -399,3 +399,21 @@ def test_layout_math_is_consistent():
     assert math.isclose(neat["w"], page["width_mm"] - 2 * neat["x"], abs_tol=1e-6)
     assert spec["title"]["height_pt"] > 0
     assert spec["map_frame"]["h"] > 0
+
+
+def test_publish_creates_missing_output_directory(tmp_path):
+    """目标目录不存在时必须自己建，不能当成“文件被 ArcGIS Pro 占用”。
+
+    实测组合任务：模型把图写到 ``output/成果图/`` 而该目录还不存在，
+    ``copy2`` 抛 FileNotFoundError（WinError 3），被 ``_publish`` 重试 4 次后
+    报成「该文件可能正在 ArcGIS Pro 中打开」——连续 4 次 create_map 全失败，
+    最后模型自己 os.makedirs 才出图。
+    """
+    from gis_cli.cartography import _publish
+
+    source = tmp_path / "src.jpg"
+    source.write_bytes(b"jpg")
+    target = tmp_path / "output" / "成果图" / "密度_1982_1986.jpg"
+
+    assert _publish(str(source), str(target)) == str(target)
+    assert target.read_bytes() == b"jpg"

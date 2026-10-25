@@ -94,6 +94,11 @@ def _split_result(stdout: str) -> tuple[Any, str]:
 
 _PRELUDE = f'''
 import builtins as _bi
+import os as _os
+# 内核进程的启动目录：只在这里捕获一次（_cwd_launch 是常量，不会漂移）。
+# 以前每次 execute 都 getcwd()，上一次异常把 cwd 留在工作区里，
+# 恢复目标就永久挪一格，再也回不到启动目录（实测）。
+_cwd_launch = _os.getcwd()
 {_RESULT_VAR} = None
 
 def set_result(value):
@@ -110,6 +115,23 @@ try:
 except Exception:
     pass
 '''
+
+
+def _cwd_prefix_statements(safe_workspace: str) -> str:
+    """execute 前缀里的 CWD 语句（先回启动目录，再进本次工作区）。
+
+    execute 和测试共用这一份：测试用 exec 真跑同一段语句，
+    而不是只断言“字符串在不在”。
+    """
+    return (
+        "_os.chdir(_cwd_launch)\n"
+        f"_os.chdir(r'{safe_workspace}')\n"
+    )
+
+
+def _chdir_back_stmt() -> str:
+    """cwd 归位语句（用户代码抛异常时 cell 会中断，execute 在错误路径补一趟）。"""
+    return "_os.chdir(_cwd_launch)\n"
 
 
 class KernelError(RuntimeError):
@@ -374,14 +396,49 @@ class ArcpyKernel:
         except Exception as exc:
             logger.warning("kernel interrupt failed: %s", exc)
 
+    def _hard_kill(self, km: Any) -> None:
+        """真正杀掉内核进程。
+
+        ``jupyter_client`` 的 ``KernelManager`` **没有** ``kill()``（只有
+        ``shutdown_kernel(now=True)`` 和私有的 ``_kill_kernel()``）。以前这里直接
+        ``km.kill()``，每次抛 AttributeError 又被吞掉——看门狗其实从没杀掉过进程：
+        卡在 GP 调用里的内核一直活着占着文件句柄（实测：600s 卡死之后，下一次
+        执行直接吃 PermissionError，因为旧内核还攥着那个 .tif）。
+        """
+        try:
+            km.shutdown_kernel(now=True)
+            return
+        except Exception as exc:
+            logger.debug("shutdown_kernel(now=True) failed: %s", exc)
+        kill = getattr(km, "_kill_kernel", None)
+        if callable(kill):
+            try:
+                kill()
+                return
+            except Exception as exc:
+                logger.debug("_kill_kernel failed: %s", exc)
+        kill = getattr(getattr(km, "provisioner", None), "kill", None)
+        if callable(kill):
+            try:
+                kill()
+                return
+            except Exception as exc:
+                logger.warning("kernel hard kill failed: %s", exc)
+
     def _destroy_kernel(self) -> None:
         """Hard-stop the kernel process (used when soft interrupt fails)."""
         km = self._km
         if km is not None:
-            try:
-                km.kill()
-            except Exception as exc:
-                logger.warning("kernel hard kill failed: %s", exc)
+            self._hard_kill(km)
+        try:
+            if self._kc is not None:
+                self._kc.stop_channels()
+        except Exception:
+            pass
+        # 必须把句柄清掉：只置 _started=False 时，下一次 start() 会 new 一个
+        # KernelManager，旧进程和旧通道就成了没人收的僵尸。
+        self._km = None
+        self._kc = None
         self._started = False
         logger.warning("kernel process destroyed (wedged); will restart on next use")
 
@@ -406,8 +463,12 @@ class ArcpyKernel:
         ws = workspace or self.workspace
         prefix = ""
         if ws:
-            safe = ws.replace("\\", "\\\\").replace("'", "\\'")
-            prefix = (
+            safe = ws.replace(chr(92), chr(92) * 2).replace(chr(39), chr(92) + chr(39))
+            # 先回启动目录（_cwd_launch 是 prelude 里捕获的常量，不会漂移），
+            # 再进本次工作区。用户代码抛异常会让 cell 中断，cwd 可能留在
+            # 上一个工作区，所以下一次 execute 仍从 _cwd_launch 起步。
+            prefix = "import os as _os\n" + _cwd_prefix_statements(safe)
+            prefix += (
                 "import arcpy\n"
                 f"arcpy.env.workspace = r'{safe}'\n"
                 "arcpy.env.overwriteOutput = True\n"
@@ -429,6 +490,14 @@ class ArcpyKernel:
             combined = prefix + _RESULT_HEAD + code + _RESULT_TAIL
             outcome = self._execute_raw(combined, timeout=timeout)
             outcome.duration_ms = int((time.time() - started) * 1000)
+            if ws and not outcome.ok:
+                # 用户代码抛异常会让整个 cell 中断，cwd 可能停在工作区里。
+                # 错误路径补一趟轻量归位（成功路径不需要：prefix 每次都先回
+                # _cwd_launch 再进工作区，本来就是自愈的）。
+                try:
+                    self._execute_raw("import os as _os\n" + _chdir_back_stmt(), timeout=30)
+                except Exception as exc:  # pragma: no cover - 归位失败不掩盖原始错误
+                    logger.warning("cwd 归位失败: %s", exc)
             if outcome.ok:
                 result, stdout = _split_result(outcome.stdout or "")
                 outcome.stdout = stdout
@@ -467,7 +536,7 @@ class ArcpyKernel:
                     "watchdog: wedged kernel after %ss, hard-killing process", hard_timeout
                 )
                 try:
-                    km.kill()
+                    self._hard_kill(km)
                 except Exception as exc:  # pragma: no cover - best effort
                     logger.warning("watchdog kill failed: %s", exc)
                 self._started = False

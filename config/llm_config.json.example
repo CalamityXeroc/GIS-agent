@@ -45,5 +45,19 @@
       "api_base": "http://localhost:11434",
       "models": ["llama2", "qwen"]
     }
+  },
+
+  "engine": {
+    "subagent_enabled": false,
+    "subagent_max_per_run": 3,
+    "subagent_max_turns": 30,
+    "subagent_timeout_seconds": 900,
+    "subagent_exec_timeout_seconds": 300,
+    "subagent_result_max_chars": 4000,
+    "_comment_subagent": "子代理（delegate）：把自包含子任务放进独立对话，只回结构化结论。默认关——每个子代理多一份 system prompt（约 1.5~2 万 token/轮），拆 3 步的小活儿反而更贵。见 docs/subagent.md。",
+    "vision_mode": "auto",
+    "_comment_vision": "识图：auto（按模型名判断，默认，看不见图就不附图）/ on（强制附）/ off（强制不附）。上游对看不见图的模型通常不报错（实测 glm-5.3-flash 静默收下图片），只会白烧 token 并让模型分心解释“我看不到图”。图面质检开关是另一个键 vision_check（warn|block|off）。",
+    "reasoning_effort": "",
+    "_comment_reasoning_effort": "思考档位（minimal/low/medium/high/xhigh/max），部分推理模型不传就没有思考内容。留空则不传该字段；换到不认此参数的网关时必须留空。"
   }
 }

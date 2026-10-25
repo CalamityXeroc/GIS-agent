@@ -159,6 +159,10 @@ def _publish(source: str, target: str) -> str:
         return target
     if os.path.abspath(source) == os.path.abspath(target):
         return target
+    # 目标目录不存在时 copy2 抛 FileNotFoundError（WinError 3），以前会被当成
+    # “文件被 ArcGIS Pro 占用”重试 4 次再报错（实测组合任务：连续 4 次
+    # create_map 全失败，最后模型自己 os.makedirs 才出图）。出图前先把目录建好。
+    Path(target).parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
     for attempt in range(4):
         try:

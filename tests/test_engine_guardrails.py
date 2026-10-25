@@ -674,3 +674,224 @@ def test_repair_exception_does_not_kill_run(tmp_path):
                              args={"code": "print(1)", "description": "d"}, parse_error=None)
     out = loop._run_code_with_repair(action)   # 不抛 = 通过
     assert isinstance(out, Observation) and out.ok is False
+
+
+def test_verify_sees_outputs_that_were_never_registered(tmp_path):
+    """模型用 csv 模块写出的文件不在 artifacts 里，验收也必须看得见。
+
+    实测组合任务：``output/分布中心.csv`` 一直在盘上，但工具只从 set_result /
+    代码里的字面量路径提产物，它从没进过 artifacts → 语义验收每次都报“缺失该
+    CSV”，模型反复补证也无法自证（4 次 finish 连拒的主因之一）。
+    """
+    from types import SimpleNamespace
+
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output"
+    out.mkdir()
+    declared = out / "报告.md"
+    declared.write_text("ok", encoding="utf-8")
+    csv_path = out / "分布中心.csv"
+    csv_path.write_text("YEAR,X\n1982,1\n", encoding="utf-8")
+    gdb = out / "result_data.gdb"
+    gdb.mkdir()
+    child = gdb / "year_centers"
+
+    seen: list[str] = []
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            paths = [str(declared), str(csv_path), str(child)]
+            seen.extend(paths)
+            return SimpleNamespace(ok=True, result={"records": [{"path": p, "exists": True} for p in paths]})
+
+    v = Verifier(workspace=tmp_path, code_runner=_Runner())
+    state = SimpleNamespace(
+        artifacts=[str(declared), str(child)],
+        requirements=[], methodology="", final_summary="", tasklist=[], goal="test",
+    )
+    verdict = v.verify(state)
+
+    paths = [str(r.get("path")) for r in verdict["structural"]]
+    assert str(csv_path) in paths, f"未登记的产出必须被发现: {paths}"
+    assert str(csv_path) in state.artifacts
+    # 已声明库内具体条目时不再补整个 .gdb 目录（目录只是弱证据）
+    assert str(gdb) not in paths, paths
+
+
+def test_structural_check_is_cached_until_outputs_change(tmp_path):
+    """同一批产物重复验收不该反复问内核（实测 25 条要 14~25s，一个 run 验 4 次）。"""
+    from types import SimpleNamespace
+
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output"
+    out.mkdir()
+    raster = out / "kde.tif"
+    raster.write_bytes(b"x")
+
+    calls = {"n": 0}
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            calls["n"] += 1
+            return SimpleNamespace(ok=True, result={"records": [{"path": str(raster), "exists": True}]})
+
+    v = Verifier(workspace=tmp_path, code_runner=_Runner())
+    v.structural_check([str(raster)])
+    v.structural_check([str(raster)])
+    assert calls["n"] == 1, "产物没变时不该再跑内核"
+
+    import os
+
+    os.utime(raster, (raster.stat().st_atime, raster.stat().st_mtime + 5))
+    v.structural_check([str(raster)])
+    assert calls["n"] == 2, "产物变了必须重新体检"
+
+
+def test_verify_code_enumerates_gdb_contents():
+    """GDB 只回一个 kind=Workspace 的壳等于什么都没证——必须把库里的数据集列出来。"""
+    from gis_cli.engine.verifier import _VERIFY_CODE
+
+    assert "_workspace_contents" in _VERIFY_CODE
+    assert 'rec["contents"]' in _VERIFY_CODE
+    assert "ListRasters" in _VERIFY_CODE and "ListFeatureClasses" in _VERIFY_CODE
+    # 图片不该被当成栅格去读值域（Describe 对 .jpg 也回 RasterDataset）
+    assert '"Image"' in _VERIFY_CODE
+
+
+def test_semantic_verdict_is_cached_when_material_unchanged(tmp_path):
+    """同一批产物 + 同一份 summary，语义验收只该问一次模型。
+
+    ``verify_outputs``（工具）和 finish 的 ``verification`` 走的是同一个
+    ``verify()``，实测组合任务 4 次 verify_outputs 共 206s，四次材料完全一样。
+    """
+    from types import SimpleNamespace
+
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output"
+    out.mkdir()
+    report = out / "报告.md"
+    report.write_text("ok", encoding="utf-8")
+
+    calls = {"n": 0}
+
+    class _LLM:
+        class _Cfg:
+            effective_vision = False
+
+        config = _Cfg()
+
+        def chat(self, messages, **kwargs):
+            calls["n"] += 1
+            return SimpleNamespace(
+                content='{"pass": true, "per_requirement": [], "missing": [], "repair_hint": ""}',
+                model="mock",
+            )
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            return SimpleNamespace(ok=True, result={"records": [{"path": str(report), "exists": True}]})
+
+    v = Verifier(workspace=tmp_path, code_runner=_Runner(), llm_client=_LLM())
+    state = SimpleNamespace(
+        artifacts=[str(report)], requirements=[SimpleNamespace(to_dict=lambda: {"id": "r1", "text": "报告"})],
+        methodology="", final_summary="已完成", tasklist=[], goal="测试",
+    )
+    first = v.verify(state)
+    second = v.verify(state)
+
+    assert calls["n"] == 1, "材料没变不该再问一次模型"
+    assert first["pass"] is True and second["pass"] is True
+
+    # 摘要变了 = 材料变了，必须重新验收
+    state.final_summary = "已完成，另附说明"
+    v.verify(state)
+    assert calls["n"] == 2
+
+
+def test_discovery_ignores_previous_run_outputs(tmp_path):
+    """持久 workspace 里上次的产物不能算成这次的（实测踩过）。
+
+    基准每 run 一个 workspace，交互式 workspace/output 从不按 run 清理。
+    历史产物并进 artifacts 会一路喂给卫生检查、识图质检和语义验收。
+    """
+    import os
+    import time
+    from types import SimpleNamespace
+
+    from gis_cli.engine.verifier import Verifier
+
+    out = tmp_path / "output"
+    out.mkdir()
+    old = out / "关键统计汇总.csv"
+    old.write_text("x", encoding="utf-8")
+    old_time = time.time() - 86400
+    os.utime(old, (old_time, old_time))
+    fresh = out / "本次报告.md"
+    fresh.write_text("ok", encoding="utf-8")
+    (out / "tmp_train.tif").write_bytes(b"x")
+
+    v = Verifier(workspace=tmp_path)
+    found = v._discover_outputs(since=time.time() - 60)
+    names = [Path(p).name for p in found]
+
+    assert "本次报告.md" in names
+    assert "关键统计汇总.csv" not in names, f"历史产物不该被发现: {names}"
+    assert "tmp_train.tif" not in names, f"过程件不该被发现: {names}"
+
+    # verify() 端到端：历史 CSV 不能进产物清单
+    state = SimpleNamespace(
+        artifacts=[str(fresh)], requirements=[], methodology="",
+        final_summary="", tasklist=[], goal="t",
+        created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+    )
+    v.verify(state)
+    assert str(old) not in state.artifacts
+
+
+def test_structural_key_sees_inplace_gdb_edits(tmp_path):
+    """原地改库内条目（追加要素）必须让缓存失效（实测踩过）。
+
+    只看 `.gdb` 目录自身的 mtime 不够：改数据文件不动目录时间戳。
+    """
+    import os
+    import time
+    from types import SimpleNamespace
+
+    from gis_cli.engine.verifier import Verifier
+
+    gdb = tmp_path / "output" / "result_data.gdb"
+    gdb.mkdir(parents=True)
+    (gdb / "gdb").write_bytes(b"")
+    table = gdb / "a00000001.gdbtable"
+    table.write_bytes(b"x" * 10)
+
+    calls = {"n": 0}
+
+    class _Runner:
+        def run(self, code, timeout=None, workspace=None):
+            calls["n"] += 1
+            return SimpleNamespace(ok=True, result={"records": [{"path": str(gdb / "pts"), "exists": True, "feature_count": calls["n"]}]})
+
+    v = Verifier(workspace=tmp_path, code_runner=_Runner())
+    target = str(gdb / "pts")
+    v.structural_check([target])
+    v.structural_check([target])
+    assert calls["n"] == 1, "产物没变时缓存应命中"
+
+    # 原地追加数据：改库内数据文件，不动 gdb 目录本身
+    time.sleep(0.01)
+    table.write_bytes(b"x" * 99)
+    os.utime(table, (time.time() + 5, time.time() + 5))
+    v.structural_check([target])
+    assert calls["n"] == 2, "库内条目变了必须重新体检"
+
+    # 目录形态（``output/x.gdb`` 本身就会被 _discover_outputs 当产物）也要失效：
+    # 目录自身的 mtime 不随库内数据文件变化，只比它等于没比。
+    folder = [str(gdb)]
+    before = v._structural_key(folder)
+    table.write_bytes(b"x" * 5000)
+    os.utime(table, (time.time() + 30, time.time() + 30))
+    assert v._structural_key(folder) != before, "目录形态的库内改动必须让缓存失效"

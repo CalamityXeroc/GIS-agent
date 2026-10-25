@@ -249,6 +249,60 @@ def to_unit(event: str, payload: dict[str, Any] | None = None) -> RenderUnit | N
         files = data.get("files") or []
         return RenderUnit("note", f"附上成图自检（{len(files)} 张）", lines=[_short(f, 120) for f in files[:3]])
 
+    # ---------------------------------------------------------- 子代理
+    # 子代理跑几分钟时父会话是阻塞的：这几个事件是唯一的“还在动”信号，
+    # 不转发界面会静默到用户以为卡死。
+    if event == "subagent_start":
+        sid = str(data.get("subtask_id") or "?")
+        task = _short(data.get("task") or "", 70)
+        return RenderUnit(
+            "note",
+            f"子代理 {sid} 开始：{task}",
+            lines=[f"预算 {data.get('max_turns', '?')} 轮 / {data.get('timeout_s', '?')}s"],
+            meta={"subtask_id": sid},
+        )
+
+    if event == "subagent_tool":
+        sid = str(data.get("subtask_id") or "?")
+        tool = str(data.get("tool") or "?")
+        args = data.get("args") if isinstance(data.get("args"), dict) else {}
+        return RenderUnit("step", f"[{sid}] {tool}", lines=[describe_args(tool, args)], meta={"tool": tool, "subtask_id": sid})
+
+    if event == "subagent_warn":
+        sid = str(data.get("subtask_id") or "?")
+        tool = str(data.get("tool") or "?")
+        return RenderUnit(
+            "warn",
+            f"[{sid}] {tool} 失败",
+            lines=[_short(data.get("summary") or "", 160)],
+            ok=False,
+            meta={"tool": tool, "subtask_id": sid},
+        )
+
+    if event == "subagent_end":
+        sid = str(data.get("subtask_id") or "?")
+        status = str(data.get("status") or "?")
+        ok = status == "completed"
+        label = {
+            "completed": "完成",
+            "max_turns": "撞轮次上限",
+            "deadline_exceeded": "超时",
+            "llm_unavailable": "模型不可用",
+            "failed": "失败",
+            "stopped": "被中断",
+        }.get(status, status)
+        lines = [unescape_text(data.get("summary") or "")] if data.get("summary") else []
+        leaks = data.get("namespace_leaks") or []
+        if leaks:
+            lines.append("未加前缀的内核变量：" + "、".join(str(x) for x in leaks[:5]))
+        return RenderUnit(
+            "verify" if ok else "warn",
+            f"子代理 {sid} {label}（{data.get('turns', '?')} 轮 / {data.get('elapsed_s', '?')}s，产物 {data.get('artifacts', 0)} 个）",
+            lines=lines,
+            ok=ok,
+            meta={"subtask_id": sid, "status": status},
+        )
+
     if event == "run_end":
         return _run_end_unit(data)
 
@@ -371,6 +425,13 @@ class StatusTracker:
             self.current_action = ""
         elif event == "repair_attempt":
             self.repair_count += 1
+        elif event == "subagent_turn":
+            # 子代理的轮次不能覆盖父的 turn（那是两个预算）
+            self.current_action = f"子代理 {data.get('subtask_id')} · 第 {data.get('turn')} 轮"
+        elif event == "subagent_tool":
+            self.current_action = f"子代理 {data.get('subtask_id')} · {data.get('tool')}"
+        elif event == "subagent_end":
+            self.current_action = ""
         elif event == "verification":
             self.verify_pass = bool(data.get("pass"))
         elif event == "run_end":

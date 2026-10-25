@@ -105,7 +105,7 @@ def test_execute_does_not_fetch_result_on_error():
 def test_execute_preserves_workspace_prefix():
     """workspace 前缀仍要注入（arcpy.env.workspace / overwriteOutput）。"""
     kernel, calls = _fake_kernel(
-        lambda code: ExecResult(ok=True, stdout=_RESULT_MARKER + "null\n")
+        lambda code: ExecResult(ok=True, stdout=_RESULT_MARKER + "null" + chr(10) + "n"),
     )
     kernel.execute("pass", workspace=r"C:\ws")
     assert "arcpy.env.workspace" in calls[0]
@@ -132,7 +132,7 @@ def test_execute_resets_result_before_running():
     from gis_cli.runtime.kernel import _RESULT_HEAD
 
     kernel, calls = _fake_kernel(
-        lambda code: ExecResult(ok=True, stdout=_RESULT_MARKER + "null\n")
+        lambda code: ExecResult(ok=True, stdout=_RESULT_MARKER + "null" + chr(10) + "n"),
     )
     outcome = kernel.execute("x = 1")
     assert outcome.result is None
@@ -148,3 +148,78 @@ def test_result_tail_clears_after_reading():
     from gis_cli.runtime.kernel import _RESULT_TAIL, _RESULT_VAR
 
     assert f"globals()['{_RESULT_VAR}'] = None" in _RESULT_TAIL
+
+
+def test_execute_chdirs_to_workspace_and_restores(tmp_path, monkeypatch):
+    """CWD 跟着工作区走，且**无论成败**都回到启动目录（实测）。
+
+    真执行拼装出来的语句（不只断言字符串在不在）：
+
+    - 正常跑完 → 用户代码期间 cwd = 工作区，归位语句后 = 启动目录；
+    - 用户代码抛异常 → cell 中断，归位语句后仍回启动目录（execute 的错误路径
+      会补一趟 _chdir_back_stmt()，这里用同一条语句验证）；
+    - _cwd_launch 在 prelude 里只捕获一次，连续两次失败也不会把恢复目标挪走。
+    """
+    import os
+    import sys
+    import types
+
+    from gis_cli.runtime.kernel import _chdir_back_stmt, _cwd_prefix_statements
+
+    launch = os.getcwd()
+    ws1 = tmp_path / "ws1"
+    ws1.mkdir()
+    ws2 = tmp_path / "ws2"
+    ws2.mkdir()
+
+    # 假 arcpy：组合代码里有 import arcpy / env.workspace
+    fake = types.ModuleType("arcpy")
+    fake.env = types.SimpleNamespace(workspace=None, overwriteOutput=None)
+    monkeypatch.setitem(sys.modules, "arcpy", fake)
+
+    def run_combined(combined: str):
+        g: dict = {"_cwd_launch": launch}
+        try:
+            exec(compile(combined, "<combined>", "exec"), g)
+            error = None
+        except Exception as exc:  # 模拟 execute 的错误路径：cell 中断后补归位
+            error = exc
+            exec(compile("import os as _os" + chr(10) + _chdir_back_stmt(), "<restore>", "exec"), g)
+        return error
+
+    safe1 = str(ws1).replace(chr(92), chr(92) * 2)
+    combined_ok = "import os as _os" + chr(10) + _cwd_prefix_statements(safe1) + "x = 1"
+    assert run_combined(combined_ok) is None
+    assert os.getcwd() == str(ws1), "执行期间 cwd = 本次工作区（成功路径不需要额外归位）"
+
+    safe2 = str(ws2).replace(chr(92), chr(92) * 2)
+    combined_boom = (
+        "import os as _os" + chr(10) + _cwd_prefix_statements(safe2)
+        + "raise RuntimeError('boom')"
+    )
+    assert run_combined(combined_boom) is not None, "用户代码的异常要如实抛出"
+    assert os.getcwd() == launch, "异常路径也要回启动目录"
+
+    # 无漂移：_cwd_launch 是常量，第二个工作区照样能进
+    error2 = run_combined(combined_ok.replace(safe1, safe2))
+    assert error2 is None and os.getcwd() == str(ws2), "第二个工作区照样进得去（无漂移）"
+
+    os.chdir(launch)  # 别把 pytest 留在 tmp 里
+
+
+def test_failed_execute_sends_cwd_repair(tmp_path):
+    """用户代码抛异常会让 cell 中断，cwd 停在工作区 —— 错误路径必须补一趟归位（实测）。
+
+    以前这个归位语句拼在用户代码后面，cell 一中断它根本不执行；
+    而且每次 execute 都 getcwd() 当恢复目标，失败一次就永久挪一格。
+    """
+    kernel, calls = _fake_kernel(lambda code: ExecResult(ok=False, error={"type": "RuntimeError"}))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    kernel.execute("raise RuntimeError('boom')", workspace=str(ws))
+
+    assert len(calls) == 2, f"错误路径要多一趟归位，实际 {len(calls)} 趟"
+    assert "_os.chdir(_cwd_launch)" in calls[1]
+    # 漂移修复：拼装里不再有“每次 execute 都 getcwd 当恢复目标”
+    assert "_cwd_restore = _os.getcwd()" not in calls[0]
+    assert "_cwd_launch" in calls[0]

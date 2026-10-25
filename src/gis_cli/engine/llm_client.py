@@ -64,6 +64,30 @@ class LLMResponse:
         return int(self.usage.get("total_tokens", 0) or 0)
 
 
+#: 能识图的模型家族（名字片段匹配，小写）。
+#: **默认不附图**：上游对“看不见图”的模型通常不报错（实测 glm-5.3-flash 会静默收下
+#: 图片），于是每张图都白烧 token，模型还要花一轮解释“我看不到图”。只认名单内的。
+_VISION_MODEL_HINTS = (
+    "gpt-4o", "gpt-4.1", "gpt-5", "claude-3", "claude-4", "claude-sonnet", "claude-opus",
+    "gemini", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "glm-4v", "glm-4.5v", "internvl",
+    "llava", "pixtral", "minicpm-v",
+)
+
+
+def model_supports_vision(model: str) -> bool:
+    """模型名看起来能识图吗（保守判断：没命中就是不能）。"""
+    name = str(model or "").lower()
+    return any(hint in name for hint in _VISION_MODEL_HINTS)
+
+
+def _parse_vision_mode(data: dict, engine: dict) -> str:
+    """``auto`` | ``on`` | ``off``；兼容旧的布尔 ``vision``。"""
+    raw = str(engine.get("vision_mode", data.get("vision_mode", "")) or "").strip().lower()
+    if raw in {"auto", "on", "off"}:
+        return raw
+    return "on" if bool(data.get("vision", engine.get("vision", False))) else "auto"
+
+
 @dataclass
 class EngineLLMConfig:
     """Configuration for the engine LLM client."""
@@ -89,6 +113,8 @@ class EngineLLMConfig:
     # 多模态：模型能识图时，把产出图（地图/统计图）附进对话，让它自己看一眼核对；
     # 也可用于图面质检（中文是否变方框、图例是否被裁掉）。
     vision: bool = False
+    #: 识图开关：auto（按模型能力，默认）/ on（强制附）/ off（强制不附）
+    vision_mode: str = "auto"
     routing_rules: dict[str, list[str]] = field(default_factory=dict)
     max_concurrency: int = 1
     retry_count: int = 6
@@ -112,6 +138,15 @@ class EngineLLMConfig:
     #: 所以即使外层只剩几秒也至少给这么久（测试里可调小以免拖慢 CI）。
     min_stream_budget_seconds: float = 30.0
 
+    @property
+    def effective_vision(self) -> bool:
+        """真正要不要附图：``auto`` 时按模型名判断，别指望上游会报错提醒。"""
+        if self.vision_mode == "off":
+            return False
+        if self.vision_mode == "on":
+            return True
+        return model_supports_vision(self.model)
+
     @classmethod
     def from_file(cls, path: str | Path) -> "EngineLLMConfig":
         data: dict[str, Any] = {}
@@ -129,6 +164,7 @@ class EngineLLMConfig:
             timeout=float(data.get("timeout", cls.timeout)),
             total_timeout=float(engine.get("request_total_timeout_seconds", data.get("total_timeout", 420.0))),
             vision=bool(data.get("vision", engine.get("vision", False))),
+            vision_mode=_parse_vision_mode(data, engine),
             reasoning_effort=str(
                 engine.get("reasoning_effort", data.get("reasoning_effort", "")) or ""
             ).strip(),

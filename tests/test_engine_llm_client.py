@@ -864,3 +864,30 @@ def test_repair_stops_after_wall_clock_cap():
     obs = Observation(ok=False, summary="boom", error={"type": "E", "message": "fail-0"})
     _, _, attempts = r.run(intent="x", code="print(0)", observation=obs)
     assert len(attempts) < 10, f"墙钟上限没生效，跑满 {len(attempts)} 次"
+
+
+def test_vision_mode_auto_uses_model_capability():
+    """`vision_mode: auto` 按模型名决定要不要附图；旧键 `vision: true` 仍当 on。"""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from gis_cli.engine.llm_client import EngineLLMConfig, model_supports_vision
+
+    assert model_supports_vision("glm-5.3-flash") is False
+    assert model_supports_vision("gpt-4o-2024-08-06") is True
+    assert model_supports_vision("qwen2.5-vl-72b") is True
+
+    assert EngineLLMConfig(model="glm-5.3-flash").effective_vision is False
+    assert EngineLLMConfig(model="gpt-4o").effective_vision is True
+    assert EngineLLMConfig(model="glm-5.3-flash", vision_mode="on").effective_vision is True
+    assert EngineLLMConfig(model="gpt-4o", vision_mode="off").effective_vision is False
+
+    # 配置文件：显式 vision_mode 优先；只有旧键 vision=true 时按 on 处理
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "llm_config.json"
+        path.write_text(json.dumps({"model": "glm-5.3-flash", "vision": True, "engine": {"vision_mode": "auto"}}), encoding="utf-8")
+        assert EngineLLMConfig.from_file(path).effective_vision is False
+
+        path.write_text(json.dumps({"model": "glm-5.3-flash", "vision": True}), encoding="utf-8")
+        assert EngineLLMConfig.from_file(path).vision_mode == "on"
