@@ -41,6 +41,25 @@ _STATUS_ROLE = {
     "llm_unavailable": "gis.err",
     "runner_error": "gis.err",
     "stopped": "gis.warn",
+    "cancelled": "gis.warn",
+    "plan_pending": "gis.warn",
+}
+
+#: 状态 → 中文标签（与 events.StatusTracker.footer 同一套；过去只列了 4 个，
+#: stopped（用户中断）/ cancelled（计划未确认）等会直接显示英文）
+_STATUS_LABEL = {
+    "running": "运行中",
+    "awaiting_user": "等待输入",
+    "completed": "已完成",
+    "idle": "空闲",
+    "failed": "失败",
+    "stopped": "已停止",
+    "max_turns": "达轮次上限",
+    "deadline_exceeded": "超时停止",
+    "llm_unavailable": "模型不可用",
+    "runner_error": "运行出错",
+    "cancelled": "已取消",
+    "plan_pending": "待确认计划",
 }
 
 #: 正文折行宽度（留出缩进与边框）
@@ -625,6 +644,10 @@ class TranscriptView:
         if kind == "note":
             self.console.print(system_line(_short(unit.text, _BODY_WIDTH)))
             return
+        if kind == "plan":
+            # 计划卡是多行框线文本：按行原样打，不能被 _short 截断
+            self.console.print(Text(unit.text, style="gis.code"))
+            return
         if kind == "verify":
             passed = bool(unit.ok)
             detail = unit.text or ""
@@ -697,6 +720,8 @@ def render_unit(unit: RenderUnit, *, elapsed: float | None = None) -> Renderable
         return turn_rule(int(match.group(0)) if match else 0)
     if unit.kind == "note":
         return system_line(_short(unit.text, _BODY_WIDTH))
+    if unit.kind == "plan":
+        return Text(unit.text, style="gis.code")
     return Text(unit.text, style="gis.agent")
 
 
@@ -785,7 +810,11 @@ def result_card(state: dict[str, Any]) -> Panel:
 
     turn = state.get("turn")
     meta = Text()
-    meta.append(f"状态 {status or '未知'}", style=role)
+    # 中文标签后面保留原始状态码：人看得懂，脚本/排查也能直接搜到 llm_unavailable
+    status_text = _STATUS_LABEL.get(status) or status or "未知"
+    if status_text != (status or ""):
+        status_text = f"{status_text}（{status}）"
+    meta.append(f"状态 {status_text}", style=role)
     if turn is not None:
         meta.append(f" · 轮次 {turn}", style="gis.dim")
     body.append(Text(""))
@@ -804,20 +833,8 @@ def footer_text(tracker: StatusTracker, *, width: int = 0) -> Text:
     pieces: list[tuple[str, str]] = []
     if tracker.model:
         pieces.append((tracker.model, "gis.accent"))
-    # 与 events.StatusTracker.footer 保持同一套中文映射：过去只列了 4 个，
-    # stopped（用户中断）等状态会直接显示英文。
-    status_label = {
-        "running": "运行中",
-        "awaiting_user": "等待输入",
-        "completed": "已完成",
-        "idle": "空闲",
-        "failed": "失败",
-        "stopped": "已停止",
-        "max_turns": "达轮次上限",
-        "deadline_exceeded": "超时停止",
-        "llm_unavailable": "模型不可用",
-        "runner_error": "运行出错",
-    }.get(tracker.status, tracker.status or "空闲")
+    # 与 events.StatusTracker.footer 同一套中文映射（_STATUS_LABEL）
+    status_label = _STATUS_LABEL.get(tracker.status, tracker.status or "空闲")
     pieces.append((status_label, _STATUS_ROLE.get(tracker.status, "gis.status")))
 
     idle = tracker.status in ("", "idle") and not tracker.turn

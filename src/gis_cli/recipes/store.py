@@ -638,7 +638,7 @@ class RecipeLibrary:
             spec = raw.get("spec") or self._load_sibling_spec(target, raw.get("image"))
             image_path = str(raw.get("image") or "")
             min_font_pt = float(raw.get("min_font_pt") or 7.0)
-            # 版面体检要读 .aprx，只有 arcpy 能读。CLI 跑在 venv 里
+            # 版面体检要读 .aprx，只有 arcpy 能读。benchmark/CLI 跑在 venv 里
             # （没装 arcpy），直接 import 会报 “No module named 'arcpy'” 而判失败——
             # 实测 14 届 4a-1 就报 “版面体检失败: ...”。有 code_runner（内核/子进程）
             # 时改让它在 ArcGIS 解释器里体检，把结果回传。
@@ -1213,7 +1213,7 @@ class RecipeLibrary:
         因此这里重试一次再下结论，避免把已有数据判成"不存在"。
 
         重试后仍是**否定**结论时，再换一路真 arcpy（ArcGIS Pro python 子进程）复核一次：
-        内核会话里 arcpy 的状态可能已经脏了——实测同一份 ``real_a.gdb`` 在同一
+        内核会话里 arcpy 的状态可能已经脏了——DAIR-15 实测同一份 ``real_a.gdb`` 在同一
         会话里 ``arcpy.Exists`` 恒 False，而全新的 Pro 进程里 exists=True、count=3。
         这类假阴性会被读成"产出缺失"，逼 agent 重建数据、也污染基准结论。
         子进程实测 14~25s，所以在肯定分支上不付这笔开销。
@@ -1241,7 +1241,7 @@ class RecipeLibrary:
         """用 ArcGIS Pro python 子进程复核 Describe（同会话说"不存在"时才走这里）。
 
         不用 venv 的进程内 arcpy：那条路在基准/CLI 的 venv 里根本没有 arcpy，
-        必然返回 None，等于没复核（早期的 ``_describe_in_process`` 兜底就是这样失效的）。
+        必然返回 None，等于没复核（DAIR-15 的 ``_describe_in_process`` 兜底就是这样失效的）。
         """
         from ..arcpy_bridge import run_arcpy_code
 

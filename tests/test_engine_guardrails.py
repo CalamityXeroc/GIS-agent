@@ -812,7 +812,7 @@ def test_semantic_verdict_is_cached_when_material_unchanged(tmp_path):
 
 
 def test_discovery_ignores_previous_run_outputs(tmp_path):
-    """持久 workspace 里上次的产物不能算成这次的（实测踩过）。
+    """持久 workspace 里上次的产物不能算成这次的（DAIR-6 阻塞项 2）。
 
     基准每 run 一个 workspace，交互式 workspace/output 从不按 run 清理。
     历史产物并进 artifacts 会一路喂给卫生检查、识图质检和语义验收。
@@ -852,7 +852,7 @@ def test_discovery_ignores_previous_run_outputs(tmp_path):
 
 
 def test_structural_key_sees_inplace_gdb_edits(tmp_path):
-    """原地改库内条目（追加要素）必须让缓存失效（实测踩过）。
+    """原地改库内条目（追加要素）必须让缓存失效（DAIR-6 阻塞项 3）。
 
     只看 `.gdb` 目录自身的 mtime 不够：改数据文件不动目录时间戳。
     """

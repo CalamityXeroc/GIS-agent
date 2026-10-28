@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 #: 验收永远报“没有任何产出文件”。
 GIS_OUTPUT_EXT = {
     # 矢量 / 栅格 / 表格
-    ".shp", ".gdb", ".tif", ".tiff", ".img", ".dbf", ".gpkg", ".csv", ".xlsx", ".xls",
+    ".shp", ".gdb", ".geojson", ".tif", ".tiff", ".img", ".dbf", ".gpkg", ".csv", ".xlsx", ".xls",
     # 地图与工程
     ".lyrx", ".mapx", ".aprx", ".mxd",
     # 图片
@@ -126,7 +126,7 @@ def _path_literals(node: Any, known: dict[str, set[str]]) -> set[str]:
     ):
         # 外壳只改写法、不改指向：``p = os.path.abspath("output/x.gdb")`` 解析成
         # ``output/x.gdb``，这样 ``rmtree(p)`` 认得出是清理；而 ``abspath("...x.gdb/probe_pts")``
-        # 解析成库内子路径，不会被当成「删的就是库本身」（曾因宽判据漏放行）。
+        # 解析成库内子路径，不会被当成「删的就是库本身」（DAIR-18 阻塞项）。
         return _path_literals(node.args[0], known)
     if isinstance(node, ast.Call) and _call_name(node.func) == "join":
         parts = [_path_literals(arg, known) for arg in node.args]
@@ -151,10 +151,10 @@ def _cleanup_gdb_names(tree: Any) -> set[str]:
     - ``gdb = os.path.join(out, "x.gdb"); shutil.rmtree(gdb)`` —— 是清理（放行）；
     - ``for name in ["fake_a.gdb"]: p = os.path.join("output", name); shutil.rmtree(p)``
       —— 也是清理。以前只跟赋值、不跟循环变量，解析不出名字，agent 照 guard 自己的
-      hint 写的整改代码被误拦，又得靠 ``arcpy.Delete_management`` 绕过去（实测 trace 107→109）；
+      hint 写的整改代码被误拦，又得靠 ``arcpy.Delete_management`` 绕过去（DAIR-15 trace 107→109）；
     - ``Delete("output/fake_a.gdb/probe_pts")`` 后面跟着写 —— **不是**清理：删的是库里的
       要素类，不是假库本身。以前按 basename 豁免，整个 cell 里对该假库的写入一起被
-      放行，假库里真写出了 shapefile（探针实测）。
+      放行，假库里真写出了 shapefile（DAIR-16 探针 run 20261023_170723 实测）。
     """
     known: dict[str, set[str]] = {}
     for _ in range(4):
@@ -324,7 +324,7 @@ def extract_outputs(value: Any, workspace: str | Path, *, limit: int = 30) -> li
 
     实测两个坑：
     1. 模型习惯把读过的输入也写进 set_result，若当成产物登记，验收会报
-       “产出不在 output 目录内”而判定失败（实测就栽在这）。
+       “产出不在 output 目录内”而判定失败（benchmark 的 4b 就栽在这）。
     2. 模型会把工具回参里的**外部**工程当成产物，例如
        ``E:\\ArcGISPro3.6\\...\\Blank.aprx``、用户 Documents 下的 MyProject.aprx。
        这些是 ArcGIS 自带的模板工程，一登记就让验收永远报“产出不在 output 目录内”，
@@ -967,15 +967,20 @@ def build_default_registry() -> EngineToolRegistry:
             "    _out = str(_r.get('output') or '')\n"
             "    if _out:\n"
             "        _sp = _os.path.splitext(_out)[0] + '.spec.json'\n"
+            "        _payload = {k: v for k, v in _r.items() if k != 'spec'}\n"
+            # 渲染器也要落盘：验收入口（recipes.store 的 map_layout_ok）读的就是这个边车，
+            # 少了 renderer 它就无法区分“分类图例”与“分级图例”，会对同一张图得出
+            # 与运行内体检相反的结论（DAIR-35：交付 .aprx 图例“193,834”被判“不整齐”）。
+            "        _payload['renderer'] = (_r.get('spec') or {}).get('renderer') or {}\n"
             "        with open(_sp, 'w', encoding='utf-8') as _fh:\n"
-            "            _json.dump({k: v for k, v in _r.items() if k != 'spec'}, _fh, ensure_ascii=False, indent=2)\n"
+            "            _json.dump(_payload, _fh, ensure_ascii=False, indent=2)\n"
             "        _r['spec_path'] = _sp\n"
             "except Exception as _e:\n"
             "    _r['spec_error'] = str(_e)[:200]\n"
             "set_result(_r)\n"
         )
         # 制图引擎自己要在 ArcGIS 解释器（内核）里跑，所以固定走 code_runner；
-        # 不要在这里直接用 create_map（CLI 的 venv 没有 arcpy）。
+        # 不要在这里直接用 create_map（benchmark/CLI 的 venv 没有 arcpy）。
         result = ctx.code_runner.run(code, timeout=float(args.get("timeout_seconds") or 900), workspace=str(ctx.workspace))
         if not result.ok:
             detail = ""
@@ -1000,12 +1005,29 @@ def build_default_registry() -> EngineToolRegistry:
         summary = f"出图完成：{output_path}"
         if qc_ok is not None:
             summary += f"（版面体检 {'通过' if qc_ok else '未通过'}）"
+        if qc_ok is False:
+            # 体检不通过**不能放行**：以前这里返回 ok=True，模型看到“未通过”也照样
+            # 走到 finish，交付的 .aprx 就带着未取整的图例标签（DAIR-32 基准 4a 实测）。
+            # 产物照常登记（已经落盘，丢掉反而会重复出图），但必须让模型看见失败并修掉。
+            qc_detail = str(payload.get("qc_summary") or "")[:400]
+            return Observation(
+                ok=False,
+                summary=f"版面体检未通过：{output_path}",
+                data=payload,
+                artifacts=artifacts,
+                error={"type": "LayoutQCFailed", "message": qc_detail},
+                hint=(
+                    f"版面无问题前不要交付。体检问题：{qc_detail}\n"
+                    "按提示改参数重出：图例类名带原始浮点 → unique 模式改用 mode=graduated + "
+                    "explicit_bounds 显式分级（或用 category_names 给可读类名）；分界值不整齐 → "
+                    "explicit_bounds 传整齐的上界；元素越界/压盖 → 用 overrides 调位置或换 style_profile。"
+                ),
+            )
         return Observation(
             ok=True,
             summary=summary,
             data=payload,
             artifacts=artifacts,
-            hint="" if qc_ok is not False else f"版面问题：{str(payload.get('qc_summary'))[:220]}",
         )
 
     registry.register(
@@ -1026,7 +1048,9 @@ def build_default_registry() -> EngineToolRegistry:
                 "（from/to 也可写成 x0/y0/x1/y1，两种写法都认）\n"
                 "arrows 画带箭头的迁移线，labels 在点位旁标文字；两者不要重复标同一信息。\n"
                 "【版式微调】要覆盖自动设计（如比例尺长度）用 overrides，点路径写法："
-                '{"scale_bar.element_width_mm": 55}；出图后看 qc_summary 的提示即可。'
+                '{"scale_bar.element_width_mm": 55}；出图后看 qc_summary 的提示即可。\n'
+                "【硬约束】版面体检不通过时本工具返回失败（ok=false）并列出要改的参数，"
+                "必须改完重出，不要带着未通过的版面去 finish。"
             ),
             parameters={
                 "type": "object",

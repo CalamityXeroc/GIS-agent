@@ -442,6 +442,29 @@ def _parse_name_map(raw: Any) -> dict[str, str]:
     return mapping
 
 
+def _category_label(key: str) -> str:
+    """唯一值类名：数值去掉原始浮点，文本原样。
+
+    唯一值渲染器会把字段值**原样**当类名：浮点字段就把 ``193833.858800001``
+    写进图例（DAIR-32 基准 4a 实测，``legend_labels_unrounded`` 判不通过）。
+    这里按显示精度取整：整数（年份/编码）原样保留，小数留 2 位，大数取整。
+    """
+    text = str(key).strip()
+    if not text:
+        return ""
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    if number != number or number in (float("inf"), float("-inf")):  # NaN / inf
+        return text
+    if number.is_integer():
+        return str(int(number))
+    if abs(number) >= 1000:
+        return f"{int(round(number)):,}"
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
 def _apply_unique(layer: Any, spec: dict[str, Any], notes: list[str]) -> None:
     renderer_spec = spec["renderer"]
     sym = layer.symbology
@@ -455,6 +478,7 @@ def _apply_unique(layer: Any, spec: dict[str, Any], notes: list[str]) -> None:
     color_map = _parse_color_map(renderer_spec.get("category_colors") or "")
     name_map = _parse_name_map(renderer_spec.get("category_names") or "")
     applied: dict[str, str] = {}
+    entries: list[dict[str, str]] = []
     for group in sym.renderer.groups:
         for item in getattr(group, "items", []) or []:
             values = list(item.values) if item.values else []
@@ -462,25 +486,29 @@ def _apply_unique(layer: Any, spec: dict[str, Any], notes: list[str]) -> None:
             if values:
                 first = values[0]
                 key = str(first[0]) if isinstance(first, (list, tuple)) else str(first)
+            # 配色/名称仍按**原始值**查表（category_colors 是模型按原始值给的）
             hex_color = color_map.get(key, renderer_spec.get("nodata_color") or "#D9D9D9")
             try:
                 item.symbol.color = {"RGB": _hex_to_rgb(hex_color)}  # type: ignore[assignment]
             except Exception:
                 pass
-            display = name_map.get(key, key)
+            # 类名与 legend label 用同一个显示文本：ArcGIS 原生图例与叠加重绘
+            # 两侧的标签必须一致，否则又是“同一产物两个结论”。
+            display = name_map.get(key) or _category_label(key)
             try:
                 item.label = display or str(getattr(item, "label", ""))
             except Exception:
                 pass
-            applied[key] = hex_color
+            applied[display] = hex_color
+            entry = {"label": display, "color": hex_color}
+            if entry not in entries:
+                entries.append(entry)
     layer.symbology = sym
-    if applied:
+    if entries:
         notes.append(f"unique_colors: {applied}")
         if name_map:
             notes.append(f"category_names: {name_map}")
-        spec["renderer"]["legend_entries"] = [
-            {"label": name_map.get(key, key), "color": color} for key, color in applied.items()
-        ]
+        spec["renderer"]["legend_entries"] = entries
 
 
 def _apply_raster_classify(layer: Any, spec: dict[str, Any], project: Any, notes: list[str]) -> bool:

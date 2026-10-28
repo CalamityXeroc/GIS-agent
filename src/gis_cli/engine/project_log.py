@@ -30,6 +30,7 @@ _STATUS_LABEL = {
     "stopped": "已停止",
     "awaiting_user": "等待用户",
     "llm_unavailable": "中断（模型不可用）",
+    "cancelled": "已取消（计划未确认）",
 }
 
 

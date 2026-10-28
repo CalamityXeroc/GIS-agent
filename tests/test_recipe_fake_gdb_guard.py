@@ -181,7 +181,7 @@ def test_execute_code_allows_real_gdb_and_missing_gdb(tmp_path):
 
 
 def test_fake_gdb_guard_does_not_hit_real_gdb_with_same_name_elsewhere(tmp_path):
-    """工作区别处有同名假库时，指向**真库**的代码不能被拦（曾误拦）。
+    """工作区别处有同名假库时，指向**真库**的代码不能被拦（DAIR-8 B1-1）。
 
     以前相对路径解析成功后没有 continue，还会走“按名字 glob”，
     于是报出来的是一个完全不相干的目录。
@@ -201,7 +201,7 @@ def test_fake_gdb_guard_does_not_hit_real_gdb_with_same_name_elsewhere(tmp_path)
 
 
 def test_fake_gdb_guard_ignores_mentions_in_comments(tmp_path):
-    """注释里提到 x.gdb 不算要写它（曾误判）。"""
+    """注释里提到 x.gdb 不算要写它（DAIR-8 B1-3）。"""
     from gis_cli.engine.tools import _fake_gdb_in_code
 
     (tmp_path / "output" / "landcover.gdb").mkdir(parents=True)
@@ -210,7 +210,7 @@ def test_fake_gdb_guard_ignores_mentions_in_comments(tmp_path):
 
 
 def test_fake_gdb_guard_allows_cleanup_calls(tmp_path):
-    """清理假库的代码必须放行——guard 自己的 hint 就写着“先 rmtree 清掉”（曾误拦）。"""
+    """清理假库的代码必须放行——guard 自己的 hint 就写着“先 rmtree 清掉”（DAIR-8 B1-2）。"""
     from gis_cli.engine.tools import _fake_gdb_in_code
 
     (tmp_path / "output" / "landcover.gdb").mkdir(parents=True)
@@ -227,7 +227,7 @@ def test_fake_gdb_guard_allows_cleanup_calls(tmp_path):
 
 
 def test_fake_gdb_guard_handles_windows_backslash_paths(tmp_path):
-    r"""反斜杠路径必须被当成一个完整 path token（实测）。
+    r"""反斜杠路径必须被当成一个完整 path token（DAIR-9）。
 
     正则的字符类里少了转义的反斜杠时，``output\landcover.gdb`` 会退化成裸名，
     落到“按名字 glob”兜底：指向**真库**的代码被拦（报的还是别处那个假库），
@@ -265,7 +265,7 @@ def test_fake_gdb_guard_handles_windows_backslash_paths(tmp_path):
 
 
 def test_fake_gdb_guard_allows_cleanup_through_loop_variable(tmp_path):
-    """循环变量拼出来的清理路径也要放行（实测 trace 107→109）。
+    """循环变量拼出来的清理路径也要放行（DAIR-15 trace 107→109）。
 
     ``for name in ["fake_a.gdb"]: p = os.path.join("output", name)`` 之后
     ``shutil.rmtree(p)`` 以前解析不出名字（只跟赋值、不跟循环变量），被当成
@@ -297,7 +297,7 @@ def test_fake_gdb_guard_allows_cleanup_through_loop_variable(tmp_path):
 def test_cleanup_of_child_path_does_not_exempt_writes(tmp_path):
     """删假库**里面的要素类**不算清理意图 —— 同一段里"往里写"照样要拦。
 
-    探针实测：模型把
+    DAIR-16 探针 run 20261023_170723 实测：模型把
     ``if arcpy.Exists(...): arcpy.management.Delete("output/fake_a.gdb/probe_pts")``
     和 ``CreateFeatureclass("output/fake_a.gdb", ...)`` 写在一个 cell 里，而清理豁免
     按 basename 生效 → 整段放行 → arcpy 把普通目录当 folder workspace，假库里真的
@@ -337,7 +337,7 @@ def test_cleanup_of_child_path_does_not_exempt_writes(tmp_path):
     )
     assert _fake_gdb_in_code(abspath_child, tmp_path) == str(fake)
 
-    # 外壳包住的就是库内子路径、变量再拿去删 —— 同样不是清理意图（曾因宽判据漏放行）
+    # 外壳包住的就是库内子路径、变量再拿去删 —— 同样不是清理意图（DAIR-18 阻塞项）
     wrapped_child_vars = (
         'p = os.path.abspath("output/fake_a.gdb/probe_pts")\n'
         "arcpy.management.Delete(p)\n"
@@ -367,7 +367,7 @@ def test_cleanup_wrapped_in_call_still_allowed(tmp_path):
 
 
 def test_cleanup_through_wrapped_variable_still_allowed(tmp_path):
-    """外壳包住的值先赋给变量再删，也要放行（曾误拦）。
+    """外壳包住的值先赋给变量再删，也要放行（DAIR-17 复审阻塞项）。
 
     ``p = os.path.abspath("output/fake_a.gdb"); shutil.rmtree(p)``：赋值右侧解析不出路径
     → 变量登记为空集，而 ``rmtree(p)`` 的参数是裸 Name 也解析不出 → 两头都拿不到名字，

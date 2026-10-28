@@ -4,7 +4,7 @@
 引擎侧 ``on_event(event, payload)`` 会发这些事件（见 ``engine/loop.py``）::
 
     run_start / requirements_extracted / turn / llm_result / tool_call / tool_result
-    repair_attempt / verification / llm_error / deadline_exceeded / run_end
+    repair_attempt / verification / deliverables / llm_error / deadline_exceeded / run_end
 
 本模块只做两件事：
 1. :func:`to_unit` 把事件翻译成 :class:`RenderUnit`（调用方决定怎么画）；
@@ -37,6 +37,7 @@ UNIT_KINDS = (
     "final_line",
     "thought",
     "answer",
+    "plan",
 )
 
 
@@ -174,6 +175,24 @@ def to_unit(event: str, payload: dict[str, Any] | None = None) -> RenderUnit | N
             return None
         return RenderUnit("note", f"抽取验收需求 {count} 条", lines=[str(data.get("requirements", ""))])
 
+    if event == "plan_card":
+        # 5 行计划卡整块照原样进 transcript（框线已在 ui.plan_card 里画好）
+        return RenderUnit("plan", str(data.get("text", "")), meta={"round": data.get("round", 1)})
+
+    if event == "plan_cancelled":
+        # 理由与标题同义（计划未确认），再列一遍只会多一行重复
+        return RenderUnit("warn", "已取消：计划未确认，未开始执行", ok=False)
+
+    if event == "plan_pending":
+        # 暂停态：卡片底栏已经写明按键，这里只更新状态行，不再多打一行
+        return None
+
+    if event == "plan_decided":
+        return None
+
+    if event == "plan_card_auto_start":
+        return RenderUnit("note", str(data.get("reason", "")))
+
     if event == "turn":
         turn = int(data.get("turn") or 0)
         if turn <= 1:
@@ -235,6 +254,17 @@ def to_unit(event: str, payload: dict[str, Any] | None = None) -> RenderUnit | N
     if event == "verification":
         passed = bool(data.get("pass"))
         return RenderUnit("verify", _short(data.get("summary", ""), 200), ok=passed, meta={"verdict": data})
+
+    if event == "deliverables":
+        # 成果包（P0-4）：告诉人“发哪个文件出去”，路径只留文件名
+        files = [_short(str(f).replace("\\", "/").rsplit("/", 1)[-1], 40) for f in (data.get("files") or [])]
+        if not files:
+            return None
+        lines = []
+        if data.get("layers") or data.get("images"):
+            lines.append(f"内嵌 {int(data.get('images') or 0)} 张图、{int(data.get('layers') or 0)} 个图层")
+        lines.extend(str(note) for note in (data.get("notes") or [])[:3])
+        return RenderUnit("note", "成果包已生成：" + "、".join(files), lines=lines)
 
     if event == "llm_error":
         return RenderUnit("error", "模型调用失败", lines=[cleanup_error(data.get("error", ""), 200)])
@@ -396,6 +426,14 @@ class StatusTracker:
             self.started_at = now
             self.current_action = "准备"
             self.action_started = now
+        elif event == "plan_pending":
+            # 引擎停在计划闸门上等人按 s/e/q（chat）：状态行要说清楚，
+            # 否则看起来就是“卡住了”。具体按键由 chat 的状态行补（events 不认识按键）
+            self.status = "plan_pending"
+            self.current_action = ""
+        elif event == "plan_decided":
+            self.status = "running"
+            self.current_action = ""
         elif event == "turn":
             self.turn = int(data.get("turn") or self.turn)
         elif event == "llm_result":
@@ -474,6 +512,8 @@ class StatusTracker:
             "deadline_exceeded": "超时停止",
             "llm_unavailable": "模型不可用",
             "runner_error": "运行出错",
+            "cancelled": "已取消",
+            "plan_pending": "待确认计划",
         }.get(self.status, self.status or "空闲")
         bits.append(status_text)
         idle = self.status in ("", "idle") and not self.turn

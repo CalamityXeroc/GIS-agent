@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Describe 否定结论的复核：同会话 arcpy 状态脏了不能直接判"产出缺失"。
 
-实测：``real_{a,b}.gdb/probe_pts`` 在同一个内核会话里 ``arcpy.Exists``
+DAIR-15 实测：``real_{a,b}.gdb/probe_pts`` 在同一个内核会话里 ``arcpy.Exists``
 恒 False（先删假库、再建真库留下的状态残留；hygiene 也判 ``real_*.gdb: 0MB/0项``），
 换一个全新的 Pro 进程 exists=True、count=3。旧实现只有"会话窗口"这一路判定，
 ``_describe_in_process`` 在 venv 里又没有 arcpy（必然 None），于是 4 条断言假阴性、

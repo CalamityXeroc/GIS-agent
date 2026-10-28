@@ -628,3 +628,4 @@ def test_hygiene_sees_files_in_subdirectories():
     )
     assert any("_m0.aprx" in p for p in problems), problems
     assert "散文件=2" in detail, detail
+

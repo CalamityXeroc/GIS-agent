@@ -17,9 +17,39 @@ gis-agent loop "把 county.shp 定义坐标系并投影到 CGCS2000 111E"
 # 启动时就把数据目录扫全（默认不扫，见下）
 gis-agent chat --refresh-catalog
 
+# 环境自检：arcpy 能不能 import、能不能真跑一行代码（--deep 连内核一起验）
+gis-agent doctor
+
 # 一键启动（Windows，自动装依赖并进入对话）
 一键启动.bat
 ```
+
+### 跑之前先体检：`doctor`
+
+```bash
+gis-agent doctor          # 7 项，约 10~20 秒
+gis-agent doctor --deep   # 额外启动一次持久内核
+```
+
+| 检查 | 判据 |
+|---|---|
+| `pro_installed` | 找到 ArcGIS Pro 的 python（环境变量 → 注册表 → 默认路径） |
+| `arcpy_importable` | 用那个 python 真的 `import arcpy` |
+| `pro_version` | ≥ 3.2 |
+| `deps` | 9 个核心包都能导入（失败时拼一条可直接复制的 `pip install`） |
+| `path_spaces` / `path_nonascii` | 工作目录与 Pro 环境路径无空格、纯 ASCII |
+| `kernel_start` | 持久内核能起来（仅 `--deep`） |
+
+**刻意不检查许可证**（既无用又冒犯），也不引导安装、不自动改环境。详见 [`p0-features.md`](p0-features.md)。
+
+### 计划卡：执行前先让你看懂
+
+首轮执行前会打印一张 5 行计划卡（做什么 / 用什么 / 输出 / 怎么验 / 合规）：
+
+- **TTY**：`s` 开始、`e` 改一句（改完重新渲染）、`q` 取消
+- **非 TTY / 脚本 / CI**：自动通过，但卡**照样打印**（日志里能看到当时判断）
+- 「用什么」从数据目录匹配而来，匹配不到就写「执行时先确认」，不编
+
 
 ### 启动为什么很快，以及数据目录何时扫
 

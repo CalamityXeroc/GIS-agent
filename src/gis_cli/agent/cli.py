@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -73,6 +74,7 @@ def chat(
     """交互式对话（新引擎）：工具动作/结果实时呈现，运行中可纠偏，Esc 中断。"""
     from .interactive import InteractiveChat
 
+    _startup_envcheck(workspace)
     chat_session = InteractiveChat(
         workspace=workspace,
         config=config,
@@ -383,15 +385,19 @@ def _run_engine_task(
     theme_mode: str = "system",
     no_color: bool = False,
     color: bool = False,
+    yes: bool = False,
 ) -> int:
     """Run one task with the new observe-decide-act engine.
 
-    渲染统一走 :mod:`gis_cli.ui`：启动横幅 → 工具动作/结果（可折叠）→ 验收 → 结果卡片 + 状态行。
+    渲染统一走 :mod:`gis_cli.ui`：启动横幅 → 计划卡 → 工具动作/结果（可折叠）→ 验收 → 结果卡片 + 状态行。
+
+    ``yes``：不等人确认计划卡（仍会打印）。非 TTY 下自动等同于 ``yes``。
     """
     from ..engine.runner import build_engine
     from ..ui import events as ui_events
     from ..ui import render as ui_render
     from ..ui import theme as ui_theme
+    from ..ui.plan_card import PlanGate, can_ask
 
     ui_console = ui_theme.make_console(theme_mode, no_color=no_color, color=True if color else None)
     ws = workspace or Path.cwd()
@@ -416,6 +422,10 @@ def _run_engine_task(
         elapsed = tracker.action_elapsed if name == "tool_result" else None
         ui_console.print(ui_render.render_unit(unit, elapsed=elapsed))
 
+    # 计划卡闸门：TTY 且没加 --yes 才真的停下来等人（其余只打印）。
+    # 判定必须在 ``status(Live)`` **之外**：Live 期间 ``sys.stdout`` 是 rich 的
+    # ``FileProxy``，``isatty()`` 恒为 False，真终端也会被误判成非交互（DAIR-37）。
+    interactive_ok = can_ask()
     with ui_console.status("[gis.dim]启动引擎（加载数据目录/内核）…[/]"):
         try:
             bundle = build_engine(
@@ -423,6 +433,8 @@ def _run_engine_task(
                 config_path=config,
                 refresh_catalog=refresh_catalog,
                 on_event=_on_event,
+                # 计划卡闸门：TTY 且没加 --yes 才真的停下来等人（其余只打印）
+                plan_gate=PlanGate(interactive=interactive_ok and not yes),
             )
         except Exception as exc:
             ui_console.print(Panel.fit(str(exc), title="引擎启动失败", border_style="red"))
@@ -489,6 +501,9 @@ def _run_engine_task(
     ui_console.print(ui_render.footer_text(tracker, width=ui_console.width))
 
     bundle.close()
+    if state.status == "cancelled":
+        # 用户主动取消不是失败：按中断码返回，别让 CI 把它当成任务出错
+        return 130
     return 0 if state.status == "completed" else 1
 
 
@@ -501,11 +516,124 @@ def loop(
     max_turns: int = typer.Option(0, "--max-turns", help="最大轮次（0 表示用配置默认值）"),
     theme: str = typer.Option("system", "--theme", help="配色：system（跟随终端）/ dark / light"),
     no_color: bool = typer.Option(False, "--no-color", help="关闭颜色（老终端或重定向到文件时用）"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="不等计划确认，直接开始（CI / 脚本用；计划卡照常打印）"),
 ):
     """使用新引擎（观察-决策-执行循环 + 代码自修复）执行 GIS 任务。"""
+    _startup_envcheck(workspace)
     raise typer.Exit(
-        code=_run_engine_task(task, workspace, config, refresh_catalog, max_turns, theme, no_color)
+        code=_run_engine_task(task, workspace, config, refresh_catalog, max_turns, theme, no_color, yes=yes)
     )
+
+
+# === 环境自检（doctor） ===
+
+#: 体检结果的展示标签。只有 ``fail`` 影响退出码。
+_DOCTOR_STATUS = {
+    "pass": ("通过", "green"),
+    "warn": ("注意", "yellow"),
+    "fail": ("失败", "red"),
+    "skip": ("跳过", "dim"),
+}
+
+
+def _render_doctor(report, title: str = "环境自检") -> Table:
+    """体检结果 → 表格。
+
+    建议单独一列而不是拼进详情：详情里有路径，路径里可能出现 ``[]``，
+    拼进 markup 会被 rich 当成标签吞掉。
+    """
+    table = Table(title=title, header_style="bold")
+    table.add_column("检查", no_wrap=True)
+    table.add_column("结果", no_wrap=True)
+    table.add_column("详情", overflow="fold")
+    table.add_column("建议", overflow="fold")
+    for check in report.checks:
+        label, style = _DOCTOR_STATUS.get(check.status, (check.status, "white"))
+        table.add_row(check.id, f"[{style}]{label}[/]", check.detail, check.hint or "")
+    return table
+
+
+def _print_doctor_summary(report) -> None:
+    style = "green" if report.ok else "red"
+    console.print(Text(report.summary, style=style))
+    console.print(Text(f"用时 {report.elapsed_seconds:.1f}s", style="dim"))
+
+
+def _startup_envcheck(workspace: Optional[Path]) -> None:
+    """启动时的轻量体检：**只在有问题时说话**。
+
+    外行不会主动敲 ``doctor``，他们只会在第一次任务失败时看到一堆看不懂的报错；
+    所以在 chat/loop 启动前先花约 0.6s 判一次"缺不缺"，缺了就用同一套人话报告
+    说清楚。这里不做真实 arcpy 导入（本机实测 10.7s，不能加到每次启动上）。
+
+    自检自身出错时静默放过：诊断工具不能拦住主流程。
+    """
+    try:
+        from ..envcheck import run_startup_checks
+
+        report = run_startup_checks(workspace=workspace)
+    except Exception:
+        return
+    if report.ok:
+        return
+    console.print(_render_doctor(report, title="环境自检：发现问题，任务可能跑不起来"))
+    console.print(
+        Text(
+            "完整检查：gis-agent doctor    装齐依赖：gis-agent doctor --fix-install",
+            style="dim",
+        )
+    )
+
+
+@app.command("doctor")
+def doctor_cmd(
+    as_json: bool = typer.Option(False, "--json", help="机器可读输出（CI 用）"),
+    deep: bool = typer.Option(False, "--deep", help="额外跑持久内核启动检查（多花约 20 秒）"),
+    fix_install: bool = typer.Option(
+        False, "--fix-install", help="把本包装进探测到的 arcgispro-py3，然后重新体检"
+    ),
+):
+    """体检本机环境：arcpy 能不能 import、能不能真跑一行代码。
+
+    退出码：0 全部 pass/warn；1 有 fail；2 doctor 自己崩了。
+    """
+    from ..envcheck import fix_install as run_fix_install
+    from ..envcheck import run_checks
+
+    try:
+        if fix_install:
+            outcome = run_fix_install()
+            if as_json:
+                # stdout 只留 JSON 契约，人看的进度走 stderr
+                typer.echo(outcome.detail, err=True)
+                if outcome.output:
+                    typer.echo(outcome.output, err=True)
+            else:
+                title = "安装依赖" if outcome.ok else "安装失败"
+                console.print(Panel.fit(Text(outcome.detail), title=title))
+                if outcome.output:
+                    console.print(Text(outcome.output, style="dim"))
+        report = run_checks(deep=deep)
+    except Exception as exc:  # doctor 自身崩了 → 退出码 2，别伪装成"环境有问题"
+        if as_json:
+            typer.echo(
+                json.dumps(
+                    {"ok": False, "summary": f"doctor 自身崩溃：{exc}", "checks": []},
+                    ensure_ascii=True,
+                    indent=2,
+                )
+            )
+        else:
+            console.print(Panel.fit(Text(f"doctor 自身崩溃：{exc}"), title="自检失败"))
+        raise typer.Exit(code=2)
+
+    if as_json:
+        # ensure_ascii=True：中文路径在 GBK 控制台会被替换成 ?，JSON 也就废了。
+        typer.echo(json.dumps(report.to_dict(), ensure_ascii=True, indent=2))
+    else:
+        console.print(_render_doctor(report))
+        _print_doctor_summary(report)
+    raise typer.Exit(code=report.exit_code)
 
 
 def main():

@@ -63,6 +63,16 @@ class LoopConfig:
     # 整跑截止时间：网关半死不活时，单轮 LLM 调用可能反复重试几十分钟，
     # 若无总截止，一次 run 会整夜空转（实测 11.7h/22 轮）。到时后置 deadline_exceeded。
     run_deadline_seconds: float = 7200.0
+    #: 执行前打印 5 行计划卡（P0-3）。非交互时只打印不拦截；闸门由调用方注入。
+    plan_card: bool = True
+    #: 计划卡上的合规标记。只写提示，不做判定（判定在 P1）。
+    plan_compliance: str = "未送审，仅内部使用（不做合规判定）"
+    #: 「e 修改」最多改几轮：改到第 3 次还在改，说明该重新描述任务，不是改卡。
+    plan_max_revisions: int = 3
+
+    #: 验收通过后自动生成成果包（单文件 HTML + PDF，P0-4）。
+    #: 关掉只影响成果包，不影响验收与产物登记。
+    report_enabled: bool = True
 
 
 _DIAGNOSIS_TOOLS = {"catalog_query", "read_document", "list_recipes"}
@@ -92,6 +102,7 @@ class AgentLoop:
         use_project_log: bool = True,
         catalog_prewarmer: Any = None,
         should_stop: Callable[[], bool] | None = None,
+        plan_gate: Any = None,
     ):
         self.workspace = Path(workspace)
         self.llm = llm_client
@@ -111,6 +122,9 @@ class AgentLoop:
         self.catalog_prewarmer = catalog_prewarmer
         #: 外部停止条件（子代理用它继承父的「用户中断」）。每轮开头检查一次。
         self.should_stop = should_stop
+        #: 计划卡确认闸门（``ui.plan_card.PlanGate`` 之类，只要实现 ``ask(card)``）。
+        #: ``None`` = 只打印计划卡、不等人（子代理与无头调用走这条路）。
+        self.plan_gate = plan_gate
         #: ``run()`` 的持久化开关：子代理只留 trace，不写 runs/ 与项目日志。
         self._persist_state = True
         self._hints_seen: list[str] = []
@@ -198,11 +212,35 @@ class AgentLoop:
         # 数据目录后台扫描：与首轮模型调用重叠（启动时不扫，界面才能立刻可用）。
         # 先启动再拼 system prompt：摘要里能如实写上“正在扫描”，
         # 真正的数据由 catalog_query 工具在需要时等扫描完再给。
-        self._start_catalog_prewarm()
+        self._start_catalog_prewarm(kernel=False)
+
+        # 执行前先给人看一张 5 行计划卡（P0-3）：非交互只打印，TTY 等人确认。
+        # 放在目录扫描之后：“用什么”才能列到刚扫出来的数据集；
+        # 内核先不预热——用户按 q 取消时不该白起一次内核（实测 12~17s）。
+        if not self._confirm_plan_or_continue(goal, doc_paths):
+            self.state.status = "cancelled"
+            self.state.error = "计划未确认（用户取消）"
+            self.recorder.record("plan_cancelled", {"reason": self.state.error})
+            self._emit("plan_cancelled", {"reason": self.state.error})
+            self._finalize()
+            return self.state
+
+        self._start_catalog_prewarm()  # 计划已确认：现在才预热内核（扫描幂等，不会重跑）
+
         self._messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": self._initial_user_message(goal, doc_paths)},
         ]
+        # messages 在**计划确认之后**才拼：`e` 改的那一句已并回 state.requirements，
+        # system prompt 会照 requirements_digest() 的口径带上去。留一条 trace，
+        # 事后能核实“模型当时看到的到底是哪一版需求”。
+        self.recorder.record(
+            "system_prompt",
+            {
+                "chars": len(self._messages[0]["content"]),
+                "requirements": self.state.requirements_digest(),
+            },
+        )
         self._deadline = (
             time.monotonic() + self.config.run_deadline_seconds
             if self.config.run_deadline_seconds and self.config.run_deadline_seconds > 0
@@ -744,6 +782,7 @@ class AgentLoop:
 
         if verdict.get("pass"):
             self.state.status = "completed"
+            self._build_deliverables(verdict)
             prefix = "验收降级通过" if verdict.get("degraded") else "验收通过"
             return (
                 Observation(
@@ -767,6 +806,43 @@ class AgentLoop:
             hint=str(verdict.get("repair_hint", "") or ""),
         )
         return feedback, False
+
+    # ------------------------------------------------------------ deliverables
+    def _build_deliverables(self, verdict: dict[str, Any]) -> None:
+        """验收通过后生成单文件成果包（P0-4 步 d）。
+
+        放在验收**之后**：报告里的"验证"段要写验收结论，提前生成只能是空的。
+        任何失败都只记日志，不影响交付状态 —— 成果包是附加物。
+        """
+        if not getattr(self.config, "report_enabled", True) or self.state is None:
+            return
+        try:
+            from ..report import build_deliverables
+
+            result = build_deliverables(
+                workspace=self.workspace,
+                state=self.state,
+                verdict=verdict,
+                catalog=self.catalog,
+                code_runner=getattr(self.context, "code_runner", None),
+                trace_path=getattr(self.recorder, "jsonl_path", None),
+                recipes=self.recipes,
+            )
+        except Exception as exc:  # pragma: no cover - 成果包不能拖垮交付
+            logger.warning("成果包生成失败（不影响交付）: %s", exc)
+            return
+        if not result.paths:
+            return
+        for path in result.paths:
+            self.state.add_artifact(path)
+        payload = {
+            "files": result.paths,
+            "layers": result.layers,
+            "images": result.images,
+            "notes": result.notes,
+        }
+        self.recorder.record("deliverables", payload)
+        self._emit("deliverables", payload)
 
     # ------------------------------------------------------------ requirements
     @staticmethod
@@ -817,6 +893,183 @@ class AgentLoop:
         except Exception as exc:
             logger.warning("requirement extraction error: %s", exc)
             return []
+
+    # ------------------------------------------------------------ plan card
+    def _plan_records(self) -> tuple[list[Any], int]:
+        """给计划卡用的数据目录记录与登记总数（拿不到就空——计划卡不能拦住主流程）。"""
+        if self.catalog is None:
+            return [], 0
+        try:
+            prewarmer = self.catalog_prewarmer
+            if prewarmer is not None and getattr(prewarmer, "busy", False):
+                # 目录还在后台扫：最多等 3 秒。计划卡要的是“已登记”，
+                # 不是“扫完”；为了它把启动拖住比少列两个数据集更亏。
+                prewarmer.wait_ready(timeout=3.0)
+            records = list(self.catalog.list_datasets(limit=200) or [])
+        except Exception as exc:
+            logger.warning("plan card catalog read failed: %s", exc)
+            records = []
+        registered = 0
+        counter = getattr(self.catalog, "counts", None)
+        if callable(counter):
+            try:
+                registered = sum(int(n) for n in (counter() or {}).values())
+            except Exception:  # pragma: no cover - 计数失败就退回列表长度
+                registered = 0
+        return records, registered
+
+    def _build_plan_card(self, goal: str, *,
+                         requirements: list[Requirement] | None = None,
+                         revisions: list[str] | None = None) -> Any:
+        """按当前需求清单重建计划卡（纯渲染，不调模型）。"""
+        from ..ui.plan_card import build_plan_card
+
+        records, registered = self._plan_records()
+        return build_plan_card(
+            goal,
+            requirements if requirements is not None else list(self.state.requirements),
+            records,
+            workspace=self.workspace,
+            revisions=revisions or [],
+            compliance=self.config.plan_compliance,
+            registered=registered or None,
+        )
+
+    def _revise_plan(
+        self, goal: str, revision: str, doc_paths: list[str] | None
+    ) -> list[Requirement]:
+        """把用户的一句话改动并回需求清单（重抽一次；失败就当成一条新需求）。"""
+        amended = f"{goal}\n\n## 用户修正（以此为准）\n{revision}"
+        revised: list[Requirement] = []
+        if self.auto_extract_requirements:
+            revised = self._extract_requirements(amended, doc_paths)
+        if not revised:
+            revised = list(self.state.requirements)
+            revised.append(
+                Requirement(
+                    id=f"user{len(revised) + 1}",
+                    text=revision,
+                    acceptance="",
+                    source="user",
+                )
+            )
+        return revised
+
+    def _confirm_plan(self, goal: str, doc_paths: list[str] | None) -> bool:
+        """执行前发计划卡并等确认。返回 False = 用户取消，不该继续跑。
+
+        非交互（或没注入闸门）时只发事件／记 trace，不读 stdin：CI 与脚本
+        不能因为一张卡片而挂住。
+        """
+        if not self.config.plan_card:
+            return True
+
+        card = self._build_plan_card(goal)
+        revisions: list[str] = []
+        interactive = bool(getattr(self.plan_gate, "interactive", False))
+        max_rounds = max(1, int(self.config.plan_max_revisions))
+        shown = False
+
+        for round_no in range(1, max_rounds + 1):
+            self._emit_plan_card(card, interactive=interactive, round_no=round_no)
+            shown = True
+
+            if self.plan_gate is None:
+                return True
+            # chat 的闸门会真的挂起（引擎线程不读 stdin）：把暂停态同时写进
+            # state 与 trace，界面/trace 都能回答“这次 run 在计划卡上等过”。
+            pausing = bool(getattr(self.plan_gate, "pauses", False))
+            try:
+                if pausing:
+                    self._enter_plan_pending(round_no, card)
+                decision = self.plan_gate.ask(card)
+            except Exception as exc:  # 闸门炸了不能把任务拖死（stdin 已关闭等）
+                logger.warning("plan gate failed (continuing): %s", exc)
+                self._emit("plan_card_auto_start", {"reason": f"计划确认不可用（{exc}），直接开始"})
+                return True
+            finally:
+                if pausing:
+                    self._leave_plan_pending()
+            action = str(getattr(decision, "action", "start") or "start")
+            revision = str(getattr(decision, "text", "") or "").strip()
+            self.recorder.record("plan_decision", {"round": round_no, "action": action, "text": revision})
+            if action == "cancel":
+                logger.info("plan card cancelled by user")
+                return False
+            if action != "revise":
+                return True
+
+            if not revision:
+                return True
+            revised = self._revise_plan(goal, revision, doc_paths)
+            if revised:
+                self.state.requirements = list(revised)
+            revisions.append(revision)
+            self.recorder.record(
+                "plan_revised",
+                {"revision": revision, "requirements": self.state.requirements_digest()},
+            )
+            card = self._build_plan_card(goal, revisions=revisions)
+            shown = False
+
+        # 改到轮次上限还在改：按最后一版开始。最后一版没展示过就先发出去，
+        # 否则跑的是一个用户没看过的计划。
+        if not shown:
+            self._emit_plan_card(card, interactive=False, round_no=max_rounds + 1)
+        self._emit(
+            "plan_card_auto_start",
+            {"reason": f"已修改 {len(revisions)} 次，按当前计划开始"},
+        )
+        return True
+
+    def _enter_plan_pending(self, round_no: int, card: Any) -> None:
+        """进入 ``plan_pending`` 暂停态：run 停在计划闸门上。
+
+        这里只改状态与 trace；**不读 stdin**。读键的是 UI 线程（chat 的
+        prompt_toolkit 会话），引擎线程停在闸门自己的 Event 上。
+        """
+        if self.state is None:
+            return
+        self.state.status = "plan_pending"
+        self.recorder.record("plan_pending", {"round": round_no, "text": card.render(interactive=True)})
+        self._emit("plan_pending", {"round": round_no})
+
+    def _leave_plan_pending(self) -> None:
+        """离开暂停态（没进过就什么都不做）。
+
+        本方法在 ``finally:`` 里调，所以**自己绝不能抛**：这里冒出的异常会顶掉
+        刚刚拿到的答复，外层按“计划卡出错 → 当作已确认”继续 —— 用户按的 ``q``
+        就被静默改成了 start（DAIR-38）。发事件失败只记日志，状态复位照旧。
+        """
+        if self.state is not None and self.state.status == "plan_pending":
+            self.state.status = "running"
+        try:
+            self._emit("plan_decided", {})
+        except Exception as exc:  # pragma: no cover - 防御性
+            logger.warning("plan_decided emit failed (decision kept): %s", exc)
+
+    def _emit_plan_card(self, card: Any, *, interactive: bool, round_no: int) -> None:
+        """发一张计划卡（事件 + trace 同源，事后能回答“当时确认的是什么”）。"""
+        payload = card.to_dict()
+        payload["text"] = card.render(interactive=interactive)
+        payload["round"] = round_no
+        self.recorder.record("plan_card", payload)
+        self._emit("plan_card", payload)
+
+    def _confirm_plan_or_continue(self, goal: str, doc_paths: list[str] | None) -> bool:
+        """计划卡永远不能拦住任务：自身出错就当“已确认”继续。
+
+        fail-open 也要**看得见**（与内层闸门失败一致：trace 一条 + 屏幕一条），
+        否则“计划卡被跳过了”只能去翻日志文件才知道（DAIR-38）。
+        """
+        try:
+            return self._confirm_plan(goal, doc_paths)
+        except Exception as exc:  # pragma: no cover - 防御性
+            logger.warning("plan card failed (continuing): %s", exc)
+            if self.recorder is not None:
+                self.recorder.record("plan_card_failed", {"error": str(exc)[:500]})
+            self._emit("plan_card_auto_start", {"reason": f"计划卡出错（{exc}），直接开始"})
+            return True
 
     # ------------------------------------------------------------- messages
     # ------------------------------------------------------------ error memory
@@ -1315,13 +1568,16 @@ class AgentLoop:
                 safe[key] = value
         return safe
 
-    def _start_catalog_prewarm(self) -> None:
+    def _start_catalog_prewarm(self, *, kernel: bool = True) -> None:
         """启动后台预热：数据目录扫描 + 内核启动（幂等；无预热器时只起内核）。
 
         两者都是"用户已经发了任务、但还没用到"的资源：
         - 目录扫描：与首轮 LLM 调用重叠；
         - 内核启动（实测 11.6~17.6s，大头是 import arcpy）：与两者重叠，
           这样第一个 execute_code 到达时内核已经就绪。
+
+        ``kernel=False``：只扫地目录。计划卡要在扫描后建（才有“用什么”），
+        但卡没确认前用户随时可能取消，那时起内核就是白烧。
         """
         if self.catalog_prewarmer is not None:
             try:
@@ -1330,7 +1586,7 @@ class AgentLoop:
                     self.recorder and self.recorder.record("catalog_scan", {"state": "started"})
             except Exception as exc:  # pragma: no cover - 扫描失败不影响任务
                 logger.warning("catalog prewarm start failed: %s", exc)
-        if self.code_runner is not None and hasattr(self.code_runner, "prewarm"):
+        if kernel and self.code_runner is not None and hasattr(self.code_runner, "prewarm"):
             try:
                 self.code_runner.prewarm()
             except Exception as exc:  # pragma: no cover - 预热失败不影响任务

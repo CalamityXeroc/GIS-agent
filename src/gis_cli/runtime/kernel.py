@@ -97,7 +97,7 @@ import builtins as _bi
 import os as _os
 # 内核进程的启动目录：只在这里捕获一次（_cwd_launch 是常量，不会漂移）。
 # 以前每次 execute 都 getcwd()，上一次异常把 cwd 留在工作区里，
-# 恢复目标就永久挪一格，再也回不到启动目录（实测）。
+# 恢复目标就永久挪一格，再也回不到启动目录（DAIR-13）。
 _cwd_launch = _os.getcwd()
 {_RESULT_VAR} = None
 

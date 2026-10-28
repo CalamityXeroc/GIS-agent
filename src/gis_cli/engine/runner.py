@@ -222,11 +222,14 @@ def build_engine(
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
     verbose: bool = False,
     engine_overrides: dict[str, Any] | None = None,
+    plan_gate: Any = None,
 ) -> EngineBundle:
     """Assemble the engine and optionally warm the catalog.
 
-    ``engine_overrides`` 允许调用方（如跨模型基准）按任务覆盖 engine 段配置，
+    ``engine_overrides`` 允许调用方（如 benchmark runner）按任务覆盖 engine 段配置，
     例如用任务 YAML 的 ``timeout_seconds`` 覆盖 ``run_deadline_seconds``。
+    ``plan_gate`` 是执行前的计划卡闸门（``ui.plan_card.PlanGate``）：
+    留 ``None`` = 只打印计划卡、不等输入（子代理 / benchmark 走这条路）。
     """
     from ..datacatalog.scanner import refresh_catalog as do_refresh
     from ..datacatalog.store import Catalog
@@ -311,6 +314,7 @@ def build_engine(
         max_diagnosis_turns=int(engine_cfg.get("exploration_turn_budget", 3)),
         escalate_after_failures=int(engine_cfg.get("escalate_after_failures", 2)),
         run_deadline_seconds=float(engine_cfg.get("run_deadline_seconds", 7200)),
+        report_enabled=bool(engine_cfg.get("report_enabled", True)),
         verbose=verbose,
     )
 
@@ -336,6 +340,7 @@ def build_engine(
         on_event=on_event,
         auto_extract_requirements=bool(engine_cfg.get("auto_extract_requirements", True)),
         catalog_prewarmer=prewarmer,
+        plan_gate=plan_gate,
     )
     context.state = loop.state  # updated per run in loop.run
 

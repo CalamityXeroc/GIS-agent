@@ -34,7 +34,7 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "gis_cli"
 #: 新引擎各模块目录（相对 src/gis_cli）。这些目录下的代码必须在
 #: "只有 rich/openai/prompt-toolkit/jupyter-client/pillow/numpy/typer/pydantic"
 #: 的环境里也能 import。
-ENGINE_DIRS = ("engine", "runtime", "ui", "cartography", "datacatalog", "trace", "recipes", "requirements")
+ENGINE_DIRS = ("engine", "runtime", "ui", "cartography", "datacatalog", "trace", "recipes", "requirements", "envcheck", "report")
 
 #: 只被旧引擎使用的重包（新引擎不得 import）。
 LEGACY_ONLY = {

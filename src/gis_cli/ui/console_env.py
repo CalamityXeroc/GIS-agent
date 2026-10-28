@@ -127,11 +127,38 @@ def terminal_family() -> str:
     return "unknown"
 
 
-def _stdout_is_tty() -> bool:
+def stdout_is_tty() -> bool:
+    """当前 stdout 是不是终端。
+
+    ``rich`` 的 ``Live``/``status()`` 会把 ``sys.stdout`` 换成 ``FileProxy``（退出
+    ``with`` 才恢复），而它继承 ``io.TextIOBase``、``isatty()`` 恒为 False。不先解
+    代理，凡是在 Live 内部判定的“这是不是终端”都会被带偏（DAIR-37/38）。
+
+    这是**唯一**一份实现：``ui/prompt.py`` 与 ``ui/plan_card.py`` 都转调这里，
+    免得日后只修一边。
+    """
     try:
-        return bool(sys.stdout.isatty())
+        stream = getattr(sys.stdout, "rich_proxied_file", sys.stdout)
+        return bool(stream.isatty())
     except Exception:
         return False
+
+
+def stdin_is_tty() -> bool:
+    """当前 stdin 是不是终端。"""
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:  # pragma: no cover - 极端环境
+        return False
+
+
+def interactive_terminal() -> bool:
+    """能不能真的停下来问人：stdin **和** stdout 都是终端。
+
+    只看 stdin 会漏掉 ``gis-agent loop "…" | tee run.log`` 这类用法：提示进了管道，
+    屏幕上什么都没有，人不知道要按 Enter，进程就默默卡在那里。
+    """
+    return stdin_is_tty() and stdout_is_tty()
 
 
 def force_color_requested() -> bool:
@@ -154,7 +181,7 @@ def ansi_ok() -> bool:
     """
     if plain_requested():
         return False
-    if not _stdout_is_tty():
+    if not stdout_is_tty():
         return False
     if force_color_requested():
         return True

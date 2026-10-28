@@ -15,7 +15,34 @@ CI 只跑 ``pytest -m "not arcpy"``（见 .github/workflows/ci.yml）。带 arcp
 
 from __future__ import annotations
 
+import io
+import sys
+
 import pytest
+
+
+class FakeTTY(io.StringIO):
+    """可写、且自称是终端的字符流：给“真终端语义”的用例当 conhost 的无头替身。"""
+
+    def isatty(self) -> bool:
+        return True
+
+
+@pytest.fixture()
+def install_fake_tty(monkeypatch):
+    """返回一个“把当前进程换成真终端语义”的函数（**在用例体里**调用）。
+
+    pytest 的 fd 捕获会在 fixture 跑完之后重设 ``sys.stdout``，所以只能在用例体里
+    才 patch；返回值是新的 ``sys.stdout``。
+    """
+
+    def _install():
+        monkeypatch.setattr(sys, "stdin", FakeTTY())
+        out = FakeTTY()
+        monkeypatch.setattr(sys, "stdout", out)
+        return out
+
+    return _install
 
 #: 需要 ArcGIS（arcpy）的测试文件。
 #:

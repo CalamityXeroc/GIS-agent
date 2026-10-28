@@ -417,3 +417,131 @@ def test_publish_creates_missing_output_directory(tmp_path):
 
     assert _publish(str(source), str(target)) == str(target)
     assert target.read_bytes() == b"jpg"
+
+
+def test_unique_class_labels_drop_raw_floats_and_match_legend_entries():
+    """回归：unique 模式的类名不能把字段原始浮点写进图例。
+
+    实测（DAIR-32 基准 4a）：``create_map(mode="unique", field="FROM_YEAR")`` 的
+    唯一值渲染器把 ``DIST_M`` 的原始浮点当类名，交付的 .aprx 图例里是
+    ``193833.858800001``，``map_layout_ok`` 断言（legend_labels_unrounded）判不通过。
+    """
+    from gis_cli.cartography.apply import _apply_unique
+
+    class _Symbol:
+        color = None
+
+    class _Item:
+        def __init__(self, value):
+            self.values = [(value, str(value))]
+            self.label = str(value)
+            self.symbol = _Symbol()
+
+    class _Group:
+        def __init__(self, items):
+            self.items = items
+
+    class _Renderer:
+        def __init__(self, items):
+            self.groups = [_Group(items)]
+            self.fields = None
+
+    class _Symbology:
+        def __init__(self, items):
+            self.renderer = _Renderer(items)
+
+        def updateRenderer(self, name):
+            self.updated = name
+
+    class _Layer:
+        def __init__(self, items):
+            self.symbology = _Symbology(items)
+
+    layer = _Layer([_Item(193833.858800001), _Item(1982), _Item("水田")])
+    spec = {"renderer": {
+        "mode": "unique", "field": "FROM_YEAR", "nodata_color": "#E8E8E8",
+        "category_colors": "193833.858800001:#E8E8E8", "legend_entries": [],
+    }}
+    notes: list[str] = []
+    _apply_unique(layer, spec, notes)
+
+    items = layer.symbology.renderer.groups[0].items
+    labels = [item.label for item in items]
+    assert labels == ["193,834", "1982", "水田"]
+    # 类名与图例条目走同一个显示文本（不然 ArcGIS 原生图例与叠加重绘又是两个结论）
+    assert [entry["label"] for entry in spec["renderer"]["legend_entries"]] == labels
+    # 原始浮点不许残留在图例条目 / 类名 / notes 里
+    assert "193833.858800001" not in json.dumps(spec["renderer"]["legend_entries"], ensure_ascii=False)
+    assert "193833.858800001" not in " ".join(notes)
+    # 配色仍按**原始值**查表（模型给的 category_colors 是按原始值写的）
+    assert items[0].symbol.color == {"RGB": [232, 232, 232, 100]}
+
+
+def test_unique_class_labels_respect_category_names():
+    """给了 category_names 就用它（编码→名称），不再走数值格式化。"""
+    from gis_cli.cartography.apply import _apply_unique
+
+    class _Symbol:
+        color = None
+
+    class _Item:
+        def __init__(self, value):
+            self.values = [(value, str(value))]
+            self.label = str(value)
+            self.symbol = _Symbol()
+
+    class _Group:
+        def __init__(self, items):
+            self.items = items
+
+    class _Renderer:
+        def __init__(self, items):
+            self.groups = [_Group(items)]
+            self.fields = None
+
+    class _Symbology:
+        def __init__(self, items):
+            self.renderer = _Renderer(items)
+
+        def updateRenderer(self, name):
+            self.updated = name
+
+    class _Layer:
+        def __init__(self, items):
+            self.symbology = _Symbology(items)
+
+    layer = _Layer([_Item(1), _Item(2)])
+    spec = {"renderer": {
+        "mode": "unique", "field": "LC", "category_names": "1:水域;2:林地",
+        "category_colors": "1:#1F77B4;2:#2CA02C", "legend_entries": [],
+    }}
+    _apply_unique(layer, spec, [])
+    assert [item.label for item in layer.symbology.renderer.groups[0].items] == ["水域", "林地"]
+    assert [entry["label"] for entry in spec["renderer"]["legend_entries"]] == ["水域", "林地"]
+
+
+def test_class_label_keeps_codes_and_rounds_measurements():
+    """类名格式化：编码/年份不动，测量值去噪声（不能把 110101 取成 110,000）。"""
+    from gis_cli.cartography.apply import _category_label
+
+    assert _category_label("110101") == "110101"
+    assert _category_label("1982") == "1982"
+    assert _category_label("193833.858800001") == "193,834"
+    assert _category_label("0.123456") == "0.12"
+    assert _category_label("1.5") == "1.5"
+    assert _category_label("水田") == "水田"
+    assert _category_label("") == ""
+
+
+def test_qc_categorical_labels_only_reject_raw_floats():
+    """分类图例（unique）只判“有没有原始浮点”，不判“是不是整齐数值”。
+
+    DAIR-32 实测：图例里 ``193833.858800001`` 必须判负；而编码 110101、取值 1.2
+    这类**合法的类别名**不能被“整齐数值”口径误杀（否则体检不阻断后会卡死交付）。
+    """
+    from gis_cli.cartography.qc import _categorical_labels_detail
+
+    ok, detail = _categorical_labels_detail(["193833.858800001"])
+    assert ok is False and "193833.858800001" in detail
+    for labels in (["1982", "1993"], ["110101", "110102"], ["1.2", "2.5"], ["水域", "林地"]):
+        assert _categorical_labels_detail(labels)[0] is True, labels

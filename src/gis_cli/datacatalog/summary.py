@@ -82,6 +82,11 @@ def record_to_line(record: DatasetRecord, *, max_fields: int = 24, with_samples:
             parts.append(" ".join(bits))
     if record.extent:
         parts.append(f"ext={_fmt_extent(record.extent)}")
+    # 来源与许可（P0-2）：默认值不占篇幅，只有接入时登记过才显示。
+    if record.source and record.source != "local":
+        parts.append(f"src={record.source}")
+    if record.license and record.license != "unknown":
+        parts.append(f"lic={record.license}")
     parts.append(f"path={record.path}")
 
     lines = ["  " + ", ".join(parts)]
@@ -195,4 +200,7 @@ def record_to_dict(record: DatasetRecord) -> dict[str, Any]:
         "fields": record.fields,
         "raster": record.raster,
         "extra": record.extra,
+        "source": record.source,
+        "license": record.license,
+        "acquired_at": record.acquired_at,
     }

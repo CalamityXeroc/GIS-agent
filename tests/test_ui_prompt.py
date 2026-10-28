@@ -8,6 +8,7 @@ Enter 提交、Alt+Enter/Ctrl+J 换行、Ctrl+C 清空或抛出、补全内容�
 from __future__ import annotations
 
 import io
+import sys
 from pathlib import Path
 
 import pytest
@@ -533,3 +534,28 @@ def test_fallback_read_when_prompt_toolkit_missing(monkeypatch):
 def test_available_reports_import_state():
     assert ui_prompt.available() is True  # 本文件已 importorskip
     assert isinstance(ui_prompt.import_error(), str)
+
+
+# ------------------------------------------------- rich Live 的 stdout 代理（DAIR-37）
+
+
+def test_interactive_terminal_survives_live_status_proxy(install_fake_tty):
+    """``Console.status()`` 内部也得认得出终端：rich 期间 stdout 是 FileProxy。
+
+    真 conhost 上 ``ChatPlanGate`` 靠这条判定决定要不要停下来等人；而 ``FileProxy``
+    继承 ``io.TextIOBase``（``isatty()`` 恒为 False），不解代理就会把真终端判成
+    非交互 —— 计划卡从不暂停（DAIR-37）。
+    """
+    from rich.console import Console
+
+    fake_out = install_fake_tty()
+    assert fake_out.isatty() is True
+    assert ui_prompt.interactive_terminal() is True  # 前提：外层确实是终端
+
+    console = Console(file=io.StringIO(), width=100, no_color=True, force_terminal=True)
+    with console.status("启动引擎…"):
+        assert type(sys.stdout).__name__ == "FileProxy", "前提：Live 期间 stdout 真的被代理了"
+        assert ui_prompt.interactive_terminal() is True, "Live 内部不得把终端判成非交互"
+
+    assert ui_prompt.interactive_terminal() is True  # 退出 with 后恢复
+    assert fake_out.isatty() is True

@@ -151,7 +151,7 @@ def test_result_tail_clears_after_reading():
 
 
 def test_execute_chdirs_to_workspace_and_restores(tmp_path, monkeypatch):
-    """CWD 跟着工作区走，且**无论成败**都回到启动目录（实测）。
+    """CWD 跟着工作区走，且**无论成败**都回到启动目录（DAIR-12/13）。
 
     真执行拼装出来的语句（不只断言字符串在不在）：
 
@@ -208,7 +208,7 @@ def test_execute_chdirs_to_workspace_and_restores(tmp_path, monkeypatch):
 
 
 def test_failed_execute_sends_cwd_repair(tmp_path):
-    """用户代码抛异常会让 cell 中断，cwd 停在工作区 —— 错误路径必须补一趟归位（实测）。
+    """用户代码抛异常会让 cell 中断，cwd 停在工作区 —— 错误路径必须补一趟归位（DAIR-13）。
 
     以前这个归位语句拼在用户代码后面，cell 一中断它根本不执行；
     而且每次 execute 都 getcwd() 当恢复目标，失败一次就永久挪一格。

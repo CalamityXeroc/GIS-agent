@@ -399,7 +399,7 @@ def test_vision_follows_model_capability(tmp_path: Path):
 
 
 def test_degrade_requires_same_requirement_failures(tmp_path: Path):
-    """两次拒绝失败的是**不同需求**，不是“同一理由”，不许降级（实测踩过）。"""
+    """两次拒绝失败的是**不同需求**，不是“同一理由”，不许降级（DAIR-6 阻塞项 1）。"""
     verdicts = [
         {"pass": False, "summary": "缺直方图", "missing": [],
          "semantic": {"per_requirement": [{"id": "R1", "status": "FAIL"}]}},

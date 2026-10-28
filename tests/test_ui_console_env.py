@@ -13,6 +13,7 @@ ConEmu / mintty 等）才自动上色；用户可用 ``--color`` / ``GIS_AGENT_F
 from __future__ import annotations
 
 import io
+import sys
 
 import pytest
 from rich.console import Console as RichConsole
@@ -58,13 +59,13 @@ class FakeTTY(io.StringIO):
 def tty(monkeypatch):
     """冒充"真实终端"。
 
-    同时打两个位置：``sys.stdout``（真实路径）与 ``console_env._stdout_is_tty``
+    同时打两个位置：``sys.stdout``（真实路径）与 ``console_env.stdout_is_tty``
     （自有的判定接缝）—— pytest 的输出捕获会在 fixture 之后重新绑定 stdout，
     只打 sys.stdout 会不稳定（实测只在 -s 下通过）。
     """
     stream = FakeTTY()
     monkeypatch.setattr("sys.stdout", stream)
-    monkeypatch.setattr(console_env, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(console_env, "stdout_is_tty", lambda: True)
     return stream
 
 
@@ -101,7 +102,7 @@ def test_no_color_disables(clean_env, tty):
 
 
 def test_not_tty_never_colors(clean_env, monkeypatch):
-    monkeypatch.setattr(console_env, "_stdout_is_tty", lambda: False)
+    monkeypatch.setattr(console_env, "stdout_is_tty", lambda: False)
     monkeypatch.setenv("GIS_AGENT_FORCE_COLOR", "1")
     assert console_env.ansi_ok() is False  # 重定向到文件时连强制也不给颜色码
 
@@ -200,6 +201,47 @@ def test_configure_stdio_uses_utf8_console(clean_env, monkeypatch):
     monkeypatch.setattr("sys.stderr", FakeStream())
     assert console_env.configure_stdio()["encoding"] == "utf-8"
     assert out.kwargs.get("encoding") == "utf-8"
+
+
+def test_prompt_toolkit_missing_only_blocks_the_chat_gate(install_fake_tty, monkeypatch):
+    """真终端但 prompt_toolkit 缺失：chat 的输入框起不来，loop 的 ``input()`` 照旧可问。
+
+    两套 helper 以前各写一份 ``isatty()``；现在判定收口在 ``console_env``，
+    这里把**唯一允许的分歧**（要不要 prompt_toolkit）锁成用例（DAIR-38）。
+    """
+    from gis_cli.ui import plan_card, prompt
+
+    install_fake_tty()
+    monkeypatch.setattr(prompt, "_PT_AVAILABLE", False)
+
+    assert prompt.interactive_terminal() is False, "chat 的输入框本体是 PromptSession"
+    assert plan_card.can_ask() is True, "loop 的 PlanGate 读 input()，不需要 prompt_toolkit"
+
+
+def test_install_fake_tty_does_not_leak_between_cases():
+    """假终端必须随用例结束还原：随机顺序（``-p randomly``）下不能漏给下一案。"""
+    assert type(sys.stdin).__name__ != "FakeTTY"
+    assert type(sys.stdout).__name__ != "FakeTTY"
+
+
+def test_tty_check_is_one_implementation(install_fake_tty):
+    """三条路径（console_env / plan_card / prompt）共用一份 tty 判定，包括解 rich 代理。
+
+    Live 期间 ``sys.stdout`` 是 ``FileProxy``（``isatty()`` 恒为 False）；解代理只写在
+    ``console_env`` 一处，所以这里三处都得认得终端（DAIR-38）。
+    """
+    from gis_cli.ui import plan_card, prompt
+
+    install_fake_tty()
+    assert console_env.interactive_terminal() is True
+    assert plan_card.can_ask() is True
+    assert prompt.interactive_terminal() is prompt.available()
+
+    console = RichConsole(file=io.StringIO(), width=100, no_color=True, force_terminal=True)
+    with console.status("启动…"):
+        assert type(sys.stdout).__name__ == "FileProxy", "前提：Live 期间 stdout 真的被代理了"
+        assert console_env.stdout_is_tty() is True
+        assert plan_card.can_ask() is True
 
 
 def test_describe_reports_everything(clean_env, tty, monkeypatch):

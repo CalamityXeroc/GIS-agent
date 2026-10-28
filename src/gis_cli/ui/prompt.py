@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
+
+from .console_env import interactive_terminal as _console_interactive_terminal
 
 logger = logging.getLogger(__name__)
 
@@ -630,23 +631,23 @@ def _is_dumb_terminal() -> bool:
     return os.environ.get("TERM", "").lower() in ("dumb", "") and not os.environ.get("WT_SESSION")
 
 
-def _stdout_is_tty() -> bool:
-    try:
-        return bool(sys.stdout.isatty())
-    except Exception:
-        return False
-
-
-def _stdin_is_tty() -> bool:
-    try:
-        return bool(sys.stdin.isatty())
-    except Exception:
-        return False
-
-
 def _interactive_tty() -> bool:
-    """标准输入与输出都是终端时，才适合把控制权交给 prompt_toolkit。"""
-    return _stdin_is_tty() and _stdout_is_tty()
+    """标准输入与输出都是终端（判定实现在 :mod:`gis_cli.ui.console_env`）。"""
+    return _console_interactive_terminal()
+
+
+def interactive_terminal() -> bool:
+    """当前会话能不能真的在终端里收键（prompt_toolkit 可用 + 两端都是终端）。
+
+    计划卡闸门（``ChatPlanGate``）要据此决定“停下来等 s/e/q”还是“非 TTY 降级”：
+    没有可读的终端时停下来就是挂死。
+
+    与 ``plan_card.can_ask()`` 只差 ``prompt_toolkit`` 这一条：chat 的输入框本体就是
+    ``PromptSession``，缺了就只剩 ``input()``，计划卡无法在输入框里等人；而 loop 的
+    ``PlanGate`` 本来就读 ``input()``，不需要它。这条**唯一的分歧**有用例锁定
+    （DAIR-38）。
+    """
+    return bool(_PT_AVAILABLE and _interactive_tty())
 
 
 def _is_console_error(exc: BaseException) -> bool:

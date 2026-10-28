@@ -20,10 +20,15 @@ _SKIP_DIRS = {
     ".gis_agent_memory", ".gis_agent_state", ".codegraph", ".claude", ".codex",
     ".pytest_cache", "temp", "tmp",
 }
-_VECTOR_EXT = {".shp", ".geojson", ".gpkg"}
+_VECTOR_EXT = {".shp", ".geojson", ".gpkg", ".kml"}
 _RASTER_EXT = {".tif", ".tiff", ".img", ".dem", ".asc"}
 _TABLE_EXT = {".csv", ".xlsx", ".dbf"}
 _PROJECT_EXT = {".aprx", ".lyrx", ".mxd", ".mapx"}
+
+#: 不靠 arcpy 也能读的矢量格式（在 agent 进程里读，毫秒级）。
+#: .kml 是 XML、.gpkg 是 SQLite；交给内核只会白等十几秒，而且 .kml 根本
+#: 不是 arcpy 能直接 Describe 的数据集（要先 KMLToLayer）。
+_LOCAL_VECTOR_EXT = {".kml", ".gpkg"}
 
 
 @dataclass
@@ -386,6 +391,17 @@ def profile_table(path: Path, *, max_rows: int = 5000) -> dict[str, Any]:
     return {"path": str(path), "kind": "table", "name": path.name}
 
 
+def profile_vector(path: Path) -> dict[str, Any] | list[dict[str, Any]]:
+    """Profile a KML/GPKG without ArcPy (agent-side).
+
+    KML 一个文件一条记录；GPKG 一个图层一条记录（container 指向 .gpkg，
+    与 .gdb 的记账方式一致，新鲜度判断也能复用 container 分支）。
+    """
+    from ..ingest.formats import describe_vector
+
+    return describe_vector(path)
+
+
 @dataclass
 class RefreshStats:
     """Summary of a catalog refresh."""
@@ -414,20 +430,29 @@ def refresh_catalog(
     # 默认只扫 input/ 时，旧逻辑把 output/ 里的记录（自己刚生成的成果）
     # 当成“文件已消失”删掉了（实测 removed=19）。数据目录应只增不误删。
     root_prefixes = [str(Path(r).resolve()).lower() for r in roots]
+    # 容器：.gdb 目录与 .gpkg 文件。它们的子记录 path 不在 items 里，
+    # 只看 path 会把它们当“已消失”每轮删一遍（GPKG 于是永远重扫）。
+    containers = {
+        d.path for d in items
+        if d.kind == "gdb" or Path(d.path).suffix.lower() == ".gpkg"
+    }
     stats.removed = catalog.remove_missing(
         {d.path for d in items},
-        {d.path for d in items if d.kind == "gdb"},
+        containers,
         within=root_prefixes,
     )
 
     to_scan: list[Discovery] = []
     table_items: list[Discovery] = []
+    local_vector_items: list[Discovery] = []
     for item in items:
         if not force and catalog.is_fresh(item.path, item.mtime, item.size):
             stats.skipped += 1
             continue
         if item.kind == "table":
             table_items.append(item)
+        elif item.kind == "vector" and Path(item.path).suffix.lower() in _LOCAL_VECTOR_EXT:
+            local_vector_items.append(item)
         else:
             to_scan.append(item)
 
@@ -438,6 +463,20 @@ def refresh_catalog(
             payload.update({"mtime": item.mtime, "size": item.size, "container": item.container})
             catalog.upsert(record_from_scan(payload))
             stats.scanned += 1
+        except Exception as exc:
+            stats.errors.append(f"{item.path}: {exc}")
+
+    # KML / GPKG 也本地读（不用起内核，不用 arcpy）。
+    for item in local_vector_items:
+        try:
+            payload = profile_vector(Path(item.path))
+            records = payload if isinstance(payload, list) else [payload]
+            for raw in records:
+                raw["mtime"] = item.mtime
+                raw["size"] = item.size
+                raw.setdefault("container", item.container)
+                catalog.upsert(record_from_scan(raw))
+                stats.scanned += 1
         except Exception as exc:
             stats.errors.append(f"{item.path}: {exc}")
 

@@ -179,7 +179,7 @@ def _shrink_json(value: Any, budget: int, depth: int = 0) -> Any:
 def _artifact_exists(path: str) -> bool:
     """已删除的产物不该再算产物（文件系统或 GDB 语义都试一下）。
 
-    注意：本函数可能跑在**没有 arcpy 的解释器**里（CLI 的 venv）。
+    注意：本函数可能跑在**没有 arcpy 的解释器**里（benchmark/CLI 的 venv）。
     GDB 内的要素类/栅格在文件系统上根本不存在，只有 arcpy 能判——此时
     “判不了”不能当成“不存在”，否则会把合法产物剔除（14 届 4a-1 实测：
     finish 里列的 4 个 kde_* 栅格全被剔除，验收只说“缺失栅格元数据”，

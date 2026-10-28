@@ -93,6 +93,20 @@ def _snap_integer(value: float) -> float:
     return float(nearest) if abs(value - nearest) <= max(1e-3, abs(value) * 1e-9) else float(value)
 
 
+def _categorical_labels_detail(labels: list[str]) -> tuple[bool, str]:
+    r"""分类图例（unique）的类名检查：只判“有没有把原始浮点当类名”。
+
+    唯一值的类名是**数据值本身**（类别名），不是分级边界，所以不能沿用分级图例的
+    “必须是整齐数值”：那会把 ``110101`` 这类编码、``1.2`` 这类取值永久判负，
+    而 ``193833.858800001`` 这种噪声本应被 ``\d+\.\d{3,}`` 抓住（DAIR-32 实测）。
+    """
+    noisy = [match for text in labels for match in _LONG_DECIMAL.findall(text)]
+    if noisy:
+        return False, f"类名残留原始浮点 {noisy[:4]}"
+    sample = [text for text in labels if text][:3]
+    return True, (f"类名无原始浮点（{sample}）" if sample else "分类图例无可解析数值（类别图例）")
+
+
 def _is_round(value: float) -> bool:
     """是否"整齐数值"：0 或整数且有效位后至少两位为零（如 1000/2500/7500；而 903/1375 不算）。"""
     if value == 0:
@@ -234,18 +248,23 @@ def check_layout(
     legend_element = elements.get("Legend")
     if legend_element is not None:
         overlay_entries = ((spec or {}).get("renderer") or {}).get("legend_entries") or []
+        renderer_mode = str(((spec or {}).get("renderer") or {}).get("mode") or "")
         if overlay_entries:
             # 导出图里的图例是叠加层重绘的（干净标签）；ArcGIS 自身的标签格式只作备注，不参与判定
             overlay_text = [str(item.get("label") or "") for item in overlay_entries]
-            overlay_numbers = [_snap_integer(float(value))
-                               for text in overlay_text for value in re.findall(r"-?\d+(?:\.\d+)?", text)]
-            overlay_loose = [value for value in overlay_numbers
-                             if not (_is_round(value) or _near_round(value, tolerance=0.02))]
-            checks.append({
-                "name": "legend_labels_unrounded", "ok": not overlay_loose,
-                "detail": (f"图例（叠加重绘）分界值整齐（{overlay_numbers[:5]}）" if overlay_numbers and not overlay_loose
-                           else (f"分界值不整齐 {overlay_loose[:4]}" if overlay_loose else "图例无可解析数值（分类图例）")),
-            })
+            if renderer_mode == "unique":
+                ok_labels, detail = _categorical_labels_detail(overlay_text)
+                checks.append({"name": "legend_labels_unrounded", "ok": ok_labels, "detail": detail})
+            else:
+                overlay_numbers = [_snap_integer(float(value))
+                                   for text in overlay_text for value in re.findall(r"-?\d+(?:\.\d+)?", text)]
+                overlay_loose = [value for value in overlay_numbers
+                                 if not (_is_round(value) or _near_round(value, tolerance=0.02))]
+                checks.append({
+                    "name": "legend_labels_unrounded", "ok": not overlay_loose,
+                    "detail": (f"图例（叠加重绘）分界值整齐（{overlay_numbers[:5]}）" if overlay_numbers and not overlay_loose
+                               else (f"分界值不整齐 {overlay_loose[:4]}" if overlay_loose else "图例无可解析数值（分类图例）")),
+                })
         try:
             definition = legend_element.getDefinition("V3")
             labels: list[str] = []
@@ -297,13 +316,19 @@ def check_layout(
             numbers = [_snap_integer(float(value)) for value in re.findall(r"-?\d+(?:\.\d+)?", joined)] if joined else []
             loose = [value for value in numbers if not (_is_round(value) or _near_round(value, tolerance=0.02))]
             bad = [] if (is_raster or not numbers) else loose[:5]
-            checks.append({
-                "name": "legend_labels_unrounded", "ok": not bad,
-                "detail": ("栅格拉伸渲染：图例标注数值范围，跳过取整检查" if is_raster
-                           else (f"分界值不整齐 {bad}" if bad
-                                 else f"分界值均为整齐数值（{numbers[:4]}…）" if numbers
-                                 else "无分级标签")),
-            })
+            if renderer_mode == "unique" and joined:
+                # 分类图例（没叠加重绘时读的是 ArcGIS 原生标签）：类名是数据值本身，
+                # 只判有没有原始浮点，不判“是否整齐”
+                ok_labels, detail = _categorical_labels_detail(labels)
+                checks.append({"name": "legend_labels_unrounded", "ok": ok_labels, "detail": detail})
+            else:
+                checks.append({
+                    "name": "legend_labels_unrounded", "ok": not bad,
+                    "detail": ("栅格拉伸渲染：图例标注数值范围，跳过取整检查" if is_raster
+                               else (f"分界值不整齐 {bad}" if bad
+                                     else f"分界值均为整齐数值（{numbers[:4]}…）" if numbers
+                                     else "无分级标签")),
+                })
             if font_sizes:
                 smallest = min(font_sizes)
                 checks.append({

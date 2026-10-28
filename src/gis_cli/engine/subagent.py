@@ -211,6 +211,11 @@ class SubAgentRunner:
             ),
             # 子代理的成功运行不沉淀配方：它只是父任务的一段，蒸馏价值归父
             distill_after_success="off",
+            # 子代理没有“人”可确认计划卡：打印出去也只是刷屏，直接关掉
+            plan_card=False,
+            # 子任务的产物由父代理统一交付：子层出一份“成果包”只会把半成品
+            # 写成正式报告，且会和父的同名文件抢字
+            report_enabled=False,
             role_preamble=ROLE_PREAMBLE,
             # 子代理的卡死要尽快失败，别用父那档 600s
             exec_timeout=min(float(self.parent.config.exec_timeout or 600.0), self.exec_timeout),

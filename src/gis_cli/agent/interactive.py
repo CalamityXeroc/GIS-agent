@@ -19,7 +19,7 @@ from typing import Any, Optional
 from rich.text import Text
 
 from ..ui import events as ui_events
-from ..ui import logging_setup, prompt as ui_prompt, render as ui_render, session_store, theme as ui_theme, wiring
+from ..ui import logging_setup, plan_card as ui_plan_card, prompt as ui_prompt, render as ui_render, session_store, theme as ui_theme, wiring
 from ..ui.session_runner import EngineSession
 
 
@@ -64,6 +64,11 @@ class InteractiveChat:
         self.bundle: Any = None
         self.session: EngineSession | None = None
         self.reader: ui_prompt.PromptInput | None = None
+        #: 计划卡闸门：引擎跑在工作线程，跨线程 ``input()`` 会抢输入框的按键，
+        #: 所以闸门只投递请求，按键由主线程（prompt_toolkit）读。
+        self.plan_gate: ui_plan_card.ChatPlanGate | None = None
+        #: 已按了 ``e``，下一行是“怎么改”的那一句
+        self._plan_asking_revision = False
         self.store = ui_render.ToolOutputStore()
         #: 转录视图（合并连续工具调用、区分思考/答复/系统）
         self.view = ui_render.TranscriptView(self.console, ui_events.StatusTracker(workspace=str(self.workspace)), self.store)
@@ -92,7 +97,13 @@ class InteractiveChat:
             if name == "run_end":
                 self._record_finish(payload)
 
+        # 计划卡闸门：只有真能收键（真终端）时才停下来等确认；
+        # 管道/重定向下照旧只打印（行为与之前一致，只是文案改成“未确认”）。
+        # 判定必须在 ``status(Live)`` **之外**：Live 期间 ``sys.stdout`` 是 rich 的
+        # ``FileProxy``，``isatty()`` 恒为 False（DAIR-37：真终端也不暂停）。
+        interactive_ok = ui_prompt.interactive_terminal()
         with self.console.status("[gis.dim]启动引擎（加载配方/配置）…[/]"):
+            self.plan_gate = ui_plan_card.ChatPlanGate(interactive=interactive_ok)
             try:
                 self.bundle = build_engine(
                     workspace=self.workspace,
@@ -102,6 +113,7 @@ class InteractiveChat:
                     # 想启动就扫全的用 ``--refresh-catalog``。
                     refresh_catalog=bool(self.force_refresh_catalog),
                     on_event=_on_event,
+                    plan_gate=self.plan_gate,
                 )
             except Exception as exc:
                 self.console.print(ui_render.render_unit(ui_events.RenderUnit("error", "引擎启动失败", lines=[str(exc)[:200]])))
@@ -727,11 +739,15 @@ class InteractiveChat:
                 if text is None:
                     break
                 text = text.strip()
-                if not text:
-                    continue
                 if text.startswith("/"):
                     if not self._handle_command(text):
                         break
+                    continue
+                # 计划卡正在等人确认：下一行就是答复（s / e / q / 一句改动）。
+                # 放在命令处理之后：``/exit`` 之类随时可用（退出会先把闸门判 cancel）。
+                if self._plan_step(text):
+                    continue
+                if not text:
                     continue
                 self._dispatch(text)
         finally:
@@ -741,7 +757,63 @@ class InteractiveChat:
     def _status_text(self) -> str:
         """框下状态行的文本（模型 · 状态 · 轮次 · 用时 · token · 工具）。"""
         tracker = self.session.tracker if self.session else self.view.tracker
-        return ui_render.footer_text(tracker, width=0).plain.strip()
+        text = ui_render.footer_text(tracker, width=0).plain.strip()
+        request = self._plan_request()
+        if request is not None:
+            # 状态行已经写着“待确认计划”；这里只补按键（太长会被终端截掉）
+            hint = "怎么改（一句话）？" if self._plan_asking_revision else "s 开始 / e 修改 / q 取消"
+            text = f"{text} · {hint}" if text else hint
+        return text
+
+    # ------------------------------------------------------------ 计划确认
+
+    def _plan_request(self) -> ui_plan_card.PlanRequest | None:
+        """当前待答复的确认请求（没有则 None）。"""
+        if self.plan_gate is None:
+            return None
+        request = self.plan_gate.pending
+        return request if request is not None and not request.answered else None
+
+    def _plan_step(self, text: str) -> bool:
+        """把这一行输入当“计划确认答复”处理；返回 True = 已消费掉这行输入。
+
+        动作词与 ``ui.plan_card.parse_decision`` 同一套（loop 入口也用那一份）。
+        ``e`` 会再问一句“怎么改”，所以分两行。
+        """
+        request = self._plan_request()
+        if request is None:
+            self._plan_asking_revision = False
+            return False
+        if self._plan_asking_revision:
+            self._plan_asking_revision = False
+            revision = (text or "").strip()
+            if not revision:
+                self.console.print(Text("（没听到改动内容：再按 e 说一句，或按 s 直接开始）", style="gis.dim"))
+                return True
+            self._resolve_plan(request, "revise", revision)
+            return True
+        decision = ui_plan_card.parse_decision(text)
+        if decision is None:  # e：先问一句怎么改
+            self._plan_asking_revision = True
+            self.console.print(
+                Text("（怎么改？一句话说完按回车；直接按 s 开始）", style="gis.dim")
+            )
+            return True
+        self._resolve_plan(request, decision.action, decision.text)
+        return True
+
+    def _resolve_plan(self, request: ui_plan_card.PlanRequest, action: str, text: str = "") -> None:
+        """答复闸门，并在转录里留下“确认了什么”（事后能查）。"""
+        if not request.resolve(action, text):
+            return
+        label = {
+            "start": "开始执行",
+            "revise": f"按修改重抽计划 —— {text}",
+            "cancel": "取消，这次任务不开始",
+        }.get(action, action)
+        style = "gis.ok" if action == "start" else ("gis.warn" if action == "cancel" else "gis.agent")
+        self.console.print(Text(f"（计划确认：{label}）", style=style))
+        self.sessions.append(self.session_id, "user", f"[计划确认] {label}")
 
     def _dispatch(self, text: str, *, echo: bool = False) -> None:
         """派发用户输入。
@@ -784,6 +856,10 @@ class InteractiveChat:
         self.console.print(Text(body, style="gis.code"))
 
     def _interrupt(self) -> bool:
+        # 计划卡正等着确认：Esc 等同按 q（引擎线程停在闸门上，不取消就一直等）
+        if self.plan_gate is not None and self.plan_gate.cancel_pending():
+            self.console.print(Text("（已取消计划确认，这次任务不开始）", style="gis.warn"))
+            return True
         if self.session is None or not self.session.busy:
             return False
         ok = self.session.interrupt()
@@ -794,6 +870,9 @@ class InteractiveChat:
     # ------------------------------------------------------------ 收尾
 
     def _shutdown(self) -> None:
+        # 退出时还挂在计划闸门上：先判成 cancel，否则线程会一直等下去
+        if self.plan_gate is not None:
+            self.plan_gate.cancel_pending()
         if self.session is not None and self.session.busy:
             self.session.interrupt()
             self.session.wait(timeout=20)

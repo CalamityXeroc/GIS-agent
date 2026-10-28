@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS datasets (
     feature_count INTEGER,
     extent TEXT,
     extra TEXT,
+    source TEXT,
+    license TEXT,
+    acquired_at TEXT,
     updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS fields (
@@ -62,8 +65,25 @@ CREATE INDEX IF NOT EXISTS idx_datasets_container ON datasets(container);
 """
 
 
+#: 数据来源（P0-2）：接入时就登记，扫描器不覆盖。
+SOURCES = ("local", "csv_upload", "boundary", "download")
+#: 许可（P0-2）：未知就写 unknown，绝不猜。
+LICENSES = ("unknown", "ODbL", "天地图条款", "用户自有")
+
+#: 老库补列用的迁移表（SQLite 只能 ALTER TABLE ADD COLUMN）。
+_ADDED_COLUMNS = {
+    "source": "TEXT",
+    "license": "TEXT",
+    "acquired_at": "TEXT",
+}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+#: extra 里属于“上一次扫描的瞬时结论”的键：重扫没带就该清掉，不该继承。
+_TRANSIENT_EXTRA_KEYS = {"error"}
 
 
 @dataclass
@@ -84,6 +104,11 @@ class DatasetRecord:
     fields: list[dict[str, Any]] = field(default_factory=list)
     raster: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+    #: 接入来源 / 许可 / 采集时间。空串表示"本次没带信息"：
+    #: 写入时保留库里的旧值（扫描器重扫不能把 csv_upload 打回 local）。
+    source: str = ""
+    license: str = ""
+    acquired_at: str = ""
 
     def to_row(self) -> tuple:
         return (
@@ -99,6 +124,9 @@ class DatasetRecord:
             self.feature_count,
             json.dumps(self.extent, ensure_ascii=False) if self.extent else None,
             json.dumps(self.extra, ensure_ascii=False) if self.extra else None,
+            self.source,
+            self.license,
+            self.acquired_at,
             _now(),
         )
 
@@ -117,6 +145,9 @@ class DatasetRecord:
             feature_count=row["feature_count"],
             extent=json.loads(row["extent"]) if row["extent"] else None,
             extra=json.loads(row["extra"]) if row["extra"] else {},
+            source=row["source"] or "local",
+            license=row["license"] or "unknown",
+            acquired_at=row["acquired_at"] or "",
         )
 
 
@@ -131,22 +162,38 @@ class Catalog:
         self._conn.row_factory = sqlite3.Row
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """给 P0-2 之前建的库补 source/license/acquired_at 三列。
+
+        ``CREATE TABLE IF NOT EXISTS`` 对已存在的表不起作用，老库（用户机器上
+        已经跑出来的 catalog.db）不会自动长出新列 —— 只能显式 ALTER。
+        """
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(datasets)")}
+        for name, decl in _ADDED_COLUMNS.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE datasets ADD COLUMN {name} {decl}")
 
     # ------------------------------------------------------------------ write
     def upsert(self, record: DatasetRecord) -> None:
         with self._lock, self._conn:
+            self._merge_provenance(record)
             self._conn.execute(
                 """
                 INSERT INTO datasets
                     (path, kind, container, name, mtime, size, crs_name, wkid,
-                     geom_type, feature_count, extent, extra, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     geom_type, feature_count, extent, extra,
+                     source, license, acquired_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     kind=excluded.kind, container=excluded.container, name=excluded.name,
                     mtime=excluded.mtime, size=excluded.size, crs_name=excluded.crs_name,
                     wkid=excluded.wkid, geom_type=excluded.geom_type,
                     feature_count=excluded.feature_count, extent=excluded.extent,
-                    extra=excluded.extra, updated_at=excluded.updated_at
+                    extra=excluded.extra, source=excluded.source,
+                    license=excluded.license, acquired_at=excluded.acquired_at,
+                    updated_at=excluded.updated_at
                 """,
                 record.to_row(),
             )
@@ -201,6 +248,31 @@ class Catalog:
                         json.dumps(r.get("extra", {}), ensure_ascii=False),
                     ),
                 )
+
+    def _merge_provenance(self, record: DatasetRecord) -> None:
+        """空串字段沿用库里已有值，缺省值落到 local/unknown。
+
+        为什么不能在 SQL 里用 COALESCE：扫描器每次都 upsert 全量记录，
+        它不知道"这份 CSV 是用户上传的"。若把它带来的空串写成 local，
+        一次重扫就会把 `source=csv_upload, license=用户自有` 冲掉。
+
+        注意：会就地补全传入的 ``record``（调用方拿到的对象与库里一致）。
+        """
+        row = self._conn.execute(
+            "SELECT source, license, acquired_at, extra FROM datasets WHERE path = ?",
+            (record.path,),
+        ).fetchone()
+        old = dict(row) if row is not None else {}
+        record.source = record.source or old.get("source") or "local"
+        record.license = record.license or old.get("license") or "unknown"
+        record.acquired_at = record.acquired_at or old.get("acquired_at") or ""
+        # extra：登记时写的元信息（来源格式、原始列名、跳过行数…）不能被一次重扫抹掉。
+        # 扫描器不认识这些字段，它带来的 extra 往往是空的；而 error 是上一次扫描的
+        # 瞬时结论，新扫描没带就该丢——所以“旧的先留、新的覆盖、瞬时键清掉”。
+        old_extra = json.loads(old.get("extra") or "{}") if old.get("extra") else {}
+        merged_extra = {k: v for k, v in old_extra.items() if k not in _TRANSIENT_EXTRA_KEYS}
+        merged_extra.update(record.extra or {})
+        record.extra = merged_extra
 
     def remove_missing(
         self,
@@ -355,4 +427,7 @@ def record_from_scan(payload: dict[str, Any]) -> DatasetRecord:
         fields=list(payload.get("fields", []) or []),
         raster=dict(payload.get("raster", {}) or {}),
         extra=dict(payload.get("extra", {}) or {}),
+        source=str(payload.get("source", "") or ""),
+        license=str(payload.get("license", "") or ""),
+        acquired_at=str(payload.get("acquired_at", "") or ""),
     )

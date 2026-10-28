@@ -198,3 +198,35 @@ def test_engine_task_reports_failure_status_with_exit_code(fake_cli, monkeypatch
     assert "余额不足" in text
     assert "traceId" not in text  # 网关噪声被清理
     assert "llm_unavailable" in text
+
+
+# ------------------------------------------------- 计划卡片闸门（DAIR-37）
+
+
+def test_engine_task_plan_gate_follows_real_terminal(monkeypatch, tmp_path, install_fake_tty):
+    """真终端 + 没加 --yes 必须停下来等确认；--yes 强制不问（CI / 脚本）。
+
+    rich 的 ``status()`` 会把 sys.stdout 换成 ``FileProxy``（``isatty()`` 恒为 False），
+    闸门若在 with 内部判定，真 conhost 上也会被误判成非交互（DAIR-37）。
+    """
+    import gis_cli.engine.runner as runner_mod
+
+    assert install_fake_tty().isatty() is True
+    console = RichConsole(
+        file=io.StringIO(), width=100, no_color=True, force_terminal=True, theme=ui_theme.build_theme("dark")
+    )
+    monkeypatch.setattr(ui_theme, "make_console", lambda *a, **k: console)
+
+    gates: list[Any] = []
+
+    def fake_build_engine(*, workspace, config_path=None, refresh_catalog=True, on_event=None, plan_gate=None, **_kw):
+        gates.append(plan_gate)
+        return FakeBundle(on_event)
+
+    monkeypatch.setattr(runner_mod, "build_engine", fake_build_engine)
+
+    assert agent_cli._run_engine_task("统计物种点位数", tmp_path, None, True, 0, "dark", True) == 0
+    assert gates[0].interactive is True, "真终端 + 没加 --yes：必须停下来等确认"
+
+    assert agent_cli._run_engine_task("统计物种点位数", tmp_path, None, True, 0, "dark", True, yes=True) == 0
+    assert gates[1].interactive is False, "--yes 就是不要等（CI / 脚本）"
