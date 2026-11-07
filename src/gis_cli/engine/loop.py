@@ -74,6 +74,14 @@ class LoopConfig:
     #: 关掉只影响成果包，不影响验收与产物登记。
     report_enabled: bool = True
 
+    # ---- 分析正确性双复核（P1-5 / W5）----
+    #: 默认关：复核 subagent 的 token 会翻倍，只在交付级任务里开。
+    review_enabled: bool = False
+    #: 复核发现 error 时是否阻断 finish。默认只提示：复核误杀不应该毁掉一份好交付。
+    review_block_on_fail: bool = False
+    #: 开启复核时，finish 前必须先调用 review_result（否则第 2 次 finish 波过）。
+    review_require_before_finish: bool = True
+
 
 _DIAGNOSIS_TOOLS = {"catalog_query", "read_document", "list_recipes"}
 
@@ -145,6 +153,8 @@ class AgentLoop:
         self.state: TaskState | None = None
         self._messages: list[dict[str, Any]] = []
         self._finish_rejections = 0
+        #: 双复核：finish 被“还没 review_result”拦过一次后置 True，避免无限拦。
+        self._review_missing_nudged = False
         #: 上一次被拒时的（缺失/问题签名, 产物清单）：两者都没变就说明“再拒也没用”
         self._last_rejection: tuple[tuple, tuple] | None = None
         #: 已发过的收尾提醒阈值（0.8 / 0.95），避免每轮重复提醒
@@ -174,6 +184,7 @@ class AgentLoop:
         run_id = new_run_id()
         self.recorder = self.recorder or RunRecorder(run_id, self.workspace / ".gis_agent" / "traces")
         self.state = TaskState(run_id=run_id, goal=goal, workspace=str(self.workspace))
+        self._review_missing_nudged = False
         self._deadline = None
         self.context.state = self.state
         for item in requirements or []:
@@ -614,15 +625,23 @@ class AgentLoop:
         self._check_workspace_hygiene(observation)
         self._collect_design_note(observation)
         if self.recorder is not None:
-            self.recorder.record(
-                "tool_result",
-                {
-                    "tool": action.tool,
-                    "ok": observation.ok,
-                    "summary": observation.summary,
-                    "artifacts": observation.artifacts,
-                },
-            )
+            payload: dict[str, Any] = {
+                "tool": action.tool,
+                "ok": observation.ok,
+                "summary": observation.summary,
+                "artifacts": observation.artifacts,
+            }
+            # 质量分也要进 trace：不然基准只能让模型把分数抄进 markdown，抄错/漏抄
+            # 都查不出来（实测 DAIR-57 就是这么取数的）。只留 total + 三维度 +
+            # 扣分项名字（详见 ``brief_quality``），detail 全文不进 trace。
+            quality = None
+            if isinstance(observation.data, dict) and observation.data.get("quality"):
+                from ..cartography.score import brief_quality
+
+                quality = brief_quality(observation.data["quality"])
+            if quality is not None:
+                payload["quality"] = quality
+            self.recorder.record("tool_result", payload)
         self._emit("tool_result", {"tool": action.tool, "ok": observation.ok, "summary": observation.summary})
         return observation, False
 
@@ -758,7 +777,14 @@ class AgentLoop:
             {"tool": "finish", "ok": observation.ok, "summary": observation.summary, "artifacts": observation.artifacts},
         )
         self._emit("tool_result", {"tool": "finish", "ok": observation.ok, "summary": observation.summary})
+        gate = self._finish_review_gate(observation)
+        if gate is not None:
+            return gate, False
         verdict = self.verifier.verify(self.state) if self.verifier is not None else {"pass": True, "summary": "未配置验证器"}
+        # 双复核结论进验收数据（成果包/溯源/UI 都能看到）；没开启时不塞空字段。
+        review = dict(getattr(self.state, "review", {}) or {})
+        if getattr(self.config, "review_enabled", False) and review:
+            verdict = {**verdict, "review": review}
         # 同一套证据被同一个理由连拒多次时，再拒一次也不可能变好（实测：组合任务
         # 连拒 4 次，每次 40~80s 的语义验收，产物一个字节都没变，最后 status=failed）。
         # 产物清单没变且拒绝理由完全一致 → 降级通过，但把原因写进 summary。
@@ -766,6 +792,9 @@ class AgentLoop:
         artifacts_now = self._artifact_signature()
         repeated = bool(
             not verdict.get("pass")
+            # 合规阻断不降级：版面/语义问题可以先放行后人工补，未审图的国界图不行。
+            # 允许降级等于“同一个阻断理由连拒三次就把图发出去”，比误报危险得多。
+            and not verdict.get("hard_block")
             # 签名全空 = 没拿到任何具体理由，那就不存在“同一理由”，不许降级
             and any(signature)
             and self._last_rejection is not None
@@ -806,6 +835,66 @@ class AgentLoop:
             hint=str(verdict.get("repair_hint", "") or ""),
         )
         return feedback, False
+
+    def _finish_review_gate(self, observation: Observation) -> Observation | None:
+        """finish 前的双复核闸门：返回 None = 放行，返回 Observation = 拒绝本次 finish。
+
+        三种情况：
+        1. 还没复核 / 复核后又改了产物 → 要求先 review_result（只拦一次，第二次放行并留痕）；
+        2. 复核 fail 且 ``review_block_on_fail`` → 拒绝，最多拒绝 max_finish_rejections 次；
+        3. 其余（pass / 未开启阻断）→ 把复核结论挂到 finish 观察与摘要上。
+        """
+        if not getattr(self.config, "review_enabled", False):
+            return None
+        review = dict(getattr(self.state, "review", {}) or {})
+        signature = sorted(str(x) for x in (self.state.artifacts or []))
+        status = str(review.get("status") or "")
+        fresh = bool(review.get("signature")) and list(review.get("signature") or []) == signature
+        if not review or (status == "pass" and not fresh):
+            if getattr(self.config, "review_require_before_finish", True) and not self._review_missing_nudged:
+                self._review_missing_nudged = True
+                return Observation(
+                    ok=False,
+                    summary="双复核未完成：请先调用 review_result 提交结论（claim.summary + metrics + data_paths）。",
+                    data={"review": review or {"status": "missing"}},
+                    hint=(
+                        "复核者只看数据 + 结论，不看你的步骤；claim 里把关键数字与单位写清"
+                        "（总量/分区明细/面积/密度/要素数），data_paths 要给产物路径。"
+                    ),
+                )
+            # 第二次仍不复核：放行但必须留痕（不能让“没复核”看起来像“复核通过”）
+            self.state.review = {
+                **review,
+                "status": "missing",
+                "summary": "未执行双复核（模型未调用 review_result）",
+                "signature": signature,
+            }
+            note = "；注意：本任务开启了双复核，但没有执行 review_result。"
+            observation.summary = (observation.summary or "") + note
+            observation.hint = ((observation.hint + "\n") if observation.hint else "") + note.lstrip("；")
+            if self.recorder is not None:
+                self.recorder.record("second_review", {"status": "missing", "signature": signature})
+            return None
+        if status == "fail" and getattr(self.config, "review_block_on_fail", False):
+            if self._finish_rejections < int(self.config.max_finish_rejections or 3):
+                self._finish_rejections += 1
+                return Observation(
+                    ok=False,
+                    summary=f"双复核未通过（第 {self._finish_rejections} 次）：{review.get('summary') or ''}",
+                    data=review,
+                    hint="按 findings 里的 claimed/measured 差异修正结果或补上可解释原因，然后重新 review_result，再 finish。",
+                )
+            note = "；双复核连续未通过，已放行——请人工复核 findings。"
+            observation.summary = (observation.summary or "") + note
+            observation.hint = ((observation.hint + "\n") if observation.hint else "") + note.lstrip("；")
+
+        data = dict(observation.data) if isinstance(observation.data, dict) else {}
+        data["review"] = review
+        observation.data = data
+        observation.summary = (observation.summary or "") + "；双复核：" + str(review.get("summary") or status)
+        if self.recorder is not None:
+            self.recorder.record("second_review", review)
+        return None
 
     # ------------------------------------------------------------ deliverables
     def _build_deliverables(self, verdict: dict[str, Any]) -> None:
@@ -1136,6 +1225,7 @@ class AgentLoop:
             "7. **少问多做**：能从数据目录/文档推断的信息不要问用户；只在关键信息确实缺失时用 ask_user。\n"
             "8. **中文输出**：与用户交流、任务清单、方法论说明全部用中文。\n\n"
             + self._delegate_hint()
+            + self._review_hint()
             + "## 关于工具边界（省时间用）\n"
             "- 每个工具的 description 就是它的全部参数说明。**不要去读 gis_cli 的源码**来猜开关——"
             "实测有任务为此白跑了 200+ 次调用。工具里没写的参数，就是没有。\n"
@@ -1187,6 +1277,21 @@ class AgentLoop:
             "（例如“4 张密度图”和“迁移图”），先 update_tasklist 拆开，再对其中一块调用 "
             "delegate（task 必须自包含：数据路径/字段/坐标系/输出位置/验收标准）。"
             "3~5 步的小活儿不要派——每个子代理的固定开销约 1.5 万 token，拆小了更贵。\n\n"
+        )
+
+    def _review_hint(self) -> str:
+        """开启双复核时，说明交付前必须做的复核（默认不出现）。"""
+        if not getattr(self.config, "review_enabled", False):
+            return ""
+        try:
+            if self.registry.get("review_result") is None:
+                return ""
+        except Exception:
+            return ""
+        return (
+            "10. **交付前双复核**：调用 review_result 提交 claim（summary + metrics + data_paths + units）。"
+            "复核者看不到你的过程，只按数据独立验算；fail 时按 findings 里的 claimed/measured 修正后"
+            "重新复核。本任务开启了双复核，finish 前必须有一次（且产物变更后要重做）。\n\n"
         )
 
     def _skills_section(self) -> str:

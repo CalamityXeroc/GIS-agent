@@ -11,6 +11,9 @@ from typing import Any
 
 import yaml  # type: ignore
 
+from .backends import DEFAULT_BACKEND, normalize_backends
+from .fragments import FRAGMENTS, FRAGMENT_SLOT
+
 #: 参数默认值写成它 → 运行时自动填成当前工作区路径。
 #: 蒸馏出来的配方常常需要“以工作区为根”的路径（``ws = {{workspace}}``），
 #: 但把源机器路径当默认值不可移植，写 ``.`` 又不对（内核 CWD 不是工作区）。
@@ -58,11 +61,18 @@ class Recipe:
     description: str = ""
     domain: str = "general"
     category: str = ""
+    #: 这个配方要哪个执行后端跑（``[arcpy]`` / ``[gdal]`` / ``[arcpy, gdal]``）。
+    #: 缺省 ``[arcpy]``：47 个老配方 manifest 一行不改也必须照样跑。
+    backend: list[str] = field(default_factory=lambda: [DEFAULT_BACKEND])
     triggers: list[str] = field(default_factory=list)
     preconditions: list[str] = field(default_factory=list)
     params: dict[str, RecipeParam] = field(default_factory=dict)
     steps: list[str] = field(default_factory=list)
     code_template: str = ""
+    #: 同一配方的 GDAL 版代码（``backend`` 同时声明了 gdal 才有意义）。
+    #: 空串 = **没有** GDAL 实现；按 gdal 后端渲染时明确报错，不回落 arcpy 代码
+    #: —— 那会在 .venv-gdal 里撞 ``import arcpy`` 而报看不懂的错。
+    code_template_gdal: str = ""
     validation: list[dict[str, Any]] = field(default_factory=list)
     pitfalls: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
@@ -71,13 +81,33 @@ class Recipe:
     source_path: str = ""
 
     # ------------------------------------------------------------------ render
-    def render(self, params: dict[str, Any]) -> str:
-        """Render the code template.
+    def template_for(self, backend: str = DEFAULT_BACKEND) -> str:
+        """取该后端的代码模板；这个后端没有模板就报错，**绝不回落**。
+
+        为什么不能回落：GDAL 版不是“arcpy 代码换了个执行器”，两者 API 完全不同。
+        回落的结果是 .venv-gdal 里 ``import arcpy`` 报 ``No module named 'arcpy'``
+        —— 一个与配方内容无关的错，查起来还得先猜是后端路由错了。
+        """
+        name = str(backend or DEFAULT_BACKEND).strip().lower()
+        if name == "arcpy":
+            return self.code_template
+        if name == "gdal":
+            if not self.code_template_gdal.strip():
+                raise ValueError(
+                    f"配方 {self.id or '(未命名)'} 没有 GDAL 版代码（code_template_gdal 为空），"
+                    f"不能用 gdal 后端跑；声明后端为 {list(self.backend)}。"
+                )
+            return self.code_template_gdal
+        raise ValueError(f"未知执行后端: {backend!r}（支持 arcpy / gdal）")
+
+    def render(self, params: dict[str, Any], *, backend: str = DEFAULT_BACKEND) -> str:
+        """Render the code template of ``backend``.
 
         ``{{param}}`` is replaced with a Python literal (quoted strings,
         numbers, JSON for containers); ``@@param@@`` is replaced with the raw
         string value for embedding inside code/expressions.
         """
+        template = self.template_for(backend)
         resolved = self.resolve_params(params)
 
         def _literal_sub(match: re.Match[str]) -> str:
@@ -92,8 +122,10 @@ class Recipe:
                 return match.group(0)
             return "" if resolved[key] is None else str(resolved[key])
 
-        text = _SLOT.sub(_literal_sub, self.code_template)
-        return _RAW_SLOT.sub(_raw_sub, text)
+        text = _SLOT.sub(_literal_sub, template)
+        text = _RAW_SLOT.sub(_raw_sub, text)
+        # 片段只在真用到时展开：老配方没有占位符，渲染输出必须逐字不变（快照盯着）
+        return _expand_fragments(text) if FRAGMENT_SLOT.search(text) else text
 
     def resolve_params(self, params: dict[str, Any]) -> dict[str, Any]:
         resolved: dict[str, Any] = {}
@@ -123,6 +155,7 @@ class Recipe:
             "description": self.description,
             "domain": self.domain,
             "category": self.category,
+            "backend": list(self.backend),
             "triggers": self.triggers,
             "preconditions": self.preconditions,
             "params": {k: v.to_dict() for k, v in self.params.items()},
@@ -135,6 +168,9 @@ class Recipe:
         }
         if with_code:
             data["code_template"] = self.code_template
+            # 只在真写过 GDAL 版时出现：老配方 to_dict 的形态一行不变
+            if self.code_template_gdal:
+                data["code_template_gdal"] = self.code_template_gdal
         return data
 
     # ------------------------------------------------------------------- load
@@ -151,11 +187,13 @@ class Recipe:
             description=str(data.get("description", "") or ""),
             domain=str(data.get("domain", "general") or "general"),
             category=str(data.get("category", "") or data.get("domain", "general") or "general"),
+            backend=normalize_backends(data.get("backend")),
             triggers=[str(t) for t in (data.get("triggers") or [])],
             preconditions=[str(t) for t in (data.get("preconditions") or [])],
             params=params,
             steps=[str(s) for s in (data.get("steps") or [])],
             code_template=str(data.get("code_template", "") or ""),
+            code_template_gdal=str(data.get("code_template_gdal", "") or ""),
             validation=[v for v in (data.get("validation") or []) if isinstance(v, dict)],
             pitfalls=[str(p) for p in (data.get("pitfalls") or [])],
             examples=[str(e) for e in (data.get("examples") or [])],
@@ -197,6 +235,44 @@ class Recipe:
                 if token and (token in trigger_lower or trigger_lower in token):
                     score += 4
         return score
+
+
+def _expand_fragments(text: str) -> str:
+    """把 ``{{@name@}}`` 展开成 fragments.py 里的源码，按占位所在的缩进对齐。
+
+    两条硬约束，违反就报人话错误，不留到执行器里变成 SyntaxError / 静默残留：
+
+    1. 占位符必须**独占一行**（``x = {{@zone_layer@}}`` 会拼出 ``x = def ...``）；
+    2. 一行**只能有一个**占位符（以前只展开第一个，第二个原样留在代码里）。
+
+    片段名拼错同样当场报错：静默留一行 ``{{@...@}}`` 会变成语法错，报错点在执行器里，
+    离真正的原因（片段名拼错）很远。
+    """
+    lines: list[str] = []
+    for line in text.split("\n"):
+        match = FRAGMENT_SLOT.fullmatch(line.strip())
+        if match is None:
+            slots = FRAGMENT_SLOT.findall(line)
+            if not slots:
+                lines.append(line)
+                continue
+            if len(slots) > 1:
+                raise ValueError(
+                    f"代码片段占位符必须独占一行，这行写了 {len(slots)} 个"
+                    f"（{', '.join('{{@' + s + '@}}' for s in slots)}）：{line.strip()}"
+                    f"—— 片段是整块语句，多段请各占一行"
+                )
+            raise ValueError(
+                f"代码片段占位符必须独占一行，不能和内联代码混写：{line.strip()}"
+                f"（{{@{slots[0]}@}} 会整段展开成 def 定义，混写拼出的代码是语法错）"
+            )
+        name = match.group(1)
+        if name not in FRAGMENTS:
+            raise ValueError(f"未知的代码片段: {name}（可用: {sorted(FRAGMENTS)}）")
+        pad = line[: len(line) - len(line.lstrip())]
+        block = [pad + item if item else item for item in FRAGMENTS[name].splitlines()]
+        lines.append("\n".join(block))
+    return "\n".join(lines)
 
 
 def _coerce_param(value: Any, declared: str) -> Any:

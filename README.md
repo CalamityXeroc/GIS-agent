@@ -125,6 +125,48 @@ src/gis_cli/
 - 分析计划卡：执行前 5 行人话确认（做什么 / 用什么 / 输出 / 怎么验 / 合规），TTY 下按 s / e / q 确认或改一句，非 TTY 自动通过、**不阻塞脚本与 CI**
 - 成果包：验收通过后自动生成**单文件 HTML**（图、图层、方法、数据来源、验证全部内联，断网可看、可直接发微信）；PDF 走 `report-pdf` 技能（浏览器无头打印，中文正常、零新依赖）
 
+**双后端（P0-1）**
+- 9 个配方同时有 arcpy 与 GDAL 两套实现：`buffer_dissolve` / `aggregate_to_zones` /
+  `attribute_join_table` / `polygon_to_raster` / `project_to_crs` / `raster_calculator` /
+  `point_buffer_raster_sum` / `zonal_statistics` / `zonal_statistics_raster`
+- 配方用 `backend: [arcpy, gdal]` 声明，`recipes/store.py` 按声明路由；**缺后端就明确报错**，
+  一行配方代码都不执行（不是跑到一半才炸）
+- GDAL 侧只依赖 `pip install gis-task-cli[gdal]`（自带 GDAL 二进制的 wheel），不需要 OSGeo4W
+- 双端一致性有实测口径：整数指标（`COUNT`/`AREA`/行数）**严格相等**，浮点指标相对差 **≤1e-6**；
+  方形像元承诺逐像元一致，非方像元只承诺分区级（arcpy 会把非方像元拉方，面积口径差约 0.37%，
+  别拿分区 `SUM` 直接比）
+
+**成果溯源卡（P1-4）**
+- 数据 → 步骤 → 参数 → 验证结果，一页可审计，随成果包一起交付（`report/provenance.py`）
+- `generated_at` 精确到秒、`_step_gap` 记录步骤间空档；**零外链**（断网可看）
+
+**成果质量分（P1-3）**
+- `cartography/score.py`：规范性 / 可读性 / 正确性三维 + 扣分明细（`deductions` 逐条给原因）
+- 每条扣分项都有合成用例；同一缺陷重复出现**分数单调不增**
+- 实测：合格成品图 100/100；注入「比例尺非整数刻度」后 92 分且 `deductions` 明确指出那一条
+
+**地图合规闸门（P1-2）**
+- `compliance/` 包：YAML 规则库 + 检测器 + 分级输出（**阻断 / 警告 / 提示**）
+- 四条规则：国界与敏感要素、边界数据来源未登记、未送审水印缺失、审图号缺失
+- 落点两处：`create_map` 出图后自检、`finish` 前汇总进 `verify_outputs`
+- **只做提示 + 阻断，不做合规判定**——责任边界写在卡片与文案里
+- 实测：20 个合成样本 **0 漏报、误报 0%**，单图自检 **<1 ms**
+
+**民生模板库（P1-1）**
+- `templates/<id>/manifest.yaml`：数据清单 + 配方链 + 断言集 + 后端声明；工具 `list_templates` / `run_template`
+- 6 个业务模板：社区适老化评估、绿地公平性、服务价值排序、地图质量评价、城市热点、普查指标相似度
+- 参数可引用上游产物（`$step.out`），引用不存在的步骤**当场报错**
+- 实测：12/12 次冷启动全绿；GDAL-only 机器上 4/4 在**预检阶段**就报「需 ArcGIS」，
+  0 次配方调用、0 个文件
+
+**分析正确性双复核（P1-5）**
+- `review/` 包：复核 subagent **只看「数据 + 结论」**，看不到主轨迹（`ReviewClaim` 没有
+  methodology 字段，工具收窄为 5 个只读），避免被主代理的推理带着走
+- 15 条纯函数断言：守恒 / 拓扑 / 量纲各 5 条；缺事实记 `skipped`、断言写错记 `errors`，
+  **两者都不算通过**
+- 只在交付级任务开启（token 会翻倍），开关进 `requirements`，默认关
+- 实测：25 个任务注入 20 个错误，抓出 **25/25**、误杀 **0/30**
+
 ## 快速开始
 
 ### ⚠️ 重要提示
@@ -208,6 +250,9 @@ gis-agent chat --continue
 
 > CLI 细节（快捷键、斜杠命令、配色、会话续聊）见 [docs/cli.md](docs/cli.md)。
 > 启动为何很快、流式输出、以及各段耗时的实测数字见 [docs/performance.md](docs/performance.md)。
+> 合规闸门的规则库与分级口径见 [docs/compliance.md](docs/compliance.md)；
+> 民生模板库的 manifest 写法见 [docs/templates.md](docs/templates.md)；
+> 分析正确性双复核的开关与断言库见 [docs/review.md](docs/review.md)。
 
 #### 使用工作区
 
@@ -371,7 +416,7 @@ cp config/llm_config.json.example config/llm_config.json
 
 ## 测试覆盖
 
-约 **530 个测试**（全量约 60s；CI 只跑不依赖 ArcGIS 的部分，约 40s）。
+约 **1069 个测试**（`pytest -m "not arcpy"` 约 66s，CI 用的就是这条）。
 
 ```powershell
 # 全量
@@ -389,6 +434,10 @@ pytest tests/test_engine_*.py
 - 内核往返、ZMQ 串行化、覆盖前备份、GDB 存在性判断
 - 假 `.gdb` 写前守卫（AST 意图识别：该拦的拦、清理该放行的放行）
 - 子代理 delegate（隔离上下文、超时、结果截断、崩了不抛异常）
+- 双后端路由与一致性（缺后端零执行、整数严格 / 浮点 1e-6、非方像元的面积口径差）
+- 合规闸门（四条规则的正例 / 反例 / 边界，0 漏报、误报 0%）
+- 模板库（manifest 解析、参数绑定、冷启动跑通、GDAL-only 预检即拦）
+- 双复核断言库（守恒 / 拓扑 / 量纲；`skipped` 与 `errors` 都不算通过）
 - 制图设计引擎（可用假 facts 跑，不需要 ArcGIS）
 - 数据目录增量扫描 / 项目日志相关性检索
 - 终端界面（含无 ANSI 终端的回归）

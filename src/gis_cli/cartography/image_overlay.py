@@ -5,7 +5,7 @@
 - ArcGIS Pro 3.6 的布局独立文本元素（TEXT_ELEMENT）**字号与对齐无法通过 API 控制**：
   CIM 里 `CIMTextSymbol.height` 被忽略（8/20/30pt 都渲染成默认约 8pt），
   `element.textSize` 只读（回读恒为 0），`CIMTextGraphic` 会直接让进程静默崩溃。
-- 因此标题按设计规格（字号/居中/字体）在**导出后**用 Pillow 绘制到 JPG 上；
+- 因此标题按设计规格（字号/对齐/字体）在**导出后**用 Pillow 绘制到 JPG 上；
   布局里仍保留同名文本元素（默认字号），用户若要在 ArcGIS Pro 里手工调整也找得到。
 
 依赖 Pillow；字体缺失时自动回退，不影响出图。
@@ -59,12 +59,14 @@ def stamp_title(
     color: str = "#000000",
     bold: bool = True,
     clear_box: bool = True,
+    align: str = "center",
 ) -> dict:
-    """在导出图上按 mm 坐标绘制标题（居中）。
+    """在导出图上按 mm 坐标绘制标题，按 ``align``（left/center/right）在框内水平对齐。
 
     ``box_mm`` 为 ``(x, y, w, h)``，其中 y 以页面**左下角**为原点（与 LayoutSpec 一致）。
+    默认 ``center``，与历史行为一致；缺省/未知值一律按居中处理。
     粗体在无粗体字体面时用**偏移重绘**合成，避免选到 SimSun-ExtB 这类只有生僻字的字体。
-    返回 ``{"ok": bool, "font": 字体文件, "size_px": 像素字号, "detail": ...}``。
+    返回 ``{"ok": bool, "font": 字体文件, "size_px": 像素字号, "align": 实际对齐, "detail": ...}``。
     """
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
@@ -102,7 +104,14 @@ def stamp_title(
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
-    draw_x = left + (right - left - text_w) / 2.0 - bbox[0]
+    align = str(align or "center").strip().lower()
+    if align == "left":
+        draw_x = left - bbox[0]
+    elif align == "right":
+        draw_x = right - text_w - bbox[0]
+    else:
+        align = "center"
+        draw_x = left + (right - left - text_w) / 2.0 - bbox[0]
     draw_y = top + (bottom - top - text_h) / 2.0 - bbox[1]
     draw.text((draw_x, draw_y), text, font=font, fill=color)
     if bold:
@@ -110,7 +119,7 @@ def stamp_title(
         draw.text((draw_x + 1.0, draw_y), text, font=font, fill=color)
         draw.text((draw_x + 0.5, draw_y + 0.5), text, font=font, fill=color)
     canvas.save(target, quality=95)
-    return {"ok": True, "font": os.path.basename(font_file), "size_px": size_px,
+    return {"ok": True, "font": os.path.basename(font_file), "size_px": size_px, "align": align,
             "text_width_mm": round(text_w / mm_to_px, 1), "box_w_mm": round(right - left, 1)}
 
 

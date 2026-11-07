@@ -41,6 +41,27 @@ dev = [
   # Python 3.10 没有 tomllib（3.11+ 才进标准库），测试要读 pyproject 就得靠它
   "tomli>=2.0; python_version < '3.11'",
 ]
+#: GDAL 后端（P0-1b 的 GDAL 配方要它）。**必须可选**：
+#:
+#: - 缺了只降级：[gdal] 配方报"需 GDAL 后端"，引擎与 47 个 arcpy 配方照常工作。
+#: - 代码里**不**在模块顶层 import 第三方 GIS 包（只在 GDAL 执行器/断言内部按需
+#:   import），所以没装这个 extra 也不会 ImportError。
+#:
+#: 为什么**不**写 `GDAL>=3.6`：那个包是 osgeo 源码包，没有 Windows wheel，要先有
+#: libgdal/OSGeo4W 才装得上（实测 `pip download --only-binary :all: GDAL` →
+#: "from versions: none"）—— 即 `pip install gis-task-cli[gdal]` 在 Windows 上
+#: **必然失败**。真正能装的是下面这组自带 GDAL 二进制的 wheel：pyogrio/rasterio
+#: 各自打包了一份 libgdal（实测 3.12.4 / 3.12.2，互不干扰），pyproj 带 PROJ。
+#: 代价是没有 `osgeo` 模块，GDAL 配方只能用 pyogrio/rasterio 的 API。
+#: 版本号是 Windows 上实测装通的组合（GDAL 二进制由这些 wheel 自带）。
+gdal = [
+  "geopandas>=1.0",
+  "shapely>=2.0",
+  "pyproj>=3.6",
+  "pyogrio>=0.9",
+  "rasterio>=1.4",
+  "matplotlib>=3.8",
+]
 #: 锦上添花的可选依赖：缺了能跑，只是能力降级（代码里都是 try/except）。
 #:
 #: 为什么要显式声明：这几个包以前**一个都没写**在 pyproject 里，全靠
@@ -83,6 +104,11 @@ gis-agent = "gis_cli.agent.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+# 合规规则库是 YAML 数据文件：不声明就不会进 wheel，装好的用户会直接撞
+# “读不到规则库”。内置那份必须随包走（用户覆盖走 config/compliance_rules.yaml）。
+"gis_cli.compliance" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 # CI 只跑不需要 ArcGIS 的部分（``pytest -m "not arcpy"``）。

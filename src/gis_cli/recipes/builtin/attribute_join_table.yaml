@@ -2,6 +2,8 @@ id: attribute_join_table
 name: 属性表挂接（JoinField）
 description: 把外部表（CSV/DBF/GDB表）按关键字段挂接到要素类上，使表字段成为要素属性的一部分。支持先导入 CSV 再挂接。
 domain: data_management
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [挂接, 关联, join, joinfield, 属性连接, 连接表, 把表挂到, 人口数据挂接]
 preconditions:
   - 两侧关键字段类型一致（文本对文本、数值对数值）
@@ -45,6 +47,7 @@ steps:
   - CopyFeatures 复制目标要素（保留属性）
   - JoinField 挂接
   - 返回结果要素数与新增字段
+  - （GDAL 后端：CSV 直接读、容器输入自动解析、输出只支持 .gpkg / .shp）
 code_template: |
   import arcpy, os
   arcpy.env.overwriteOutput = True
@@ -61,6 +64,11 @@ code_template: |
   if not arcpy.Exists(target_path):
       raise ValueError(f"目标要素不存在: {target_path}")
 
+  # 目标输入给的是容器（.gpkg / .gdb / 文件夹）时先解析成具体图层（共享片段，见 fragments.py）
+  {{@zone_layer@}}
+
+  target_path = resolve_zone_layer(target_path)
+
   # CSV 需先导入 GDB（CSV 无法直接作为 JoinField 输入）
   if str(csv_import_name).strip():
       if not str(workspace_gdb).strip():
@@ -74,6 +82,15 @@ code_template: |
 
   if not arcpy.Exists(join_table):
       raise ValueError(f"挂接表不存在: {join_table}")
+  # 挂接表要指到表本身：容器（库/文件夹）里可能有几十张表，替用户挑一张就是替用户猜
+  try:
+      _join_dtype = arcpy.Describe(join_table).dataType
+  except Exception:
+      _join_dtype = ""
+  if _join_dtype in ("Workspace", "Folder"):
+      raise ValueError(
+          f"挂接表给的是容器（{join_table}），不是表本身：请指到表（如 {join_table}/表名、统计表.dbf、统计表.gpkg/表名）"
+      )
 
   def _has_field(container, name):
       return name in [f.name for f in arcpy.ListFields(container)]
@@ -117,6 +134,313 @@ code_template: |
       "key_match_count": matched,
   })
   print(f"JoinField done: {count} features, added fields: {added}")
+code_template_gdal: |
+  # GDAL 版：语义逐条对齐上方 arcpy 版（同名字段加 _1 / 未匹配留空 / 一对多取第一条 /
+  # 键类型不兼容直接报错而不是静默 0 行）
+  import os
+  import re
+  import geopandas as gpd
+  import pandas as pd
+  import pyogrio
+
+  target_path = {{target_path}}
+  target_key = {{target_key}}
+  join_table = {{join_table}}
+  join_key = {{join_key}}
+  join_fields = {{join_fields}}
+  output_path = {{output_path}}
+  csv_import_name = {{csv_import_name}}
+  workspace_gdb = {{workspace_gdb}}
+
+  #: ``xxx.gdb\图层`` / ``xxx.gpkg/图层`` 要拆成 dataset + layer 再读：pyogrio 不认拼在一起的
+  #: 路径（OpenFileGDB 尤其），而 arcpy 侧 resolve_zone_layer 返回的正是这个形状——两端同一
+  #: 输入都得认，否则多层容器报错里让你写 ``xxx.gpkg/图层名`` 这句话就是空头支票。
+  _LAYERED = re.compile(r"^(.*\.(?:gdb|gpkg|sqlite))[\\/](.+)$", re.IGNORECASE)
+
+  #: 输出格式白名单：GDAL 没有 FileGDB 写驱动，也不该把 .gdb 静默换成别的格式
+  _OUT_DRIVERS = {".gpkg": "GPKG", ".shp": "ESRI Shapefile"}
+
+  #: 文件里声明的 OGR 类型。为什么不用 pandas dtype：整列全空时 pyogrio 读回来是
+  #: object，is_numeric_dtype 会把一个真·数值字段误判成文本。
+  _NUMERIC_OGR = {"OFTInteger", "OFTInteger64", "OFTReal"}
+  _TEXT_OGR = {"OFTString", "OFTWideString"}
+
+
+  def _split(path):
+      """``x.gdb/图层`` → (x.gdb, 图层)；其余原样返回 (路径, None)。"""
+      m = _LAYERED.match(str(path))
+      if m and os.path.exists(m.group(1)):
+          return m.group(1), m.group(2)
+      return str(path), None
+
+
+  def _read_layer(path, what, with_fid=False):
+      """读图层：容器（.gpkg / .gdb / 文件夹）里恰好一个图层就自动取用，多层要你指明。
+
+      与 zonal_statistics 等配方的取舍不同：那边没给 layer 时读第一层 + 一条 warning，
+      这里**要求能唯一定位**——挂错图层就是错数据，而 warning 没人看。
+      没有复用 arcpy 侧的 ``resolve_zone_layer`` 片段：那段是 arcpy.Describe +
+      ListFeatureClasses，GDAL 侧只能用 pyogrio.list_layers（同 polygon_to_raster 的口径）。
+
+      ``with_fid=True``：索引用**真 OID**（``fid_as_index``）而不是 RangeIndex。
+      为什么必须这样：.gpkg 的 fid 从 1 开始、.shp 的 FID 从 0 开始，普通读法给的是
+      0..N-1，跟 arcpy 的 OBJECTID、跟 zonal_statistics 写出的 OBJECTID 列都差一位——
+      按 OID 挂接就会整列错位。
+      """
+      p = str(path)
+      dataset, layer = _split(p)
+      if layer is not None:
+          # 要素数据集里的要素类（``x.gdb/数据集名/要素类名``）：GDAL 的图层名里**没有**数据集前缀，
+          # 整段读不到就退到末段再试（arcpy 自己认这种写法）；要素数据集只存在于 .gdb。
+          candidates = [layer]
+          if dataset.lower().endswith(".gdb"):
+              leaf = re.split(r"[\\/]", layer)[-1]
+              if leaf != layer:
+                  candidates.append(leaf)
+          for name in candidates:
+              try:
+                  gdf = gpd.read_file(dataset, layer=name, engine="pyogrio", fid_as_index=with_fid)
+              except pyogrio.errors.DataLayerError:
+                  continue
+              except Exception as exc:
+                  raise ValueError(f"{what}读不出来: {dataset}/{name}（{exc}）")
+              if name != layer:
+                  print(f"图层名 {layer} 带要素数据集前缀，按末段 {name} 读（GDAL 的图层名不含数据集前缀）")
+              return dataset, name, gdf
+          available = ", ".join(str(row[0]) for row in pyogrio.list_layers(dataset))
+          raise ValueError(f"{what} {dataset} 里没有图层 {layer!r}；可用图层: {available}")
+      if not os.path.exists(p):
+          raise ValueError(f"{what}不存在: {p}")
+      if not (os.path.isdir(p) or p.lower().endswith((".gpkg", ".gdb"))):
+          # 单文件（.shp / .dbf / .csv）：没有容器这一层，直接读
+          try:
+              return p, None, gpd.read_file(p, engine="pyogrio", fid_as_index=with_fid)
+          except Exception as exc:
+              raise ValueError(f"{what}读不出来: {p}（{exc}）")
+      layers = pyogrio.list_layers(p)
+      if len(layers) == 0:
+          raise ValueError(f"{what} {p} 是工作空间容器、里面没有图层：请给出图层本身（如 {p}/图层名）")
+      if len(layers) > 1:
+          names = ", ".join(str(row[0]) for row in layers)
+          raise ValueError(
+              f"{what}是多层容器（{len(layers)} 个图层: {names}），GDAL 后端不替你挑："
+              f"请指明图层，如 {p}/图层名"
+          )
+      print(f"{what}是工作空间容器（.gpkg/.gdb/文件夹），自动使用其中唯一的图层: {layers[0][0]}")
+      return p, str(layers[0][0]), gpd.read_file(
+          p, layer=str(layers[0][0]), engine="pyogrio", fid_as_index=with_fid
+      )
+
+
+  def _info(dataset, layer):
+      """(字段名 → OGR 类型, OID 字段真名)；读不出就返回空字典（调用方退回 pandas dtype）。"""
+      try:
+          info = pyogrio.read_info(dataset, layer=layer)
+      except Exception:
+          return {}, ""
+      fields, types = info.get("fields"), info.get("ogr_types")
+      pairs = {} if fields is None or types is None else {str(n): str(t) for n, t in zip(fields, types)}
+      return pairs, str(info.get("fid_column") or "")
+
+
+  def _find(columns, wanted):
+      """字段名查找：先精确，再大小写不敏感（arcpy 的 JoinField 实测就是大小写不敏感）。"""
+      if wanted in columns:
+          return wanted
+      folded = [c for c in columns if str(c).lower() == str(wanted).lower()]
+      if len(folded) == 1:
+          return folded[0]
+      if len(folded) > 1:
+          raise ValueError(f"有多个字段与 {wanted} 只差大小写: {folded}，请写清楚")
+      return None
+
+
+  def _kind(declared, series):
+      """这个键是文本还是数值：先信文件里声明的 OGR 类型，读不出才看 pandas dtype。"""
+      if declared in _TEXT_OGR:
+          return "text"
+      if declared in _NUMERIC_OGR:
+          return "num"
+      if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+          return "num"
+      return "text"
+
+
+  if str(csv_import_name).strip():
+      # arcpy 版必须先把 CSV 导进 GDB（JoinField 不认 CSV）；GDAL 直接读 CSV，
+      # 这两个参数在这里没有意义——说一声，不静默当没看见。
+      print(f"GDAL 后端直接读 CSV，忽略 csv_import_name={csv_import_name!r} / workspace_gdb")
+
+  out_ext = os.path.splitext(str(output_path))[1].lower()
+  if out_ext not in _OUT_DRIVERS:
+      why = (
+          "GDAL 没有 FileGDB 写驱动，.gdb 要素类请用 arcpy 后端"
+          if ".gdb" in str(output_path).lower()
+          else "请给 .gpkg 或 .shp"
+      )
+      raise ValueError(f"GDAL 版输出只支持 .gpkg / .shp（收到 {output_path!r}）：{why}")
+
+  target_ds, target_layer, target = _read_layer(target_path, "目标要素", with_fid=True)
+  join_ds, join_layer, join = _read_layer(join_table, "挂接表")
+
+  if "geometry" not in target.columns:
+      raise ValueError(f"目标 {target_path} 没有几何（不是要素类）：本配方把表挂到要素类上")
+  if "geometry" in join.columns:
+      join = join.drop(columns=["geometry"])
+
+  target_types, target_fid = _info(target_ds, target_layer)
+  join_types, _ = _info(join_ds, join_layer)
+
+  wanted_target = str(target_key).strip()
+  wanted_join = str(join_key).strip()
+  if not wanted_target or not wanted_join:
+      raise ValueError("target_key / join_key 不能为空（要按哪个字段挂接）")
+
+  target_col = _find(list(target.columns), wanted_target)
+  if target_col is None:
+      # OID 在 arcpy 里是真字段（OBJECTID / FID），pyogrio 读出来是索引；.shp 的 read_info
+      # 连 fid_column 都报空串（OGR 的 Shapefile 驱动没有具名 OID 字段）——按**真名**认，
+      # 真名缺失时按 .shp 的 FID 口径（.shp 的 OID 从 0 开始）。
+      fid_name = target_fid or "FID"
+      if wanted_target.lower() in {fid_name.lower(), "objectid", "fid", "oid"}:
+          target_col = "__dair_oid__"
+          target[target_col] = target.index
+          print(f"target_key={wanted_target} 按目标要素的 OID 处理（真名 {fid_name}）")
+      else:
+          known = sorted(c for c in target.columns if c != "geometry")
+          raise ValueError(f"目标要素缺少关键字段 {wanted_target}；现有: {known}")
+  join_col = _find(list(join.columns), wanted_join)
+  if join_col is None:
+      raise ValueError(f"挂接表缺少关键字段 {wanted_join}；现有: {sorted(join.columns)}")
+
+  target_kind = _kind(target_types.get(str(target_col)), target[target_col])
+  join_kind = _kind(join_types.get(str(join_col)), join[join_col])
+  if target_kind != join_kind:
+      # arcpy 实测：文本键对数值键**不报错**，静默匹配 0 行、挂上来的字段全空。
+      # 这种「看着跑成功了、数据全是空」的产出比报错贵得多，GDAL 侧直接拒绝。
+      raise ValueError(
+          f"关键字段类型不一致（目标 {wanted_target} 是"
+          f"{'文本' if target_kind == 'text' else '数值'}、挂接表 {wanted_join} 是"
+          f"{'文本' if join_kind == 'text' else '数值'}）：arcpy 的 JoinField 遇到这种会"
+          f"静默匹配 0 行、字段全空，GDAL 后端直接拒绝；请先把两侧统一成同一类型"
+          f"（如把挂接表的键读成文本，或转成 .gpkg/.dbf 保住数值类型）"
+      )
+
+  # 匹配键：文本按「去尾部空格」比（arcpy 实测 "a  " 能匹配 "a"，ArcGIS 的字符串比较
+  # 忽略尾空格）；int/float 混用时统一成 float（arcpy 实测 1 能匹配 1.0，但不能匹配 1.5）。
+  left = target[target_col]
+  right = join[join_col]
+  if target_kind == "text":
+      left_key = left.astype("string").str.rstrip()
+      right_key = right.astype("string").str.rstrip()
+  else:
+      left_key = pd.to_numeric(left, errors="coerce")
+      right_key = pd.to_numeric(right, errors="coerce")
+      if left_key.dtype != right_key.dtype:
+          left_key = left_key.astype("float64")
+          right_key = right_key.astype("float64")
+  target["__dair_lk__"] = left_key
+  join["__dair_rk__"] = right_key
+  # 与 arcpy 同口径：数的是**非空键值**的个数（不是真匹配上的行数）
+  key_match_count = int(left_key.notna().sum())
+
+  # 一对多：arcpy 的 JoinField 只取表里**第一条**（实测 pop=10/11 时取 10），行数不变；
+  # 空键永远不匹配（实测 NULL 键对 NULL 键也是空）。
+  join = join[join["__dair_rk__"].notna()]
+  join = join.drop_duplicates(subset=["__dair_rk__"], keep="first")
+
+  requested = [f.strip() for f in str(join_fields).split(",") if f.strip()]
+  available = [c for c in join.columns if c != "__dair_rk__"]
+  if requested:
+      selected = []
+      for name in requested:
+          actual = _find(available, name)
+          if actual is None:
+              # arcpy 会把不存在的字段名静默忽略（实测），等于什么都没挂上；
+              # 拼错字段名的代价不该是「静默产出全空列」，这里直接报错。
+              raise ValueError(f"挂接表没有字段 {name}；现有: {sorted(available)}")
+          if actual not in selected:
+              selected.append(actual)
+  else:
+      # 空 join_fields = 挂接表全部字段（几何除外）；arcpy 连 join_key 也挂进来（改名 code_1）
+      selected = available
+
+  # 先给挂接字段起好**唯一的新名字**再 merge：直接 merge 同名列表会让 pandas 生成
+  # name_x / name_y，与 arcpy 的 name_1 对不上。
+  taken = {str(c).lower() for c in target.columns if c != "__dair_oid__"}
+  prepared = join[["__dair_rk__"]].copy()
+  rename = {}
+  sources = {}
+  originals = {}
+  for position, col in enumerate(selected):
+      base = str(col)
+      new = base
+      if new.lower() in taken:
+          suffix = 1
+          while f"{base}_{suffix}".lower() in taken:
+              suffix += 1
+          new = f"{base}_{suffix}"
+      taken.add(new.lower())
+      temp = f"__dair_join_{position}__"
+      prepared[temp] = join[col]
+      rename[temp] = new
+      sources[temp] = join[col]
+      originals[temp] = col
+
+  merged = target.merge(prepared, left_on="__dair_lk__", right_on="__dair_rk__", how="left", sort=False)
+  merged = merged.drop(columns=["__dair_lk__", "__dair_rk__"]).rename(columns=rename)
+  # 按 OID 挂接时用的临时列不能跟着写进产物（它就是索引，不是用户的数据列）
+  if "__dair_oid__" in merged.columns:
+      merged = merged.drop(columns=["__dair_oid__"])
+
+  # 整型字段带空值：merge 之后 pandas 会升成 float，写出来就从 INTEGER 变 REAL；
+  # 用可空整型留住（arcpy 的 Integer 字段带 NULL 就是这样）。位宽跟源字段的声明走：
+  # 挂接表是 Integer 就写 OFTInteger、是 Integer64 就写 OFTInteger64，不凭 pandas 自己猜。
+  for temp, new in rename.items():
+      source = sources[temp]
+      if pd.api.types.is_integer_dtype(source) and not pd.api.types.is_bool_dtype(source):
+          declared = join_types.get(str(originals[temp]))
+          merged[new] = merged[new].astype("Int32" if declared == "OFTInteger" else "Int64")
+
+  out = gpd.GeoDataFrame(merged, geometry="geometry", crs=target.crs)
+  os.makedirs(os.path.dirname(os.path.abspath(str(output_path))), exist_ok=True)
+  if os.path.exists(str(output_path)):
+      if out_ext == ".shp":
+          stem = os.path.splitext(str(output_path))[0]
+          for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix", ".sbn", ".sbx"):
+              if os.path.exists(stem + ext):
+                  os.remove(stem + ext)
+      else:
+          os.remove(str(output_path))
+  layer_name = os.path.splitext(os.path.basename(str(output_path)))[0]
+  if out_ext == ".shp":
+      out.to_file(str(output_path), driver=_OUT_DRIVERS[out_ext], engine="pyogrio")
+  else:
+      if layer_name.lower().startswith("gpkg"):
+          # GPKG 规范把 gpkg_ 前缀留给系统表，图层名不能以它开头（否则 OGR 报的是
+          # “The layer name may not begin with 'gpkg'” 这种看不出怎么办的错误）
+          layer_name = "lyr_" + layer_name
+          print(f"输出图层名不能以 gpkg 开头（GPKG 保留前缀），改用 {layer_name}")
+      out.to_file(str(output_path), driver=_OUT_DRIVERS[out_ext], engine="pyogrio", layer=layer_name)
+
+  # added_fields 与 arcpy 同口径：写完之后按**实际字段名**做前后差集
+  # （.shp 会把超过 10 字符的字段名截断，报原名等于骗人）。
+  out_info = _info(str(output_path), None if out_ext == ".shp" else layer_name)[0]
+  before = {str(c).lower() for c in target.columns if c != "__dair_oid__"}
+  if out_ext == ".shp":
+      # .shp 会把字段名截到 10 字符：目标自己的长字段名也得按截断后的样子比，
+      # 否则它会被当成「新增字段」报出去
+      before |= {name[:10] for name in list(before)}
+  added = [name for name in out_info if str(name).lower() not in before]
+
+  count = int(len(out))
+  set_result({
+      "output": str(output_path),
+      "feature_count": count,
+      "added_fields": added,
+      "key_match_count": key_match_count,
+  })
+  print(f"JoinField done: {count} features, added fields: {added}")
 validation:
   - type: vector_exists
     path: "{{output_path}}"
@@ -124,8 +448,19 @@ validation:
     path: "{{output_path}}"
     value: 0
 pitfalls:
-  - CSV 直接 JoinField 会失败，必须先 TableToTable 导入 GDB。
-  - 关键字段类型不一致（文本/数值）会静默匹配 0 行；先检查类型并统一。
-  - 表里有多个匹配行时 JoinField 只取第一条；需先汇总。
+  - CSV 直接 JoinField 会失败，必须先 TableToTable 导入 GDB；GDAL 后端直接读 CSV（忽略 csv_import_name / workspace_gdb，会在 stdout 里说明）。
+  - 关键字段类型不一致（文本对数值）：arcpy 实测**不报错**，静默匹配 0 行、挂上来的字段全空；GDAL 后端直接报「关键字段类型不一致」拒绝。数值 int 对 double 两端都能匹配（1 匹配 1.0，不匹配 1.5）。
+  - 表里有多个匹配行时 JoinField 只取第一条（实测同键 10/11 取 10），行数不变；需先汇总。
+  - 键对不上的行**保留**，挂上的字段为空；目标行数不变。
+  - 字段重名加 `_1`（`name` → `name_1`）；目标里已经有 `name` 和 `name_1` 时 arcpy 实测给 `name_12`（它的去重是「加后缀直到唯一」的怪实现），GDAL 后端给 `name_2`。
+  - join_fields 为空 = 挂接表全部字段（OID/几何除外），arcpy 连 join_key 也挂进来（改名 `code_1`）；GDAL 后端同样。
+  - join_fields 里写了不存在的字段：arcpy 静默忽略（等于什么都没挂上）；GDAL 后端报错并列出可用字段。
+  - 文本键的尾部空格：arcpy 的字符串比较忽略尾空格（实测 `"a  "` 能匹配 `"a"`），GDAL 版匹配前 rstrip；大小写两端都敏感（`"A"` 不匹配 `"a"`）。
+  - 目标输入给的是容器（.gpkg / .gdb / 文件夹）：两端都在「容器里恰好一个图层」时自动取用，多个图层报人话错误要你指明（如 `zones.gpkg/district`）。挂接表给容器：arcpy 一律报错（要指到表本身）；GDAL 后端单层容器自动取用（stdout 会说明用了哪张表）、多层才报错。
+  - GDAL 后端只能写 .gpkg / .shp：.gdb 要素类请用 arcpy 后端（会给明确报错，不会静默换格式）；.shp 会把超过 10 字符的字段名截断，added_fields 报的是**实际**名字。
+  - OID 不要写死：.gdb 要素类是 `OBJECTID`、.shp 是 `FID`、.gpkg 是 `fid`（.gdb 表输出还可能被改名成 `OBJECTID_1`）。GDAL 后端按 pyogrio 的 fid_column 认（.shp 连这个字段都不报，按 FID 口径），target_key 写 `OBJECTID` / `fid` 都会落到真名上；跨后端串联时用上游返回的 `zone_field`。
+  - OID 的**起始值**也不一样：.gpkg 的 fid 从 **1** 开始、.shp 的 FID 从 **0** 开始。实测：从 .gpkg 分区跑出来的 zonal_statistics 统计表 `OBJECTID` 是 1..N，拿它去挂 .shp 目标会整体错一位（32 个街区只挂上 31 个，第一个空着）；两边都是 .gpkg 才是 32/32、合计逐值相等。按 OID 挂接时要么两边同格式，要么让上游把 zone_field 写成真字段。
+  - 索引字段不用管：arcpy 实测 AddIndex 前后 JoinField 耗时无差别（2000 行 1.769s vs 1.783s）；GDAL 侧是 pandas 哈希 join，没有索引这个概念。
+  - GDAL 后端的 .csv 一律按文本读（OGR CSV 默认不推断类型），数值键会对不上而直接报类型不一致；要挂数值键请把表转成 .gpkg / .dbf。
 examples:
   - "把 population.csv 按 code 挂接到 county"

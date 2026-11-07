@@ -411,6 +411,108 @@ def test_replay_refuses_when_static_gate_fails(tmp_path: Path):
     assert runner.codes == [], "静态门禁失败时不该执行代码"
 
 
+# ------------------------------------------- 门禁/回放必须按后端选模板
+class _GdalRunner:
+    """假 GDAL 执行器：真执行配方代码，pyogrio 那句回固定要素数。"""
+
+    backends = {"gdal"}
+
+    def __init__(self, feature_count: int = 7):
+        self.feature_count = feature_count
+        self.codes: list[str] = []
+
+    def run(self, code, timeout=None, workspace=None):
+        from types import SimpleNamespace
+
+        self.codes.append(code)
+        if "pyogrio.read_info" in code:
+            return SimpleNamespace(
+                ok=True, stdout="", stderr="", error=None, display_images=[],
+                result={"exists": True, "feature_count": self.feature_count, "crs": "EPSG:32650"},
+            )
+        ns: dict = {"set_result": lambda payload: ns.__setitem__("_result", payload)}
+        try:
+            exec(compile(code, "<recipe>", "exec"), ns)
+            return SimpleNamespace(ok=True, stdout="", stderr="", error=None,
+                                   display_images=[], result=ns.get("_result"))
+        except Exception as exc:  # pragma: no cover - 反例用
+            return SimpleNamespace(ok=False, stdout="", stderr="", result=None,
+                                   error={"type": type(exc).__name__, "message": str(exc)},
+                                   display_images=[])
+
+
+def _gdal_only_recipe() -> Recipe:
+    """蒸馏出的 gdal-only 配方形态：arcpy 模板空，只有 code_template_gdal。"""
+    return Recipe(
+        id="write_gdal_marker",
+        name="只写 GDAL 版",
+        backend=["gdal"],
+        code_template="",
+        code_template_gdal=(
+            "# GDAL-ONLY-MARKER\n"
+            "import os\n"
+            "os.makedirs(os.path.dirname({{out}}), exist_ok=True)\n"
+            "with open({{out}}, 'w', encoding='utf-8') as f:\n"
+            "    f.write('gdal')\n"
+            "set_result({'output': {{out}}})\n"
+        ),
+        params={"out": RecipeParam("out", "string", True, "output/marker.gpkg", "输出")},
+        validation=[{"type": "feature_count_gt", "path": "{{out}}", "value": 5}],
+    )
+
+
+def test_static_gate_renders_declared_backend_for_gdal_only_recipe(tmp_path: Path):
+    """gdal-only 配方在门禁里必须渲染 GDAL 模板，而不是拿 arcpy 模板渲出空串。
+
+    空串渲染会让“renders / valid_python / 槽位 / 硬编码路径”全部变成空阵——
+    看着在检查，实际什么都没检查（DAIR-68 非阻塞项 2）。
+    """
+    gate = _lifecycle(tmp_path).static_gate(_gdal_only_recipe())
+
+    assert gate.ok, gate.summary()
+    renders = next(c for c in gate.checks if c.name == "renders")
+    assert renders.detail.endswith("（gdal）"), renders.detail
+    assert renders.detail != "0 字符（gdal）", "拿空串渲染等于没检查"
+
+
+def test_replay_renders_declared_backend_and_asserts_with_it(tmp_path: Path):
+    """回放：gdal-only 配方要用 GDAL 模板渲染（不是空串），断言也按 gdal 口径判。"""
+    ws = tmp_path / "ws"
+    (ws / "output").mkdir(parents=True)
+    lib = RecipeLibrary(user_dir=ws / "recipes")
+    lib.load()
+    runner = _GdalRunner(feature_count=7)
+    lc = RecipeLifecycle(lib, ws, code_runner=runner)
+    lc.save_candidate(_gdal_only_recipe(), provenance="test")
+
+    res = lc.replay("write_gdal_marker", keep=True)
+
+    assert res.ok, res.summary()
+    assert "GDAL-ONLY-MARKER" in runner.codes[0], "回放必须用 GDAL 模板渲染，不是空串"
+    assert any(
+        c.name == "assert:feature_count_gt" and c.ok and "count=7" in c.detail for c in res.checks
+    ), res.summary()
+
+
+def test_replay_reports_missing_backend_instead_of_empty_render(tmp_path: Path):
+    """回放执行器跑不了声明的后端 → 当场说缺什么，不拿空串渲染去“看着通过”。"""
+    ws = tmp_path / "ws"
+    (ws / "output").mkdir(parents=True)
+    lib = RecipeLibrary(user_dir=ws / "recipes")
+    lib.load()
+    runner = _ExecRunner()
+    runner.backends = {"arcpy"}
+    lc = RecipeLifecycle(lib, ws, code_runner=runner)
+    lc.save_candidate(_gdal_only_recipe(), provenance="test")
+
+    res = lc.replay("write_gdal_marker")
+
+    assert not res.ok
+    backend_check = next(c for c in res.checks if c.name == "backend")
+    assert "需 GDAL 后端" in backend_check.detail, backend_check.detail
+    assert runner.codes == [], "选不出后端时一行代码都不该执行"
+
+
 def test_adopt_refuses_near_duplicate(tmp_path: Path):
     """同一方法论反复蒸馏会产出一堆近义配方（实测两个 csv_group_sum_* 并存）。"""
     lc = _lifecycle(tmp_path)

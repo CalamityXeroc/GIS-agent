@@ -3,6 +3,8 @@ name: 面转栅格（Polygon to Raster）
 description: 把面要素按数值字段转换为指定像元大小的栅格（如"街区老年人口 → 5 米栅格"），是栅格分摊/叠加的第一步。
 domain: raster
 category: raster
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [面转栅格, 矢量转栅格, rasterize, polygon to raster, 转栅格]
 preconditions:
   - 输入为面要素，且使用投影坐标系（像元大小单位为米）
@@ -11,23 +13,23 @@ params:
   input_path:
     type: string
     required: true
-    description: 输入面要素
+    description: 输入面要素。也可以给容器（.gpkg / .gdb / 文件夹）：里面恰好一个图层就自动取用，多个图层要指明（如 `zones.gpkg/街区`）
   value_field:
     type: string
     required: true
-    description: 取值字段（数值）
+    description: 取值字段（数值），不能为空（arcpy 实测 ERROR 000735）；要按 OID 取值请给它的真名（.gdb=OBJECTID、.gpkg=fid、.shp=FID）
   output_path:
     type: string
     required: true
-    description: 输出栅格路径（.tif 或 gdb 内栅格名）
+    description: 输出栅格路径。arcpy 后端：.tif / .img / .gdb 内栅格；gdal 后端：.tif / .tiff / .img（写不了 gdb 内栅格，遇到会明确报错）
   cell_size:
     type: number
     default: 5
-    description: 像元大小（米）
+    description: 像元大小（米）。输出恒为方形像元；网格原点 = 输入 bbox 左下角（arcpy 实测，不是从模板栅格继承）
   cell_assignment:
     type: string
     default: "MAXIMUM_AREA"
-    description: 像元取值规则 MAXIMUM_AREA/MAXIMUM_COMBINED_AREA/CENTROID
+    description: 像元取值规则，Pro 3.6 的取值域是 MAXIMUM_AREA / MAXIMUM_COMBINED_AREA / CELL_CENTER（旧名 CENTROID 等同 CELL_CENTER）。GDAL 后端**只支持 CELL_CENTER**——另两个按"像元内面积/同值合计面积"判归属，rasterio 的 all_touched 表达不了，会明确报错而不是静默退化
 steps:
   - 校验面要素、投影坐标系、数值字段
   - PolygonToRaster
@@ -44,16 +46,46 @@ code_template: |
 
   if not arcpy.Exists(input_path):
       raise ValueError(f"输入不存在: {input_path}")
+
+  # 输入给的是容器（.gpkg / .gdb / 文件夹）时先解析成具体要素类（共享片段，见 fragments.py）
+  {{@zone_layer@}}
+
+  input_path = resolve_zone_layer(input_path)
   d = arcpy.Describe(input_path)
   if d.shapeType != "Polygon":
       raise ValueError("面转栅格需要面要素")
   if d.spatialReference.type == "Geographic":
       raise ValueError("当前为地理坐标系，像元大小会按度解释；请先投影到投影坐标系")
+  # value_field 是必填参数（PolygonToRaster 实测 ERROR 000735：值字段是必填的），空串要在这边
+  # 就说人话，并顺带给出 OID 真名——它随数据源而变（.gdb=OBJECTID、.gpkg=fid、.shp=FID）。
   flds = {f.name: f.type for f in arcpy.ListFields(input_path)}
+  value_field = str(value_field or "").strip()
+  if not value_field:
+      raise ValueError(
+          f"value_field 不能为空；要用要素的 OID 请给它的真名（本数据是 {d.OIDFieldName}）；"
+          f"可用字段: {sorted(flds)}"
+      )
+  # 字段名大小写不敏感（GDAL 侧同口径）：ListFields 给的是真名，解析成真名再往下走，
+  # 不让 "ZONE_ID" 在两端一个能跑、一个报“字段不存在”。
+  value_field = next((n for n in flds if n.upper() == value_field.upper()), value_field)
   if value_field not in flds:
       raise ValueError(f"字段不存在: {value_field}；可用: {sorted(flds)}")
   if flds[value_field] in ("String", "Date", "Guid", "Blob"):
       raise ValueError(f"取值字段必须是数值型，{value_field} 是 {flds[value_field]}")
+
+  # cell_assignment 的取值域按 Pro 3.6 实测（ERROR 000800 原文：CELL_CENTER | MAXIMUM_AREA |
+  # MAXIMUM_COMBINED_AREA）。旧版文档里的 CENTROID 现在叫 CELL_CENTER，配方按旧名兼容映射；
+  # 其余拼写当场报人话，不让工具甩一句"值不在 ... 的成员中"。
+  _ASSIGNMENTS = ("MAXIMUM_AREA", "MAXIMUM_COMBINED_AREA", "CELL_CENTER")
+  cell_assignment = str(cell_assignment or "MAXIMUM_AREA").strip().upper()
+  if cell_assignment == "CENTROID":
+      print("cell_assignment=CENTROID 是旧名，按 Pro 3.6 的 CELL_CENTER 处理")
+      cell_assignment = "CELL_CENTER"
+  if cell_assignment not in _ASSIGNMENTS:
+      raise ValueError(
+          f"cell_assignment={cell_assignment!r} 不认识：Pro 3.6 的取值域是 {list(_ASSIGNMENTS)}"
+          f"（CENTROID 是旧名，等同 CELL_CENTER）"
+      )
 
   out_folder = os.path.dirname(output_path)
   if str(out_folder).lower().endswith(".gdb"):
@@ -72,6 +104,212 @@ code_template: |
               "cell_size": r.meanCellWidth, "size": [r.width, r.height],
               "min": r.minimum, "max": r.maximum, "cell_count": valid})
   print(f"PolygonToRaster done: {r.width}x{r.height}, cell={r.meanCellWidth:.3f}, range={r.minimum}~{r.maximum}")
+code_template_gdal: |
+  # GDAL 版：同一套守卫 + 同一个输出网格 + 同一条「先出现的要素优先」重叠规则
+  import os
+  import re
+  import numpy as np
+  import geopandas as gpd
+  import pyogrio
+  import rasterio
+  from rasterio.features import rasterize
+  from rasterio.transform import from_origin
+
+  input_path = {{input_path}}
+  value_field = {{value_field}}
+  output_path = {{output_path}}
+  cell_size = float({{cell_size}})
+  cell_assignment = {{cell_assignment}}
+
+  #: ``xxx.gdb\图层`` / ``xxx.gpkg/图层`` 要拆成 dataset + layer 再读：pyogrio 不认拼在一起的
+  #: 路径（OpenFileGDB 尤其），而 arcpy 侧 resolve_zone_layer 返回的正是这个形状——两端同一输入
+  #: 都得认，否则多层容器报错里让你写 ``xxx.gpkg/图层名`` 这句话就是空头支票。
+  _LAYERED = re.compile(r"^(.*\.(?:gdb|gpkg|sqlite))[\\/](.+)$", re.IGNORECASE)
+
+  #: 输出格式白名单：GDAL 写不了 gdb 里的栅格（没有 FGDB 写驱动），也不该把 .img 静默换成别的格式
+  _OUT_DRIVERS = {".tif": "GTiff", ".tiff": "GTiff", ".img": "HFA"}
+
+  #: arcpy 的取值域（Pro 3.6 实测：CELL_CENTER | MAXIMUM_AREA | MAXIMUM_COMBINED_AREA）
+  _ASSIGNMENTS = ("MAXIMUM_AREA", "MAXIMUM_COMBINED_AREA", "CELL_CENTER")
+
+  #: 输出的 nodata：整型用 int32 最小值（真实取值不可能是它），浮点用与 arcpy 的 F32 同一哨兵值
+  #: （也和 zonal_statistics_raster 一致）
+  _NODATA_INT = -2147483648
+  _NODATA_FLOAT = -3.4028234663852886e+38
+
+
+  def _read_features(path):
+      """读面图层；容器（.gpkg / .gdb / 文件夹）里恰好一个图层就自动取用，多层要你指明。
+
+      没有复用 arcpy 侧的 ``resolve_zone_layer`` 片段：片段里是 arcpy.Describe +
+      ListFeatureClasses，GDAL 侧只能用 pyogrio.list_layers。同 zonal_statistics_raster
+      的 GDAL 段，配方模板自包含，不跨后端复用代码。
+      """
+      p = str(path)
+      split = _LAYERED.match(p)
+      if split and os.path.exists(split.group(1)):
+          dataset, layer = split.group(1), split.group(2)
+          #: 要素数据集里的要素类（``xxx.gdb/数据集名/要素类名``）：GDAL 的图层名里**没有**数据集
+          #: 前缀（pyogrio.list_layers 只给末段），整段读不到就退到末段再试——arcpy 自己解析这种
+          #: 写法（实测正反斜杠都认），两端对同一输入同一写法得都能跑。要素数据集只存在于 .gdb，
+          #: 别的容器出现多段图层名一律当写错：宁可报错，也不按末段猜一个图层出来。
+          candidates = [layer]
+          if dataset.lower().endswith(".gdb"):
+              leaf = re.split(r"[\\/]", layer)[-1]
+              if leaf != layer:
+                  candidates.append(leaf)
+          for name in candidates:
+              try:
+                  gdf = gpd.read_file(dataset, layer=name, engine="pyogrio")
+              except pyogrio.errors.DataLayerError:
+                  continue
+              if name != layer:
+                  print(f"图层名 {layer} 带要素数据集前缀，按末段 {name} 读（GDAL 的图层名不含数据集前缀）")
+              return gdf
+          available = ", ".join(str(row[0]) for row in pyogrio.list_layers(dataset))
+          raise ValueError(
+              f"输入 {dataset} 里没有图层 {layer!r}；可用图层: {available}"
+          ) from None
+      if not os.path.exists(p):
+          raise ValueError(f"输入不存在: {p}")
+      layers = pyogrio.list_layers(p)
+      if len(layers) == 0:
+          raise ValueError(f"输入 {p} 是工作空间容器、里面没有图层：请给出图层本身（如 .gpkg/图层名）")
+      if len(layers) > 1:
+          names = ", ".join(str(row[0]) for row in layers)
+          raise ValueError(
+              f"输入是多层容器（{len(layers)} 个图层: {names}），GDAL 后端不替你挑："
+              f"请指明图层，如 {p}/图层名"
+          )
+      print(f"输入是工作空间容器（.gpkg/.gdb/文件夹），自动使用其中唯一的图层: {layers[0][0]}")
+      return gpd.read_file(p, layer=str(layers[0][0]), engine="pyogrio")
+
+
+  # 输出格式：白名单 + 拒绝时说清为什么（同 zonal_statistics_raster 的规矩，不静默换格式）
+  out_ext = os.path.splitext(str(output_path))[1].lower()
+  if out_ext not in _OUT_DRIVERS:
+      why = ("GDAL 后端写不了 gdb 里的栅格（没有 FGDB 写驱动），请给 .tif"
+             if ".gdb" in str(output_path).lower() else "GDAL 版输出只支持 .tif / .tiff / .img")
+      raise ValueError(f"GDAL 版输出格式不支持（收到 {output_path!r}）：{why}；gdb 栅格请用 arcpy 后端")
+
+  if cell_size <= 0:
+      raise ValueError(f"像元大小必须是正数（收到 {cell_size}）")
+
+  requested = str(cell_assignment or "MAXIMUM_AREA").strip().upper()
+  if requested == "CENTROID":
+      print("cell_assignment=CENTROID 是旧名，按 Pro 3.6 的 CELL_CENTER 处理")
+      requested = "CELL_CENTER"
+  if requested in ("MAXIMUM_AREA", "MAXIMUM_COMBINED_AREA"):
+      raise ValueError(
+          f"cell_assignment={requested} 在 GDAL 后端做不出来：它按「像元内各面的面积」"
+          f"（MAXIMUM_AREA）或「同值面的合计面积」（MAXIMUM_COMBINED_AREA）判归属，arcpy 实测还带一条"
+          f"「像元被面覆盖不到一半就输出 nodata」的门槛（49% → nodata、50% → 有值）；rasterio 的"
+          f" all_touched 只有「格心是否落在面内」一种语义，硬凑就是静默换语义。"
+          f"要逐像元对齐请传 cell_assignment=CELL_CENTER，或改用 arcpy 后端。"
+      )
+  if requested not in _ASSIGNMENTS:
+      raise ValueError(
+          f"cell_assignment={cell_assignment!r} 不认识：Pro 3.6 的取值域是 {list(_ASSIGNMENTS)}"
+          f"（CENTROID 是旧名，等同 CELL_CENTER；本后端只支持 CELL_CENTER）"
+      )
+
+  gdf = _read_features(input_path)
+  if gdf.empty:
+      raise ValueError(f"输入面图层没有要素: {input_path}")
+  other_types = sorted(
+      {str(k) for k in gdf.geom_type.dropna().unique() if str(k) not in ("Polygon", "MultiPolygon")}
+  )
+  if other_types:
+      raise ValueError(f"面转栅格需要面要素，输入里有 {other_types}")
+  if gdf.crs is None:
+      raise ValueError("输入没有坐标系（CRS），无法确定输出栅格的坐标系；请先定义并投影到投影坐标系")
+  if gdf.crs.is_geographic:
+      raise ValueError("当前为地理坐标系，像元大小会按度解释；请先投影到投影坐标系")
+
+  columns = [c for c in gdf.columns if c != "geometry"]
+  # 与 arcpy 的 ListFields 同一口径：字段名大小写不敏感（解析成真名）
+  wanted = str(value_field or "").strip()
+  if not wanted:
+      raise ValueError(
+          f"value_field 不能为空（arcpy 的 PolygonToRaster 实测 ERROR 000735）；"
+          f"要用要素的 OID 请给它的真名（.gdb=OBJECTID、.gpkg=fid、.shp=FID）；可用字段: {columns}"
+      )
+  actual_field = next((c for c in columns if c.upper() == wanted.upper()), None)
+  if actual_field is None:
+      raise ValueError(f"字段不存在: {wanted}；可用: {columns}")
+
+  kind = getattr(gdf[actual_field].dtype, "kind", "O")
+  if kind not in ("i", "u", "f", "b"):
+      raise ValueError(f"取值字段必须是数值型，{actual_field} 是 {gdf[actual_field].dtype}")
+  # dtype：arcpy 按值域挑最省的类型（Int 11/22/33 → S8、1/2 → U2、15 万 → S32、Double → F32/F64），
+  # GDAL 侧按字段类型定（整型 → int32，浮点 → float64）。像元值与 nodata 掩膜一致，只是存储类型不同。
+  is_int = kind in ("i", "u", "b")
+  dtype = "int32" if is_int else "float64"
+  nodata = _NODATA_INT if is_int else _NODATA_FLOAT
+
+  geom_ok = gdf.geometry.notna() & ~gdf.geometry.is_empty
+  if not geom_ok.any():
+      raise ValueError("输入面图层没有有效几何（全为空），无法栅格化")
+  # 输出网格：arcpy 实测**锚在 bbox 左下角**、向右/向上铺 height/cell_size 个格：
+  # origin = (minx, miny)、width = round(宽/像元)、height = round(高/像元)（0.5 进位：3.5 格 → 4 格、
+  # 4.5 格 → 5 格），且**不外扩到格线**：bbox 230..1780 × 170..940 → 输出 extent 230..1830 × 170..970；
+  # 3000×1000 / 37 → 81 列 × 27 行、extent 0..2997 × 0..999（左上角不是 maxy，是 miny + height*像元）。
+  minx, miny, maxx, maxy = (float(v) for v in gdf.loc[geom_ok].total_bounds)
+  width = int((maxx - minx) / cell_size + 0.5)
+  height = int((maxy - miny) / cell_size + 0.5)
+  if width < 1 or height < 1:
+      raise ValueError(
+          f"输入范围只有 {maxx - minx:.3f} × {maxy - miny:.3f} 米，比像元大小 {cell_size} 还小："
+          f"栅格化后连一个像元都没有，请调小 cell_size"
+      )
+  transform = from_origin(minx, miny + height * cell_size, cell_size, cell_size)
+
+  # 取值字段是 NULL 的要素不参与栅格化（arcpy 实测：那块像元是 nodata），但它的几何照样进 bbox
+  work = gdf.loc[geom_ok & gdf[actual_field].notna()]
+  if work.empty:
+      raise ValueError(f"取值字段 {actual_field} 全是空值，没有可栅格化的要素")
+  if is_int:
+      lo, hi = int(work[actual_field].min()), int(work[actual_field].max())
+      if lo <= _NODATA_INT or hi > 2147483647:
+          raise ValueError(
+              f"整型取值 {lo}~{hi} 超出 int32 范围：GDAL 版输出 int32，请先缩放取值，或改用 arcpy 后端"
+          )
+
+  # 重叠面：arcpy 实测「先出现的要素优先」（把插入顺序反过来结果就反过来），而 rasterize 是
+  # 后画的覆盖先画的 → 反序喂几何。all_touched=False = 格心判定，正是 CELL_CENTER 的语义。
+  shapes = [(geom, float(v)) for geom, v in zip(work.geometry, work[actual_field])]
+  band = rasterize(
+      list(reversed(shapes)),
+      out_shape=(height, width),
+      transform=transform,
+      fill=nodata,
+      dtype=dtype,
+      all_touched=False,
+  )
+
+  os.makedirs(os.path.dirname(os.path.abspath(str(output_path))), exist_ok=True)
+  if os.path.exists(str(output_path)):
+      os.remove(str(output_path))
+  profile = {
+      "driver": _OUT_DRIVERS[out_ext],
+      "height": int(band.shape[0]),
+      "width": int(band.shape[1]),
+      "count": 1,
+      "dtype": dtype,
+      "crs": gdf.crs,
+      "transform": transform,
+      "nodata": nodata,
+  }
+  with rasterio.open(str(output_path), "w", **profile) as dst:
+      dst.write(band, 1)
+
+  valid = band != nodata
+  vmin = float(band[valid].min()) if valid.any() else None
+  vmax = float(band[valid].max()) if valid.any() else None
+  set_result({"output": str(output_path), "value_field": actual_field,
+              "cell_size": cell_size, "size": [int(band.shape[1]), int(band.shape[0])],
+              "min": vmin, "max": vmax, "cell_count": int(valid.sum())})
+  print(f"PolygonToRaster done: {band.shape[1]}x{band.shape[0]}, cell={cell_size:.3f}, range={vmin}~{vmax}")
 validation:
   - type: raster_exists
     path: "{{output_path}}"
@@ -82,6 +320,22 @@ pitfalls:
   - 文本字段不能直接转栅格，需要先解析为数值（如 "28.3%" → 28.3）。
   - 输出像元大小要与后续栅格计算/分摊的基准栅格一致，否则重采样会引入误差。
   - build_ratings 参数只接受 BUILD / DO_NOT_BUILD（写 NONE 会报 000622 参数无效）。
+  - 输出网格**不从任何模板栅格继承**：锚在输入 bbox 左下角、向右向上铺 round(宽/像元)×round(高/像元) 个格（arcpy 实测：bbox 230..1780 × 170..940 → 输出 extent 230..1830 × 170..970、16×8；3.3 格 → 3 格、3.5 格 → 4 格；3000×1000 / 37 → 81×27、extent 0..2997 × 0..999）。所以输入里多一个要素（哪怕取值字段为空）网格就会平移——要跟别的栅格逐像元对齐，先核对左下角与像元大小。
+  - 输入给 **.gpkg** 时 arcpy 报的图层 extent 会被按 float32 网格**向外**取整（真实街区实测：4413873.9091 → 4413873.5、4426586.4066 → 4426586.5、441405.626 → 441405.625、452504.1412 → 452504.15625），而 `SHAPE@` 读到的几何范围是双精度真值；GDAL 版用的是几何真值，所以 **.gpkg 输入下两端网格可能差一行**（32 街区 × 5 m 实测：bbox 高 12712.4974 / 5 = 2542.4995，arcpy 出 2543 行、GDAL 出 2542 行、origin 差 4.59 m）。同一份几何转成 .gdb 后两端网格、nodata 掩膜、像元值完全一致（3,686,890 像元 0 差异）；.gdb/.shp 上 describe extent == 几何范围。**要严格逐像元对齐，输入用 .gdb 或 .shp。**
+  - "`cell_assignment` 的取值域在 Pro 3.6 是 **MAXIMUM_AREA / MAXIMUM_COMBINED_AREA / CELL_CENTER**（传 CENTROID 报 ERROR 000800）；本配方把 CENTROID 当旧名映射到 CELL_CENTER，其余拼写两端都当场报人话。"
+  - MAXIMUM_AREA（默认）与 MAXIMUM_COMBINED_AREA 都带一条**覆盖率门槛**：单元格被面覆盖不到一半时输出 nodata（arcpy 实测 49%→nodata、50%→有值）；CELL_CENTER 没有这条门槛，格心落在面内就有值。
+  - 三种取值不等价：格心在 A 面里、但 B 面占该格面积更大时 MAXIMUM_AREA 给 B、CELL_CENTER 给 A（实测：10% 竖条 + 90% 一块 → MA 取 90% 那块、CC 取格心所在的竖条）；MAXIMUM_AREA 与 MAXIMUM_COMBINED_AREA 也会分道（实测同一格：MA 取 30% 的单面、COMBINED 取合计 56% 的同值面），但**不是总有差**（实测：46% 的 T 形 + 两块各 27% → 两者都取 T 形）。
+  - CELL_CENTER 与另两个还有一处结构性差别：它没有覆盖率门槛，**格心落在无面覆盖的空档里就 nodata**（实测：单格覆盖 86%、格心在两个面的缝隙里 → nodata），而 MAXIMUM_AREA / MAXIMUM_COMBINED_AREA 靠 ≥50% 覆盖率给值。所以换 cell_assignment 时 nodata 掩膜会变，逐像元对比要按同一取值来比。
+  - 返回值里的 `cell_count` 两端口径不同：arcpy 报 width×height（**把 nodata 也算进去**，这是本配方原有的口径，未改），GDAL 报有效像元数。要比像元数请直接读栅格（nodata 掩膜两端一致）。
+  - GDAL 后端**只支持 CELL_CENTER**：rasterio 的 all_touched 只有"格心判定/碰到就填"两种语义，做不出面积判据，传另两个取值会明确报错而不是悄悄退化成格心。
+  - 输出 dtype 两端不同：arcpy 按值域挑最省的类型（实测 int 字段 11/22/33 → S8、1/2 → U2、15 万 → S32、真实街区 ELDER_N 11516~35121 → U2/nodata 65535；Double 字段 → F32，表示不了才 F64），GDAL 固定 int32（整型字段）/ float64（浮点字段）。像元值与 nodata 掩膜一致，dtype 不同只是存储类型。
+  - 取值字段为 NULL 的要素不参与栅格化（那块像元是 nodata），但它的几何照样进 bbox（arcpy 实测：4 块分区、第 4 块取值为空 → 输出仍 40 列、那 10 列全 nodata）。两端一致。
+  - 重叠面：**先出现的要素优先**（按 OID 顺序；实测把插入顺序反过来结果就反过来）。面要素应互不重叠，重叠本身是数据问题。
+  - 像元中心正好压在面边界上时两端取舍不同：arcpy 把这个像元算给该面，GDAL 只按自己的边界规则判（网格对齐的多边形不触发）。
+  - 输入给容器（.gpkg / .gdb / 文件夹）时两端都自动取其中唯一的图层；多层容器两端都报错要你指明（如 `zones.gpkg/街区`）。.gdb 里的要素类放在**要素数据集**里时，arcpy 的 `ListFeatureClasses` 不递归（容器这一层报「要素类都在要素数据集里」），GDAL 的图层名里也没有数据集前缀——两端都请写成 `ds.gdb/数据集名/要素类名`（正反斜杠都认）。
+  - "`value_field` 不能为空（arcpy 实测 ERROR 000735）；要按 OID 取值请给它的真名——它随数据源而变（.gdb=OBJECTID、.gpkg=fid、.shp=FID），别硬编码。"
+  - 像元大小是本配方的**参数标量**，输出恒为方形像元（arcpy 实测 cell=37 → 81 列 × 27 行、extent 0..2997）；不像 zonal_statistics_raster 那样会被输入栅格拉成方形。
+  - 很慢：大范围 + 小像元时把 timeout_seconds 调大（GDAL 侧一次 rasterize，arcpy 侧一次 PolygonToRaster 遍历）。
 examples:
   - "把街区老年人口转为 5 米栅格，用于像元级分摊"
   - "把绿地面积字段转成栅格"

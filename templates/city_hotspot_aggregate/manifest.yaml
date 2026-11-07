@@ -1,0 +1,137 @@
+id: city_hotspot_aggregate
+name: 区县人口汇总到地市 + 热点/冷点探测
+description: >-
+  口径：只有区县中心点经纬度的逐年人口 CSV + 区县面 + 地市面 →
+  CSV 转点并空间挂接到区县（得到带 Y2011..Y2020 的 county_pop）→ 地市面投影 →
+  按空间位置把各区县人口 SUM 汇总回地市（SUM_Y* 与 SRC_COUNT）→
+  对 2011/2012/2013 三年人口各做一次 Getis-Ord Gi* 热点分析，
+  产出三个带 GiZScore / GiPValue / Gi_Bin 的要素类。
+  回答「人口在地市尺度怎么集聚、哪几年有显著热点/冷点」。
+  不做人口预测、不做时空扫描统计，也不改汇总口径（固定 SUM + 区县中心点归属）。
+version: "1.0"
+# 只声明 arcpy：链上 csv_points_spatial_join（XY 转点 + SpatialJoin）与
+# hotspot_analysis（Getis-Ord Gi*）都是 arcpy-only，写双后端会在跑到第 4 步才炸；
+# 预检会提前报「需 ArcGIS」。
+backend: [arcpy]
+
+data:
+  population_csv:
+    type: file
+    required: true
+    purpose: >-
+      区县逐年人口 CSV：每行一个区县中心点，含经度/纬度列（默认 CenterLon/CenterLat）
+      与 Y2011..Y2020 逐年人口列。CSV 与区县面之间没有公共键，只能靠坐标空间挂接
+  county:
+    type: vector
+    required: true
+    purpose: >-
+      区县面（挂接逐年人口的载体；最好带 name / code 便于核对）。
+      坐标系不限：模板按它的坐标系做空间连接，再把结果投影到 target_srid
+  city:
+    type: vector
+    required: true
+    purpose: >-
+      地市面（汇总与分析单元）。需要一个唯一的字符串标识字段（优先 name）：
+      aggregate_to_zones 按它把区县汇总回地市并回写
+  target_srid:
+    type: integer
+    required: false
+    default: 4508
+    purpose: 分析用投影坐标系 EPSG/WKID（默认 4508；热点分析的邻接权重与面积口径需要投影坐标系）
+  lon_field:
+    type: string
+    required: false
+    default: CenterLon
+    purpose: CSV 里的经度列名（WGS84 十进制度）
+  lat_field:
+    type: string
+    required: false
+    default: CenterLat
+    purpose: CSV 里的纬度列名（WGS84 十进制度）
+
+pipeline:
+  # 区县面是地理坐标系，CSV 只有经纬度：菜谱先把点按 target_srid 转点/投影，
+  # 再按 INTERSECT 挂接到区县，最后把整个 county_pop 投影到 target_srid。
+  - id: county_pop
+    recipe_id: csv_points_spatial_join
+    params:
+      csv_path: $data.population_csv
+      lon_field: $data.lon_field
+      lat_field: $data.lat_field
+      target_path: $data.county
+      output_path: $out/result_data.gdb/county_pop
+      source_srid: 4326
+      target_srid: $data.target_srid
+  - id: city_proj
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.city
+      output_path: $out/result_data.gdb/city_4508
+      target_srid: $data.target_srid
+  # 汇总口径：区县按**中心点**归属地市（HAVE_THEIR_CENTER_IN，区县与地市边界并不严丝合缝），
+  # 字段是 SUM_Y2011..SUM_Y2020 加一个 SRC_COUNT（每个地市落进来的区县数）。
+  # 年份与字段名固定写死：热点分析要按年份逐个调配方，模板层不支持「一步展开成三步」。
+  - id: city_pop
+    recipe_id: aggregate_to_zones
+    params:
+      zones_path: $steps.city_proj.output
+      source_path: $steps.county_pop.output
+      output_path: $out/result_data.gdb/city_pop
+      stat_fields: "Y2011,Y2012,Y2013,Y2020"
+      stat_type: SUM
+  # 三年各一次 Gi*：Gi_Bin 1/2/3 = 90/95/99% 热点，-1/-2/-3 = 冷点，0 = 不显著。
+  - id: hotspot_2011
+    recipe_id: hotspot_analysis
+    params:
+      input_path: $steps.city_pop.output
+      field_name: SUM_Y2011
+      output_path: $out/result_data.gdb/city_hot_2011
+  - id: hotspot_2012
+    recipe_id: hotspot_analysis
+    params:
+      input_path: $steps.city_pop.output
+      field_name: SUM_Y2012
+      output_path: $out/result_data.gdb/city_hot_2012
+  - id: hotspot_2013
+    recipe_id: hotspot_analysis
+    params:
+      input_path: $steps.city_pop.output
+      field_name: SUM_Y2013
+      output_path: $out/result_data.gdb/city_hot_2013
+
+assertions:
+  - type: fields_present
+    path: $steps.city_pop.output
+    value: ["SUM_Y2011", "SUM_Y2012", "SUM_Y2013", "SUM_Y2020", "SRC_COUNT"]
+  # 汇总结果必须是投影坐标系：热点分析在地理坐标系上会直接拒绝
+  - type: crs_wkid
+    path: $steps.city_pop.output
+    value: $data.target_srid
+  # 地市没有多出来（CopyFeatures 守恒）——多出要素一般是分区键重名或扇出
+  - type: feature_count_between
+    path: $steps.city_pop.output
+    value: [1, $steps.city_proj.feature_count]
+  # 汇总没落上时 SUM_* / SRC_COUNT 都是空或 0：两条和值必须为正
+  - type: field_sum_gt
+    path: $steps.city_pop.output
+    field: SRC_COUNT
+    value: 0
+  - type: field_sum_gt
+    path: $steps.city_pop.output
+    field: SUM_Y2011
+    value: 0
+  - type: fields_present
+    path: $steps.hotspot_2011.output
+    value: ["GiZScore", "GiPValue", "Gi_Bin"]
+  # Gi_Bin 只有一个取值说明热点分析没跑成（或全部不显著）：那等于没识别出冷热点
+  - type: field_distinct_gt
+    path: $steps.hotspot_2011.output
+    field: Gi_Bin
+    value: 1
+  - type: field_distinct_gt
+    path: $steps.hotspot_2013.output
+    field: Gi_Bin
+    value: 1
+  - type: feature_count_between
+    path: $steps.hotspot_2012.output
+    value: [1, $steps.city_pop.feature_count]

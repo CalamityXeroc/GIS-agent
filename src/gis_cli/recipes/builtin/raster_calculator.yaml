@@ -3,9 +3,11 @@ name: 栅格计算（地图代数，支持分摊与补缺）
 description: 用 arcpy.sa 地图代数对多个栅格做运算（四则、Con/IsNull/SetNull、掩膜），支持"像元值/区内总值×区域人数"这类分摊公式与缺失值补缺。
 domain: raster
 category: raster
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [栅格计算, 栅格计算器, map algebra, 分摊, 权重, 加权, 补缺, Con, IsNull, 栅格运算]
 preconditions:
-  - 参与运算的栅格像元大小/坐标系一致（不一致时用 cell_size 与 extent 统一）
+  - 参与运算的栅格坐标系一致；**参与运算的输入像元大小不一致时必须显式给 `resampling`**（混分辨率的取格口径不能靠两端各自的默认，见 pitfalls）
   - 输入栅格已存在，表达式里的名称与 inputs 绑定名一致
 params:
   inputs:
@@ -19,7 +21,7 @@ params:
   output_path:
     type: string
     required: true
-    description: 输出栅格
+    description: 输出栅格。arcpy 后端：.tif / .img / .gdb 内栅格；gdal 后端：.tif / .tiff / .img（写不了 gdb 内栅格，遇到会明确报错）
   cell_size:
     type: string
     default: ""
@@ -27,14 +29,19 @@ params:
   extent_ref:
     type: string
     default: ""
-    description: 输出范围参考（输入绑定名或路径）；空则用第一个输入栅格
+    description: 输出范围参考（输入绑定名或路径）；空则按 arcpy 的逐结点规则取各输入的交集（见 pitfalls）
+  resampling:
+    type: string
+    default: ""
+    description: 混分辨率输入的重采样方法（nearest / bilinear）；参与运算的 inputs 之间像元大小不一致时必填，不给会报错（分类数据用 nearest）
 steps:
   - 绑定输入栅格为表达式变量
   - 设置像元大小/范围/NoData 环境
   - 求值并保存
   - 返回统计量与空值数
 code_template: |
-  import arcpy, os, math
+  import arcpy, os, math, re, shutil, tempfile
+  import numpy as np
   arcpy.env.overwriteOutput = True
 
   inputs_spec = {{inputs}}
@@ -42,6 +49,11 @@ code_template: |
   output_path = {{output_path}}
   cell_size = str({{cell_size}}).strip()
   extent_ref = str({{extent_ref}}).strip()
+  resampling = str({{resampling}}).strip().lower()
+
+  _RESAMPLING_METHODS = ("nearest", "bilinear")
+  if resampling and resampling not in _RESAMPLING_METHODS:
+      raise ValueError(f"resampling={resampling!r} 不支持；本版只接受 {list(_RESAMPLING_METHODS)}")
 
   if not str(expression).strip():
       raise ValueError("expression 不能为空")
@@ -63,48 +75,1004 @@ code_template: |
   if not bound:
       raise ValueError("inputs 至少需要一个 '名称=路径'")
 
-  first = next(iter(bound.values()))
-  if cell_size:
-      arcpy.env.cellSize = float(cell_size) if cell_size.replace(".", "", 1).isdigit() else bound.get(cell_size, first)
-  else:
-      arcpy.env.cellSize = first
-  if extent_ref:
-      ref = bound.get(extent_ref)
-      arcpy.env.extent = ref if ref is not None else extent_ref
+  first_name = next(iter(paths))
 
-  # 可用函数：arcpy.sa 全部公开函数 + 绑定的栅格变量
-  # 注意：arcpy.sa 内部会用到 __import__，因此这里必须传完整 builtins（
-  # 本内核本就是模型可执行代码的环境，限制 builtins 没有安全收益，只会误伤）
-  allowed = {k: getattr(arcpy.sa, k) for k in dir(arcpy.sa) if not k.startswith("_")}
-  allowed.update(bound)
+  # 坐标系必须一致：混分辨率分支按各自 Describe 出来的坐标数值直接建窗、重采样，两套 CRS
+  # （如相邻两条 UTM 带）会被当成同一坐标空间算出**没有报错、数值却跨带错位**的栅格
+  # （DAIR-152 实测：10 m@32650 + 30 m@32651 在 arcpy 侧静默出 10×10 全有效结果，
+  # GDAL 侧报「坐标系不一致」）。口径与 GDAL 版 pyproj.CRS.equals(ignore_axis_order=True)
+  # 对齐：两边都有 WKID 就比 WKID（同 EPSG 但 WKT 写法不同要放过）；任一边没有 WKID 就比
+  # 投影参数。**不能比名字**：proj4 派生的 WKT 在 Pro 里名字恒为 'unknown'，32650 与 32651
+  # 因此被当成同一坐标系放过（DAIR-157 实测：两幅只差 Central_Meridian 117/123，参数能
+  # 分开、名字不能）。
+  def _crs_wkid(sr):
+      return int(getattr(sr, "factoryCode", 0) or 0)
+
+  def _num(obj, attr):
+      try:
+          return round(float(getattr(obj, attr)), 6)
+      except Exception:
+          return None
+
+
+  def _txt(obj, attr):
+      return str(getattr(obj, attr, "") or "")
+
+
+  # 口径：这份参数元组只覆盖 arcpy 暴露的属性；GDAL 侧 pyproj.CRS.equals 还会看 TOWGS84
+  # 之类的基准面变换参数，极端自定义基准面下两端可能不对称（DAIR-157 未构造该用例）。
+  def _crs_params(sr):
+      _gcs = getattr(sr, "GCS", None)
+
+      # 只取有含义的名字（投影方法、单位、datum/spheroid/本初子午线）：顶层 name 与
+      # GCS name 在无 WKID 时是占位符 'unknown'，一进 key 就又退回比名字。
+      return (
+          _txt(sr, "type"), _txt(sr, "projectionName"),
+          _num(sr, "centralMeridian"), _num(sr, "centralParallel"),
+          _num(sr, "latitudeOfOrigin"), _num(sr, "longitudeOfOrigin"),
+          _num(sr, "azimuth"), _num(sr, "scaleFactor"),
+          _num(sr, "standardParallel1"), _num(sr, "standardParallel2"),
+          _num(sr, "falseEasting"), _num(sr, "falseNorthing"),
+          # 1st/2nd 点参数：Esri 支持 Two_Point_Equidistant（arcpy 实测 loadFromString 该
+          # 投影后四项分别读回 117/31/123/35），不纳入就会把只差该参数的 CRS 判成一致
+          _num(sr, "longitudeOf1st"), _num(sr, "latitudeOf1st"),
+          _num(sr, "longitudeOf2nd"), _num(sr, "latitudeOf2nd"),
+          _txt(sr, "linearUnitName"), _num(sr, "metersPerUnit"),
+          _txt(_gcs, "type"), _num(_gcs, "semiMajorAxis"), _num(_gcs, "semiMinorAxis"),
+          _txt(_gcs, "datumName"), _txt(_gcs, "spheroidName"),
+          _txt(_gcs, "primeMeridianName"), _txt(_gcs, "angularUnitName"),
+      )
+
+  def _crs_hint(sr):
+      # 报错用：无 WKID 时 name 在 Pro 里恒为占位符 'unknown'，只写名字定位不到差异，
+      # 把非零的投影参数摆出来（只列非零项，免得被一串 0 淹没）
+      def _g(v):
+          return "-" if v is None else f"{v:g}"
+
+      _bits = []
+      if _txt(sr, "projectionName"):
+          _bits.append(_txt(sr, "projectionName"))
+      for _label, _attr in (
+          ("中央经线", "centralMeridian"), ("原点纬度", "latitudeOfOrigin"),
+          ("标准纬线1", "standardParallel1"), ("标准纬线2", "standardParallel2"),
+          ("比例因子", "scaleFactor"), ("东偏", "falseEasting"), ("北偏", "falseNorthing"),
+      ):
+          _v = _num(sr, _attr)
+          if _v:
+              _bits.append(f"{_label} {_v:g}")
+      if _num(sr, "longitudeOf1st") or _num(sr, "latitudeOf1st"):
+          _bits.append("1st点 " + _g(_num(sr, "longitudeOf1st")) + ","
+                       + _g(_num(sr, "latitudeOf1st")))
+      if _num(sr, "longitudeOf2nd") or _num(sr, "latitudeOf2nd"):
+          _bits.append("2nd点 " + _g(_num(sr, "longitudeOf2nd")) + ","
+                       + _g(_num(sr, "latitudeOf2nd")))
+      if _txt(sr, "linearUnitName"):
+          _bits.append(_txt(sr, "linearUnitName"))
+      return "(" + ", ".join(_bits) + ")" if _bits else ""
+
+  def _crs_equal(a, b):
+      _wa, _wb = _crs_wkid(a), _crs_wkid(b)
+      if _wa and _wb:
+          return _wa == _wb
+      return _crs_params(a) == _crs_params(b)
+
+  def _crs_of(path):
+      _sr = arcpy.Describe(path).spatialReference
+      if _sr is None or not getattr(_sr, "name", "") or _sr.name == "Unknown":
+          return None
+      return _sr
+
+  _ref_sr = _crs_of(paths[first_name])
+  if _ref_sr is None:
+      raise ValueError(
+          f"输入栅格没有坐标系（CRS）: {first_name}={paths[first_name]}，请先定义投影"
+      )
+  for name, path in paths.items():
+      _sr = _crs_of(path)
+      if _sr is None:
+          raise ValueError(f"输入栅格没有坐标系（CRS）: {name}={path}，请先定义投影")
+      if not _crs_equal(_sr, _ref_sr):
+          raise ValueError(
+              f"坐标系不一致: {name}={_sr.name}{_crs_hint(_sr)}, "
+              f"参考={_ref_sr.name}{_crs_hint(_ref_sr)}，请先投影到同一坐标系"
+          )
+
+  # 路径形态的 extent_ref 不经过上面的输入校验：范围按 ref 的坐标系取、输出却写输入的
+  # CRS → 位置错了的成功栅格（与 GDAL 版 `if extent_ref:` 那一刀同口径）
+  if extent_ref and extent_ref not in paths and arcpy.Exists(extent_ref):
+      _ref_sr2 = _crs_of(extent_ref)
+      if _ref_sr2 is None:
+          raise ValueError(f"参考栅格没有坐标系（CRS）: {extent_ref}，请先定义投影")
+      if not _crs_equal(_ref_sr2, _ref_sr):
+          raise ValueError(
+              f"坐标系不一致: 参考={_ref_sr2.name}{_crs_hint(_ref_sr2)}, "
+              f"输入={_ref_sr.name}{_crs_hint(_ref_sr)}，请先投影到同一坐标系"
+          )
+
+  # ---------------------------------------------------------- 混分辨率口径
+  # 旧版在“输入像元大小不一致”时是**没定义的行为**：两端各按自己的默认最近邻重采样，
+  # 类别边界上取格口径不同（实测 10 m→30 m：7,424 px 掩膜翻面 0.35%、33,768 px 值差
+  # 1.6%，最大差一整格高程 2480 m）。现在必须显式给 resampling，且两端先按同一规则
+  # 把每个输入重采样到同一个输出网格再运算。
+  def _native_cell(path):
+      _d = arcpy.Describe(path)
+      return abs(float(_d.meanCellWidth)), abs(float(_d.meanCellHeight))
+
+  native_cells = {name: _native_cell(path) for name, path in paths.items()}
+  _names = {n for n in paths if re.search(r"(?<![A-Za-z0-9_])" + re.escape(n) + r"(?![A-Za-z0-9_])", expression)}
+  used = [name for name in paths if name in _names]
+  mixed = len({(round(cx, 9), round(cy, 9)) for cx, cy in (native_cells[n] for n in used)}) > 1
+
+  if mixed and not resampling:
+      _detail = "、".join(f"{n}={native_cells[n][0]:g} m" for n in used)
+      raise ValueError(
+          "混分辨率必须先明确重采样口径：" + _detail +
+          "；inputs 之间像元大小不一致时不能靠两端各自的默认取格，"
+          "请显式给 resampling=nearest 或 bilinear（分类数据用 nearest）"
+      )
+
+  def _out_cell():
+      if not cell_size:
+          return native_cells[first_name][0]
+      if cell_size.replace(".", "", 1).isdigit():
+          return float(cell_size)
+      if cell_size in native_cells:
+          return native_cells[cell_size][0]
+      if arcpy.Exists(cell_size):
+          return _native_cell(cell_size)[0]
+      return None  # 维持旧行为：env.cellSize 落到第一个输入
+
+  out_cell = _out_cell()
+
+  def _mixed_grid(metas, ref_meta):
+      """混分辨率输出网格：给 extent_ref 就用它整幅；否则取交集并吸附到第一个
+      被引用输入的格网相位（与单分辨率时的逐结点传播规则不同，见 pitfalls）。"""
+      if ref_meta is not None:
+          x0, y1, w, h, cx, cy = ref_meta
+          return (x0, y1, max(1, int(round(w * cx / out_cell))),
+                  max(1, int(round(h * cy / out_cell))))
+      left = max(m[0] for m in metas)
+      right = min(m[0] + m[2] * m[4] for m in metas)
+      top = min(m[1] for m in metas)
+      bottom = max(m[1] - m[3] * m[5] for m in metas)
+      if right - left <= 1e-6 or top - bottom <= 1e-6:
+          raise ValueError("混分辨率输入的公共范围为空，请用 extent_ref 指定输出网格")
+      px, py = metas[0][0], metas[0][1]
+      left2 = px + math.ceil((left - px) / out_cell - 1e-9) * out_cell
+      right2 = px + math.floor((right - px) / out_cell + 1e-9) * out_cell
+      top2 = py - math.ceil((py - top) / out_cell - 1e-9) * out_cell
+      bottom2 = py - math.floor((py - bottom) / out_cell + 1e-9) * out_cell
+      w = int(round((right2 - left2) / out_cell))
+      h = int(round((top2 - bottom2) / out_cell))
+      if w < 1 or h < 1:
+          raise ValueError("混分辨率输入的公共范围不足一个输出像元，请用 extent_ref 指定输出网格")
+      return left2, top2, w, h
+
+  def _read_float(path):
+      _r = arcpy.Raster(path)
+      _nd = _r.noDataValue
+      _arr = np.asarray(arcpy.RasterToNumPyArray(path), dtype="float64")
+      if _nd is not None and not (isinstance(_nd, float) and math.isnan(_nd)):
+          _arr = np.where(_arr == float(_nd), np.nan, _arr)
+      return _arr
+
+  def _resample(arr, meta, grid, method):
+      """把源数组放到输出网格上（两端逐字相同的实现）。
+
+      nearest：取格心所在源像元；格心正好落在源像元边界时归右/下一格。
+      bilinear：四邻域权重；越界或有任一 NoData 邻格 → NoData（不猜）。
+      """
+      sx0, sy1, sw, sh, sdx, sdy = meta
+      gx0, gy1, gw, gh = grid
+      xs = gx0 + (np.arange(gw) + 0.5) * out_cell
+      ys = gy1 - (np.arange(gh) + 0.5) * out_cell
+      out = np.full((gh, gw), np.nan)
+      if method == "nearest":
+          ci = np.floor((xs - sx0) / sdx + 1e-9).astype(int)
+          ri = np.floor((sy1 - ys) / sdy + 1e-9).astype(int)
+          for row in range(gh):
+              if ri[row] < 0 or ri[row] >= sh:
+                  continue
+              cols = np.where((ci >= 0) & (ci < sw))[0]
+              out[row, cols] = arr[ri[row], ci[cols]]
+          return out
+      u = (xs - sx0) / sdx - 0.5
+      v = (sy1 - ys) / sdy - 0.5
+      i0 = np.floor(u).astype(int)
+      j0 = np.floor(v).astype(int)
+      fx = u - i0
+      fy = v - j0
+      for row in range(gh):
+          for col in range(gw):
+              i, j = i0[col], j0[row]
+              if i < 0 or j < 0 or i + 1 >= sw or j + 1 >= sh:
+                  continue
+              p00, p10, p01, p11 = arr[j, i], arr[j, i + 1], arr[j + 1, i], arr[j + 1, i + 1]
+              if not (np.isfinite(p00) and np.isfinite(p10) and np.isfinite(p01) and np.isfinite(p11)):
+                  continue
+              out[row, col] = ((1 - fx[col]) * (1 - fy[row]) * p00 + fx[col] * (1 - fy[row]) * p10
+                               + (1 - fx[col]) * fy[row] * p01 + fx[col] * fy[row] * p11)
+      return out
+
+  if mixed and not out_cell:
+      raise ValueError(
+          f"cell_size={cell_size!r} 不是数值/已绑定输入/可打开的栅格，无法确定混分辨率的输出像元；"
+          f"已绑定: {sorted(paths)}"
+      )
+
+  _tmp_dir = None
+  _grid_extent = None
+  if mixed:
+      metas = {}
+      for name in used:
+          _d = arcpy.Describe(paths[name])
+          metas[name] = (float(_d.extent.XMin), float(_d.extent.YMax), int(_d.width),
+                         int(_d.height), abs(float(_d.meanCellWidth)), abs(float(_d.meanCellHeight)))
+      ref_meta = None
+      if extent_ref:
+          ref_path = paths.get(extent_ref, extent_ref)
+          if not arcpy.Exists(ref_path):
+              raise ValueError(f"extent_ref 不是已绑定输入也不是可打开的栅格: {extent_ref}")
+          _d = arcpy.Describe(ref_path)
+          ref_meta = (float(_d.extent.XMin), float(_d.extent.YMax), int(_d.width), int(_d.height),
+                      abs(float(_d.meanCellWidth)), abs(float(_d.meanCellHeight)))
+      gx0, gy1, gw, gh = _mixed_grid([metas[n] for n in used], ref_meta)
+      _tmp_dir = tempfile.mkdtemp(prefix="rastercalc_")
+      for name in used:
+          # 与 GDAL 版 _load 的 same 短路对称：源网格与输出网格完全重合就直读，不再过
+          # _resample。bilinear 取不到右下邻格时判 NoData（见上），对已经逐像元对齐的
+          # 输入（典型：extent_ref 指向的正是参与运算的那幅）会平白吃掉末端最后一行/列
+          # 与 NoData 洞边缘 —— 真实链 835/2,368,407 px（0.0353%）被误判 NoData（DAIR-144）。
+          _m = metas[name]
+          _same = (_m[2] == gw and _m[3] == gh
+                   and abs(_m[0] - gx0) < 1e-9 and abs(_m[1] - gy1) < 1e-9
+                   and abs(_m[4] - out_cell) < 1e-9 and abs(_m[5] - out_cell) < 1e-9)
+          _src = _read_float(paths[name])
+          _arr = _src if _same else _resample(_src, _m, (gx0, gy1, gw, gh), resampling)
+          _temp = os.path.join(_tmp_dir, name + ".tif")
+          arcpy.NumPyArrayToRaster(_arr, arcpy.Point(gx0, gy1 - gh * out_cell),
+                                   out_cell, out_cell, value_to_nodata=np.nan).save(_temp)
+          bound[name] = arcpy.sa.Raster(_temp)
+      _grid_extent = arcpy.Extent(gx0, gy1 - gh * out_cell, gx0 + gw * out_cell, gy1)
+
+  first = next(iter(bound.values()))
+  # env 是持久内核的**全局**状态：改了就必须还原（同 fragments.resolve_zone_layer 的口径）。
+  # 实测（DAIR-135）：extent_ref 的参考栅格是 DEM（UTM 10N），它的范围留在 env.extent 里，
+  # 同内核后续 zonal_statistics（EPSG:4508）直接 ERROR 010568 范围无效；cellSize 同理。
+  _previous_cell_size = arcpy.env.cellSize
+  _previous_extent = arcpy.env.extent
   try:
-      result = eval(expression, {"__builtins__": __builtins__}, allowed)
+      if _grid_extent is not None:
+          arcpy.env.cellSize = out_cell
+          arcpy.env.extent = _grid_extent
+      elif cell_size:
+          arcpy.env.cellSize = float(cell_size) if cell_size.replace(".", "", 1).isdigit() else bound.get(cell_size, first)
+      else:
+          arcpy.env.cellSize = first
+      if extent_ref:
+          ref = bound.get(extent_ref)
+          arcpy.env.extent = ref if ref is not None else extent_ref
+
+      # 可用函数：arcpy.sa 全部公开函数 + 绑定的栅格变量
+      # 注意：arcpy.sa 内部会用到 __import__，因此这里必须传完整 builtins（
+      # 本内核本就是模型可执行代码的环境，限制 builtins 没有安全收益，只会误伤）
+      allowed = {k: getattr(arcpy.sa, k) for k in dir(arcpy.sa) if not k.startswith("_")}
+      allowed.update(bound)
+      try:
+          result = eval(expression, {"__builtins__": __builtins__}, allowed)
+      except Exception as exc:
+          raise ValueError(f"表达式求值失败（{type(exc).__name__}: {exc}）；已绑定: {sorted(bound)}")
+
+      out_folder = os.path.dirname(output_path)
+      if str(out_folder).lower().endswith(".gdb"):
+          if not arcpy.Exists(out_folder):
+              arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+      elif out_folder and not os.path.isdir(out_folder):
+          os.makedirs(out_folder, exist_ok=True)
+      if arcpy.Exists(output_path):
+          arcpy.management.Delete(output_path)
+      result.save(output_path)
+
+      r = arcpy.Raster(output_path)
+      set_result({"output": output_path, "expression": expression,
+                  "min": r.minimum, "max": r.maximum, "mean": r.mean,
+                  "cell_size": r.meanCellWidth, "size": [r.width, r.height]})
+      print(f"RasterCalculator done: range={r.minimum}~{r.maximum}, mean={r.mean}")
+  finally:
+      arcpy.env.cellSize = _previous_cell_size
+      arcpy.env.extent = _previous_extent
+      if _tmp_dir:
+          shutil.rmtree(_tmp_dir, ignore_errors=True)
+code_template_gdal: |
+  # GDAL 版：逐像元对齐上方 arcpy 版（同一参数语义、同一网格选择规则、同一 nodata 哨兵）
+  import ast
+  import math
+  import os
+
+  import numpy as np
+  import pyproj
+  import rasterio
+  from rasterio.transform import from_origin
+  from rasterio.warp import Resampling, reproject
+
+  inputs_spec = {{inputs}}
+  expression = {{expression}}
+  output_path = {{output_path}}
+  cell_size = str({{cell_size}}).strip()
+  extent_ref = str({{extent_ref}}).strip()
+  resampling = str({{resampling}}).strip().lower()
+
+  _RESAMPLING_METHODS = ("nearest", "bilinear")
+  if resampling and resampling not in _RESAMPLING_METHODS:
+      raise ValueError(f"resampling={resampling!r} 不支持；本版只接受 {list(_RESAMPLING_METHODS)}")
+
+  #: 输出 nodata 固定用 float32 最小值：与 zonal_statistics_raster 的 GDAL 段同一哨兵，
+  #: 也与 arcpy 实测一致（带运算的输出一律 float32 + -3.4028234663852886e+38）。
+  _NODATA_OUT = -3.4028234663852886e+38
+
+  #: 输出格式白名单：GDAL 写不了 gdb 里的栅格（没有 FGDB 写驱动），也不该把 .img 静默换格式
+  _OUT_DRIVERS = {".tif": "GTiff", ".tiff": "GTiff", ".img": "HFA"}
+
+  #: 表达式认的函数；其余 arcpy.sa 函数一律**明确报错**，绝不静默当常量
+  _FUNCS = ("Con", "IsNull", "SetNull")
+
+  _BIN_OPS = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
+  _CMP_OPS = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=",
+              ast.Gt: ">", ast.GtE: ">="}
+
+  #: 窗口边界比较容差（米）。实测数据里 arcpy 的 0.00005 m 级差异是**真差异**
+  #: （真实链 elder 与 zone_sum 的原点就差这么多），所以只放到 1e-6
+  _EPS_M = 1e-6
+  #: 格心对齐用的无量纲容差（以像元为单位）
+  _EPS = 1e-9
+
+
+  def _open_meta(path):
+      """读一幅栅格的元数据（不读像元）。"""
+      try:
+          with rasterio.open(str(path)) as ds:
+              return {"path": str(path), "width": int(ds.width), "height": int(ds.height),
+                      "transform": ds.transform, "crs": ds.crs,
+                      "nodata": ds.nodata, "dtype": ds.dtypes[0]}
+      except Exception as exc:
+          raise ValueError(f"输入栅格打不开: {path}（{type(exc).__name__}: {exc}）")
+
+
+  # ---------------------------------------------------------------- 表达式求值
+  # 只做 arcpy.sa 里本模板用到的子集：Con / IsNull / SetNull + 四则 + 比较 + 布尔。
+  # 用 ast 自己走一遍（不用 eval）：不支持的函数/语法都能给出「不支持什么、支持什么」，
+  # 而不是像 arcpy 那样抛一个离配方很远的名字错误。
+  def _pair(left, right):
+      return np.broadcast_arrays(np.asarray(left, dtype="float64"),
+                                 np.asarray(right, dtype="float64"))
+
+
+  def _arith(left, right, op):
+      """四则：任一侧 NoData → NoData；除法的分母为 0 → NoData（arcpy 实测 0/0、x/0 都是 NoData）。"""
+      left, right = _pair(left, right)
+      out = np.full(left.shape, np.nan)
+      ok = np.isfinite(left) & np.isfinite(right)
+      if op == "/":
+          ok = ok & (right != 0)
+          np.divide(left, right, out=out, where=ok)
+      elif op == "+":
+          np.add(left, right, out=out, where=ok)
+      elif op == "-":
+          np.subtract(left, right, out=out, where=ok)
+      else:
+          np.multiply(left, right, out=out, where=ok)
+      return out
+
+
+  def _compare(left, right, op):
+      """比较：任一侧 NoData → NoData（arcpy 实测 m > 3 在 nodata 格上仍是 nodata）。"""
+      left, right = _pair(left, right)
+      out = np.full(left.shape, np.nan)
+      ok = np.isfinite(left) & np.isfinite(right)
+      if op == "==":
+          hit = left == right
+      elif op == "!=":
+          hit = left != right
+      elif op == "<":
+          hit = left < right
+      elif op == "<=":
+          hit = left <= right
+      elif op == ">":
+          hit = left > right
+      else:
+          hit = left >= right
+      out[ok] = hit[ok].astype("float64")
+      return out
+
+
+  def _logical(left, right, op):
+      """逐像元布尔（& / |）：非零为真；任一侧 NoData → NoData（arcpy 实测）。"""
+      left, right = _pair(left, right)
+      out = np.full(left.shape, np.nan)
+      ok = np.isfinite(left) & np.isfinite(right)
+      hit = (left != 0) & (right != 0) if op == "and" else (left != 0) | (right != 0)
+      out[ok] = hit[ok].astype("float64")
+      return out
+
+
+  def _con(cond, when_true, when_false):
+      """Con：条件**非 0 为真**（负值也算真）、为假取假值、**条件本身是 NoData → NoData**。
+
+      真假口径与 `_set_null` / `_logical` 一致（非零为真）：arcpy Pro 3.6 实测
+      `Con(a - 5, 1, 0)` 在 a<5 的行取 1（不是 0），`SetNull(a - 5, 1)` 在同一批行落 NoData。
+      """
+      cond, when_true, when_false = np.broadcast_arrays(
+          np.asarray(cond, dtype="float64"),
+          np.asarray(when_true, dtype="float64"),
+          np.asarray(when_false, dtype="float64"),
+      )
+      out = np.where(cond != 0, when_true, when_false)
+      out[~np.isfinite(cond)] = np.nan
+      return out
+
+
+  def _is_null(value):
+      """IsNull：是 NoData → 1，否则 0；自己永远不产生 NoData。"""
+      value = np.asarray(value, dtype="float64")
+      return np.where(np.isfinite(value), 0.0, 1.0)
+
+
+  def _set_null(cond, value):
+      """SetNull：条件为真 → NoData，为假 → 写 value；**条件为 NoData 也是 NoData**（arcpy 实测）。"""
+      cond, value = _pair(cond, value)
+      out = np.array(value, dtype="float64")
+      out[~np.isfinite(cond) | (cond != 0)] = np.nan
+      return out
+
+
+  def _eval(node):
+      if isinstance(node, ast.Expression):
+          return _eval(node.body)
+      if isinstance(node, ast.Constant):
+          if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+              raise ValueError(f"表达式里只支持数值常量，收到 {node.value!r}")
+          return float(node.value)
+      if isinstance(node, ast.Name):
+          if node.id in bound:
+              return bound[node.id]
+          raise ValueError(
+              f"表达式里的名称 {node.id!r} 没有绑定；已绑定: {sorted(bound)}"
+              f"（inputs 里要写成 {node.id}=路径）"
+          )
+      if isinstance(node, ast.BinOp):
+          kind = type(node.op)
+          if kind in (ast.BitAnd, ast.BitOr):
+              # 逐像元布尔（非零为真）：arcpy 实测 & / | **就是逐像元布尔、不是位运算**
+              # （Con(i & 2, 1, 0) 在 i=1 上为真，位运算会是假），且 NoData 传播；两端一致
+              return _logical(_eval(node.left), _eval(node.right),
+                              "and" if kind is ast.BitAnd else "or")
+          op = _BIN_OPS.get(kind)
+          if op is None:
+              raise ValueError(
+                  f"表达式里的运算符 {type(node.op).__name__} 不支持；GDAL 版只支持"
+                  f" + - * /、比较与 & / |（arcpy.sa 其余运算请用 arcpy 后端）"
+              )
+          return _arith(_eval(node.left), _eval(node.right), op)
+      if isinstance(node, ast.UnaryOp):
+          if isinstance(node.op, ast.USub):
+              return -np.asarray(_eval(node.operand), dtype="float64")
+          if isinstance(node.op, ast.UAdd):
+              return np.asarray(_eval(node.operand), dtype="float64")
+          if isinstance(node.op, ast.Not):
+              raise ValueError(
+                  "表达式里的 not 不支持（arcpy 侧同样报 'truth value of a raster is ambiguous'）；"
+                  "请改用 & / | 或 Con(x == 0, ...)"
+              )
+          raise ValueError(
+              f"表达式里的一元运算符 {type(node.op).__name__} 不支持；"
+              f"GDAL 版不实现 arcpy 的 ~（实测是**逻辑非**：~0 → 1、~1 → 0），"
+              f"请改用 Con(x == 0, 1, 0)"
+          )
+      if isinstance(node, ast.Compare):
+          if len(node.ops) > 1:
+              raise ValueError(
+                  "不支持链式比较（a < b < c）；请拆成两个条件再用 and / & 连接"
+              )
+          return _compare(_eval(node.left), _eval(node.comparators[0]),
+                          _CMP_OPS[type(node.ops[0])])
+      if isinstance(node, ast.BoolOp):
+          # and / or 是 Python 关键字，arcpy 侧会对 Raster 调 __bool__ 直接抛
+          # "The truth value of a raster is ambiguous"（实测）；GDAL 版不做得比 arcpy 宽
+          raise ValueError(
+              "表达式里的 and / or 不支持（arcpy 侧在栅格上同样报 'truth value of a raster"
+              " is ambiguous'）；请改用逐像元的 & / |"
+          )
+      if isinstance(node, ast.Call):
+          if not isinstance(node.func, ast.Name) or node.keywords:
+              raise ValueError(
+                  f"表达式里只支持 {list(_FUNCS)} 三个函数的**位置参数**，收到"
+                  f" {ast.unparse(node.func)} 的其它写法；其余 arcpy.sa 函数请用 arcpy 后端"
+              )
+          name = node.func.id
+          args = [_eval(a) for a in node.args]
+          if name == "Con":
+              if len(args) == 2:  # Con(cond, 真值)：假值为 NoData，与 arcpy 同义
+                  args.append(np.nan)
+              if len(args) != 3:
+                  raise ValueError(f"Con 只接受 2~3 个参数（条件, 真值, [假值]），收到 {len(args)} 个")
+              return _con(*args)
+          if name == "IsNull":
+              if len(args) != 1:
+                  raise ValueError(f"IsNull 只接受 1 个参数，收到 {len(args)} 个")
+              return _is_null(args[0])
+          if name == "SetNull":
+              if len(args) != 2:
+                  raise ValueError(f"SetNull 只接受 2 个参数（条件, 值），收到 {len(args)} 个")
+              return _set_null(*args)
+          raise ValueError(
+              f"GDAL 版不支持表达式里的函数 {name}()：只支持 {list(_FUNCS)}"
+              f"（arcpy.sa 其余函数请用 arcpy 后端，本版不会把它静默当常量）"
+          )
+      raise ValueError(
+          f"表达式里有不支持的语法 {type(node).__name__}；只支持名称、数值、+ - * /、"
+          f"比较、and/or/not 与 {list(_FUNCS)}"
+      )
+
+
+  # ---------------------------------------------------------------- 输出网格
+  # 实测 arcpy（Pro 3.6）的规则：**每个 AST 结点都有自己的范围**，不是按全局算一遍。
+  # 证据见 benchmark/reports/dair116_raster_calc_20261031/（探针 1/2/3，50+ 条用例，
+  # 把中间 Raster 对象的 extent 也打印出来对过）：
+  #
+  #   a+c           → 10x10 @ (0,52.5)     （c 的格子，往上多出半格）
+  #   (a+c)+d       → 10x10 @ (0,55)       （d 的格子，再往上多半格）
+  #   d+a           → 10x9  @ (0,50)       （交集正好落在 a 的格线上 → 9 行）
+  #   (d+a)+c       → 10x9  @ (0,50)       （中间结点已缩到 9 行，加 c 也不再长回去）
+  #
+  # 所以 a+c+d 与 d+a+c 在 arcpy 里本来就不同（前者 10 行、后者 9 行），必须逐结点传播。
+  # 两个结点合并时**逐轴**定窗口：
+  #   1) 交集正好等于某一侧的整幅范围 → 用那一侧的格子（窗口 = 交集）；
+  #   2) 否则用**原点更大**那一侧（y 比上边界、x 比左边界）的格子，窗口取该格子里
+  #      「**格心落在交集内**」的那些像元 —— 所以有时比交集少半格、有时多半格：
+  #      a+q3（错 3 m）arcpy 给 [3,48]（9 行，往里收），a+c 给 [2.5,52.5]（10 行，往外放）。
+  # 像元值不受这条影响：arcpy 的中间结点不落盘，最终每个像元还是**从原始栅格取格心**
+  # （a+c+d 第 0 行格心 52.5 已在 a 之外 → NoData，与实测一致）。其余输入被最近邻
+  # 重采样到最终窗口。
+  class _Grid:
+      """一个子表达式的窗口与网格相位。
+
+      `x0`/`y1` 是窗口左上角，`w`/`h` 是窗口内的像元数；`px`/`py` 是这块像元
+      所属格子的相位（格线原点），可能比窗口的上/左边界更外（窗口被交集裁过）。
+      合并时按相位比较「谁的原点更大」，窗口则按格心重新取。
+      """
+
+      __slots__ = ("x0", "y1", "w", "h", "px", "py", "name", "cell")
+
+      def __init__(self, x0, y1, w, h, px, py, name, cell):
+          self.x0, self.y1, self.w, self.h = x0, y1, w, h
+          self.px, self.py, self.name, self.cell = px, py, name, cell
+
+
+  def _span(grid):
+      """窗口：x0, x1, y0, y1（y1 是上边界）。"""
+      return (grid.x0, grid.x0 + grid.w * grid.cell,
+              grid.y1 - grid.h * grid.cell, grid.y1)
+
+
+  def _snap(phase, lo, hi, cell, vertical):
+      """在 phase 这套格子上，取「格心落在 [lo, hi] 内」的连续像元 → 返回 (起, 止)。
+
+      格心：x 方向 phase + cell/2 + k*cell，y 方向 phase - cell/2 - k*cell。
+      边界正好落在格心上时**算在内**（arcpy 实测：a+c 的输出顶端那行格心 = 50 = a 的上边界）。
+      """
+      if vertical:
+          k0 = int(np.ceil((phase - cell / 2.0 - hi) / cell - _EPS))
+          k1 = int(np.floor((phase - cell / 2.0 - lo) / cell + _EPS))
+          return phase - (k1 + 1) * cell, phase - k0 * cell
+      k0 = int(np.ceil((lo - phase - cell / 2.0) / cell - _EPS))
+      k1 = int(np.floor((hi - phase - cell / 2.0) / cell + _EPS))
+      return phase + k0 * cell, phase + (k1 + 1) * cell
+
+
+  def _new_grid(a, b):
+      """两个结点 → 合并后的窗口（逐轴按上面两条规则，窗口与相位各自可能来自不同一侧）。"""
+      def one(lo, hi, left, right, vertical):
+          """单轴：left/right = (起, 止, 相位, 名字)。"""
+          a_lo, a_hi, a_phase, a_name = left
+          b_lo, b_hi, b_phase, b_name = right
+          a_exact = abs(lo - a_lo) <= _EPS_M and abs(hi - a_hi) <= _EPS_M
+          b_exact = abs(lo - b_lo) <= _EPS_M and abs(hi - b_hi) <= _EPS_M
+          if a_exact or b_exact:
+              if a_exact and b_exact:  # 两侧都能精确表达同一个窗口 → 取原点更大那侧的相位
+                  return (a_phase, lo, hi, a_name) if a_phase >= b_phase else (b_phase, lo, hi, b_name)
+              return (a_phase, lo, hi, a_name) if a_exact else (b_phase, lo, hi, b_name)
+          phase, name = (a_phase, a_name) if a_phase >= b_phase else (b_phase, b_name)
+          lo2, hi2 = _snap(phase, lo, hi, a.cell, vertical)
+          return phase, lo2, hi2, name
+
+      ax0, ax1, ay0, ay1 = _span(a)
+      bx0, bx1, by0, by1 = _span(b)
+      lo_x, hi_x = max(ax0, bx0), min(ax1, bx1)
+      lo_y, hi_y = max(ay0, by0), min(ay1, by1)
+      if hi_x - lo_x <= _EPS_M or hi_y - lo_y <= _EPS_M:
+          raise ValueError(
+              f"输入范围没有公共部分（{a.name} 与 {b.name}），请用 extent_ref 指定输出网格"
+          )
+      px, x0, x1, _ = one(lo_x, hi_x, (ax0, ax1, a.px, a.name), (bx0, bx1, b.px, b.name), False)
+      py, y0, y1, _ = one(lo_y, hi_y, (ay0, ay1, a.py, a.name), (by0, by1, b.py, b.name), True)
+      w = int(round((x1 - x0) / a.cell))
+      h = int(round((y1 - y0) / a.cell))
+      if w < 1 or h < 1:
+          raise ValueError(f"输入范围没有公共像元（{a.name} 与 {b.name}），请用 extent_ref 指定输出网格")
+      # 网格来源名：相位与结果完全一致的那一侧（两侧都一致时取后出现的那幅；x/y 分属两侧则记 "a+b"）
+      a_hit = abs(a.px - px) <= _EPS_M and abs(a.py - py) <= _EPS_M
+      b_hit = abs(b.px - px) <= _EPS_M and abs(b.py - py) <= _EPS_M
+      if a_hit and b_hit:
+          name = b.name
+      elif a_hit:
+          name = a.name
+      elif b_hit:
+          name = b.name
+      else:
+          name = f"{a.name}+{b.name}"
+      return _Grid(x0, y1, w, h, px, py, name, a.cell)
+
+
+  def _merge(grids):
+      """一组结点的窗口 → 合并后的窗口（常量结点是 None，直接跳过）。"""
+      real = [g for g in grids if g is not None]
+      if not real:
+          return None
+      acc = real[0]
+      for other in real[1:]:
+          acc = _new_grid(acc, other)
+      return acc
+
+
+  def _leaf_grid(name, meta):
+      """输入自己的窗口（像元大小统一成 out_cell）。"""
+      t = meta["transform"]
+      nat_x, nat_y = abs(float(t.a)), abs(float(t.e))
+      x0, y1 = float(t.c), float(t.f)
+      return _Grid(x0, y1,
+                   max(1, int(round(meta["width"] * nat_x / out_cell))),
+                   max(1, int(round(meta["height"] * nat_y / out_cell))),
+                   x0, y1, name, out_cell)
+
+
+  def _grid_eval(node):
+      """只走范围（不读像元）：每个子表达式按 arcpy 的逐结点规则合并窗口。"""
+      if isinstance(node, ast.Expression):
+          return _grid_eval(node.body)
+      if isinstance(node, ast.Constant):
+          return None
+      if isinstance(node, ast.Name):
+          if node.id in grids:
+              return grids[node.id]
+          raise ValueError(
+              f"表达式里的名称 {node.id!r} 没有绑定；已绑定: {sorted(grids)}"
+              f"（inputs 里要写成 {node.id}=路径）"
+          )
+      if isinstance(node, ast.BinOp):
+          if type(node.op) not in _BIN_OPS and type(node.op) not in (ast.BitAnd, ast.BitOr):
+              raise ValueError(
+                  f"表达式里的运算符 {type(node.op).__name__} 不支持；GDAL 版只支持"
+                  f" + - * /、比较与 & / |（arcpy.sa 其余运算请用 arcpy 后端）"
+              )
+          return _merge([_grid_eval(node.left), _grid_eval(node.right)])
+      if isinstance(node, ast.UnaryOp):
+          return _grid_eval(node.operand)
+      if isinstance(node, ast.Compare):
+          return _merge([_grid_eval(node.left)] + [_grid_eval(c) for c in node.comparators])
+      if isinstance(node, ast.BoolOp):
+          raise ValueError(
+              "表达式里的 and / or 不支持（arcpy 侧在栅格上同样报 'truth value of a raster"
+              " is ambiguous'）；请改用逐像元的 & / |"
+          )
+      if isinstance(node, ast.Call):
+          if not isinstance(node.func, ast.Name) or node.keywords:
+              raise ValueError(
+                  f"表达式里只支持 {list(_FUNCS)} 三个函数的**位置参数**，收到"
+                  f" {ast.unparse(node.func)} 的其它写法；其余 arcpy.sa 函数请用 arcpy 后端"
+              )
+          return _merge([_grid_eval(a) for a in node.args])
+      raise ValueError(
+          f"表达式里有不支持的语法 {type(node).__name__}；只支持名称、数值、+ - * /、"
+          f"比较、and/or/not 与 {list(_FUNCS)}"
+      )
+
+
+  # ---------------------------------------------------------------- 1) 输入绑定
+  # 先只读元数据：输出网格要等表达式走完「逐结点传播」才定（arcpy 的规则不是「第一个输入」）
+  sources = {}
+  for item in str(inputs_spec).split(","):
+      if not item.strip():
+          continue
+      if "=" not in item:
+          raise ValueError(f"inputs 格式应为 '名称=路径'，收到: {item}")
+      name, path = item.split("=", 1)
+      name, path = name.strip(), path.strip()
+      if not name or not path:
+          raise ValueError(f"inputs 里的绑定不完整: {item!r}")
+      if not os.path.exists(path):
+          raise ValueError(f"输入栅格不存在: {path}")
+      sources[name] = _open_meta(path)
+  if not sources:
+      raise ValueError("inputs 至少需要一个 '名称=路径'")
+
+  # 输出格式：白名单 + 拒绝时说清为什么（同 zonal_statistics_raster 的规矩，不静默换格式）
+  out_ext = os.path.splitext(str(output_path))[1].lower()
+  if out_ext not in _OUT_DRIVERS:
+      why = ("GDAL 后端写不了 gdb 里的栅格（没有 FGDB 写驱动），请给 .tif"
+             if ".gdb" in str(output_path).lower() else "GDAL 版输出只支持 .tif / .tiff / .img")
+      raise ValueError(f"GDAL 版输出格式不支持（收到 {output_path!r}）：{why}；gdb 栅格请用 arcpy 后端")
+
+  # ---------------------------------------------------------------- 2) 像元大小
+  # 空则用**第一个**输入（arcpy 段同样把 env.cellSize 设成 first）；也可以写数值
+  # 或某个输入名/可打开的栅格路径
+  first_meta = next(iter(sources.values()))
+  if cell_size:
+      if cell_size.replace(".", "", 1).isdigit():
+          out_cell = float(cell_size)
+      elif cell_size in sources:
+          out_cell = abs(float(sources[cell_size]["transform"].a))
+      else:
+          try:
+              out_cell = abs(float(_open_meta(cell_size)["transform"].a))
+          except ValueError:
+              raise ValueError(
+                  f"cell_size={cell_size!r} 既不是数值也不是已绑定的输入名/可打开的栅格；"
+                  f"已绑定: {sorted(sources)}"
+              )
+      if not out_cell > 0:
+          raise ValueError(f"cell_size 必须为正数，收到 {cell_size!r}")
+  else:
+      out_cell = abs(float(first_meta["transform"].a))
+
+  def _crs_hint(crs):
+      # 报错用：无 EPSG 时 pyproj 读回的 name 是占位符（Pro 派生的 WKT 里恒为 'unknown'），
+      # 只写名字定位不到差异，把非零的投影参数摆出来（与 arcpy 段的 _crs_hint 同口径）
+      _op = crs.coordinate_operation
+      if _op is None:
+          return ""
+      _bits = [_op.method_name]
+      for _p in _op.params:
+          try:
+              _v = float(_p.value)
+          except Exception:
+              continue
+          if _v:
+              _bits.append(f"{_p.name} {_v:g}")
+      return "(" + ", ".join(_bits) + ")"
+
+
+  # 坐标系必须一致（arcpy 侧不一致也直接报错）；同 EPSG 但 WKT 写法不同不算不一致
+  if first_meta["crs"] is None:
+      raise ValueError(f"输入栅格没有坐标系（CRS）: {first_meta['path']}，请先定义投影")
+  ref_crs = pyproj.CRS.from_wkt(first_meta["crs"].to_wkt())
+  for name, meta in sources.items():
+      if meta["crs"] is None:
+          raise ValueError(f"输入栅格没有坐标系（CRS）: {name}={meta['path']}，请先定义投影")
+      other = pyproj.CRS.from_wkt(meta["crs"].to_wkt())
+      if not other.equals(ref_crs, ignore_axis_order=True):
+          raise ValueError(
+              f"坐标系不一致: {name}={other.name}{_crs_hint(other)}, "
+              f"参考={ref_crs.name}{_crs_hint(ref_crs)}，请先投影到同一坐标系"
+          )
+
+  # ---------------------------------------------------------------- 3) 输出窗口
+  grids = {name: _leaf_grid(name, meta) for name, meta in sources.items()}
+
+  if not str(expression).strip():
+      raise ValueError("expression 不能为空")
+  try:
+      tree = ast.parse(str(expression).strip(), mode="eval")
+  except SyntaxError as exc:
+      raise ValueError(f"表达式语法错误: {exc}")
+  grid = _grid_eval(tree)
+  if grid is None:  # 纯常量表达式（如 "1 + 2"）：arcpy 会落在 env.extent 上，这里用第一个输入
+      grid = next(iter(grids.values()))
+
+  # 混分辨率：旧版是没定义的行为（两端各按自己的默认最近邻，类别边界上取格口径不同；
+  # 实测 10 m→30 m 有 0.35% 掩膜翻面、1.6% 值差）。现在必须显式给 resampling，
+  # 并先按同一规则把每个输入重采样到同一个输出网格（与 arcpy 段逐字相同）。
+  _names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+  used = [name for name in sources if name in _names]
+  mixed = len({(round(abs(float(sources[n]["transform"].a)), 9),
+                round(abs(float(sources[n]["transform"].e)), 9)) for n in used}) > 1
+  if mixed and not resampling:
+      _detail = "、".join(
+          f"{n}={abs(float(sources[n]['transform'].a)):g} m" for n in used)
+      raise ValueError(
+          "混分辨率必须先明确重采样口径：" + _detail +
+          "；inputs 之间像元大小不一致时不能靠两端各自的默认取格，"
+          "请显式给 resampling=nearest 或 bilinear（分类数据用 nearest）"
+      )
+
+
+  def _mixed_grid(metas, ref_meta):
+      """混分辨率输出网格：给 extent_ref 就用它整幅；否则取交集并吸附到第一个
+      被引用输入的格网相位（与单分辨率时的逐结点传播规则不同，见 pitfalls）。"""
+      if ref_meta is not None:
+          x0, y1, w, h, cx, cy = ref_meta
+          return (x0, y1, max(1, int(round(w * cx / out_cell))),
+                  max(1, int(round(h * cy / out_cell))))
+      left = max(m[0] for m in metas)
+      right = min(m[0] + m[2] * m[4] for m in metas)
+      top = min(m[1] for m in metas)
+      bottom = max(m[1] - m[3] * m[5] for m in metas)
+      if right - left <= 1e-6 or top - bottom <= 1e-6:
+          raise ValueError("混分辨率输入的公共范围为空，请用 extent_ref 指定输出网格")
+      px, py = metas[0][0], metas[0][1]
+      left2 = px + math.ceil((left - px) / out_cell - 1e-9) * out_cell
+      right2 = px + math.floor((right - px) / out_cell + 1e-9) * out_cell
+      top2 = py - math.ceil((py - top) / out_cell - 1e-9) * out_cell
+      bottom2 = py - math.floor((py - bottom) / out_cell + 1e-9) * out_cell
+      w = int(round((right2 - left2) / out_cell))
+      h = int(round((top2 - bottom2) / out_cell))
+      if w < 1 or h < 1:
+          raise ValueError("混分辨率输入的公共范围不足一个输出像元，请用 extent_ref 指定输出网格")
+      return left2, top2, w, h
+
+
+  def _resample(arr, meta, grid, method):
+      """把源数组放到输出网格上（与 arcpy 段逐字相同的实现）。
+
+      nearest：取格心所在源像元；格心正好落在源像元边界时归右/下一格。
+      bilinear：四邻域权重；越界或有任一 NoData 邻格 → NoData（不猜）。
+      """
+      sx0, sy1, sw, sh, sdx, sdy = meta
+      gx0, gy1, gw, gh = grid
+      xs = gx0 + (np.arange(gw) + 0.5) * out_cell
+      ys = gy1 - (np.arange(gh) + 0.5) * out_cell
+      out = np.full((gh, gw), np.nan)
+      if method == "nearest":
+          ci = np.floor((xs - sx0) / sdx + 1e-9).astype(int)
+          ri = np.floor((sy1 - ys) / sdy + 1e-9).astype(int)
+          for row in range(gh):
+              if ri[row] < 0 or ri[row] >= sh:
+                  continue
+              cols = np.where((ci >= 0) & (ci < sw))[0]
+              out[row, cols] = arr[ri[row], ci[cols]]
+          return out
+      u = (xs - sx0) / sdx - 0.5
+      v = (sy1 - ys) / sdy - 0.5
+      i0 = np.floor(u).astype(int)
+      j0 = np.floor(v).astype(int)
+      fx = u - i0
+      fy = v - j0
+      for row in range(gh):
+          for col in range(gw):
+              i, j = i0[col], j0[row]
+              if i < 0 or j < 0 or i + 1 >= sw or j + 1 >= sh:
+                  continue
+              p00, p10, p01, p11 = arr[j, i], arr[j, i + 1], arr[j + 1, i], arr[j + 1, i + 1]
+              if not (np.isfinite(p00) and np.isfinite(p10) and np.isfinite(p01) and np.isfinite(p11)):
+                  continue
+              out[row, col] = ((1 - fx[col]) * (1 - fy[row]) * p00 + fx[col] * (1 - fy[row]) * p10
+                               + (1 - fx[col]) * fy[row] * p01 + fx[col] * fy[row] * p11)
+      return out
+
+
+  if mixed and not extent_ref:
+      _metas = [(float(sources[n]["transform"].c), float(sources[n]["transform"].f),
+                 int(sources[n]["width"]), int(sources[n]["height"]),
+                 abs(float(sources[n]["transform"].a)), abs(float(sources[n]["transform"].e)))
+                for n in used]
+      gx0, gy1, gw, gh = _mixed_grid(_metas, None)
+      grid = _Grid(gx0, gy1, gw, gh, gx0, gy1, "mixed", out_cell)
+
+  if extent_ref:
+      # 与 arcpy 的 env.extent 同义：整幅钉在参考栅格上，不再逐结点收缩
+      if extent_ref in sources:
+          ref_name, ref_meta = extent_ref, sources[extent_ref]
+      else:  # 与 arcpy 一样允许直接给路径（arcpy.env.extent = 路径）
+          ref_name, ref_meta = extent_ref, _open_meta(extent_ref)
+      # 范围按 ref 的坐标系取数值、输出却写输入的 CRS → 位置错了的成功栅格；
+      # 路径形态的 ref 不经过上面的输入校验，必须在这里补一刀（binding 形态恒等）
+      if ref_meta["crs"] is None:
+          raise ValueError(f"参考栅格没有坐标系（CRS）: {ref_meta['path']}，请先定义投影")
+      _ref_crs = pyproj.CRS.from_wkt(ref_meta["crs"].to_wkt())
+      if not _ref_crs.equals(ref_crs, ignore_axis_order=True):
+          raise ValueError(
+              f"坐标系不一致: 参考={_ref_crs.name}{_crs_hint(_ref_crs)}, "
+              f"输入={ref_crs.name}{_crs_hint(ref_crs)}，请先投影到同一坐标系"
+          )
+      _t = ref_meta["transform"]
+      _x0, _y1 = float(_t.c), float(_t.f)
+      _x1 = _x0 + ref_meta["width"] * abs(float(_t.a))
+      _y0 = _y1 - ref_meta["height"] * abs(float(_t.e))
+      grid = _Grid(_x0, _y1,
+                   max(1, int(round((_x1 - _x0) / out_cell))),
+                   max(1, int(round((_y1 - _y0) / out_cell))),
+                   _x0, _y1, ref_name, out_cell)
+
+  out_x0, out_y1, out_width, out_height = grid.x0, grid.y1, grid.w, grid.h
+  out_transform = from_origin(float(out_x0), float(out_y1), out_cell, out_cell)
+
+  # ---------------------------------------------------------------- 4) 读像元
+  def _load(meta, name):
+      """把一幅输入放到输出网格上：网格相同直读；混分辨率走两端逐字相同的 _resample；
+      其余不同网格仍走最近邻 reproject（arcpy 实测口径）。"""
+      with rasterio.open(meta["path"]) as ds:
+          if ds.count > 1:
+              print(f"{meta['path']}: 有 {ds.count} 个波段，只取第 1 个（与 arcpy 的 map algebra 一致）")
+          t = ds.transform
+          same = (
+              ds.width == out_width and ds.height == out_height
+              and abs(t.c - out_transform.c) < 1e-9 and abs(t.f - out_transform.f) < 1e-9
+              and abs(abs(t.a) - out_cell) < 1e-9 and abs(abs(t.e) - out_cell) < 1e-9
+          )
+          if same:
+              arr = ds.read(1, masked=True).astype("float64").filled(np.nan)
+          elif mixed and name in used:
+              src = ds.read(1, masked=True).astype("float64").filled(np.nan)
+              _meta = (float(t.c), float(t.f), int(ds.width), int(ds.height),
+                       abs(float(t.a)), abs(float(t.e)))
+              arr = _resample(src, _meta, (grid.x0, grid.y1, grid.w, grid.h), resampling)
+          else:
+              arr = np.full((out_height, out_width), np.nan, dtype="float64")
+              reproject(
+                  source=rasterio.band(ds, 1), destination=arr,
+                  src_transform=t, src_crs=ds.crs,
+                  dst_transform=out_transform, dst_crs=ds.crs,
+                  src_nodata=meta["nodata"], dst_nodata=np.nan,
+                  resampling=Resampling.nearest,
+              )
+      arr[~np.isfinite(arr)] = np.nan
+      return arr
+
+
+  bound = {name: _load(meta, name) for name, meta in sources.items()}
+
+  # ---------------------------------------------------------------- 5) 求值
+  try:
+      values = _eval(tree)
+  except ValueError:
+      raise
+  except SyntaxError as exc:
+      raise ValueError(f"表达式语法错误: {exc}")
   except Exception as exc:
       raise ValueError(f"表达式求值失败（{type(exc).__name__}: {exc}）；已绑定: {sorted(bound)}")
+  values = np.broadcast_to(np.asarray(values, dtype="float64"),
+                           (out_height, out_width)).astype("float64", copy=True)
 
-  out_folder = os.path.dirname(output_path)
-  if str(out_folder).lower().endswith(".gdb"):
-      if not arcpy.Exists(out_folder):
-          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
-  elif out_folder and not os.path.isdir(out_folder):
-      os.makedirs(out_folder, exist_ok=True)
-  if arcpy.Exists(output_path):
-      arcpy.management.Delete(output_path)
-  result.save(output_path)
+  # ---------------------------------------------------------------- 6) 写出
+  out_dir = os.path.dirname(os.path.abspath(str(output_path)))
+  if out_dir:
+      os.makedirs(out_dir, exist_ok=True)
+  if os.path.exists(str(output_path)):
+      os.remove(str(output_path))
+  payload = np.where(np.isfinite(values), values, np.float64(_NODATA_OUT)).astype("float32")
+  with rasterio.open(
+      str(output_path), "w", driver=_OUT_DRIVERS[out_ext],
+      height=out_height, width=out_width, count=1, dtype="float32",
+      crs=first_meta["crs"], transform=out_transform, nodata=_NODATA_OUT,
+  ) as dst:
+      dst.write(payload, 1)
 
-  r = arcpy.Raster(output_path)
-  set_result({"output": output_path, "expression": expression,
-              "min": r.minimum, "max": r.maximum, "mean": r.mean,
-              "cell_size": r.meanCellWidth, "size": [r.width, r.height]})
-  print(f"RasterCalculator done: range={r.minimum}~{r.maximum}, mean={r.mean}")
+  valid = values[np.isfinite(values)]
+  stats = {"output": str(output_path), "expression": expression,
+           "min": float(valid.min()) if valid.size else None,
+           "max": float(valid.max()) if valid.size else None,
+           "mean": float(valid.mean()) if valid.size else None,
+           "cell_size": float(out_cell), "size": [int(out_width), int(out_height)],
+           "nodata_px": int(values.size - valid.size), "grid_ref": grid.name}
+  set_result(stats)
+  print(f"RasterCalculator(gdal) done: grid={out_width}x{out_height}@{out_cell}m <- {grid.name}, "
+        f"range={stats['min']}~{stats['max']}, nodata={stats['nodata_px']}")
 validation:
   - type: raster_exists
     path: "{{output_path}}"
 pitfalls:
   - 表达式里的名称必须与 inputs 绑定名完全一致（区分大小写）。
   - 除法的分母若存在 0 或 NoData 会产生 NoData/Inf；分摊公式请用 Con(IsNull(...)) 或 SetNull 先处理。
-  - 像元大小不一致的栅格直接运算会触发重采样；先用 cell_size/extent_ref 统一到基准栅格。
+  - 混分辨率（参与运算的 inputs 之间像元大小不一致）在旧版是**没定义的行为**：两端各按自己的默认最近邻重采样，类别边界上取格口径不同 —— 实测 10 m 土地覆盖最近邻到 30 m 时 7,424 px 掩膜翻面（0.35%）、33,768 px 值差（1.6%，最大差一整格高程 2480 m），同分辨率 1.9M 像元则逐像元全等。现在**必须显式给 `resampling`**（`nearest` / `bilinear`），不给直接报错「混分辨率必须先明确重采样口径」；给了之后两端先按**同一套 numpy 代码**把每个输入重采样到同一输出网格再运算：`nearest` 取格心所在源像元（格心正好压在源像元边界时归右/下一格），`bilinear` 取四邻域权重（越界或有任一 NoData 邻格即 NoData），所以结果逐像元一致（**已在输出网格上且尺寸相同的输入两端都直读、不再重采样**：`extent_ref` 指向的正是参与运算的那幅时，arcpy 侧曾对它多跑一遍 bilinear，末端最后一行/列与 NoData 洞边缘 835/2,368,407 px（0.0353%）被误判 NoData，DAIR-144 已修；`bilinear` 的「越界即 NoData」只对**与输出网格不完全重合**的输入生效（同网格但只覆盖一部分的输入仍会掉末端一行/列））。分类数据用 `nearest`；要双三次/众数等其它方法请先把输入落盘成同一网格再调本配方。
+  - 混分辨率的**输出网格**与单分辨率不同：给了 `extent_ref` 就用它整幅（按 `cell_size` 取整）；没给它取各输入范围的**交集**，并吸附到第一个被引用输入的格网相位（单分辨率时仍是逐结点传播规则）。两端同一条规则，但不要再拿单分辨率的窗口去对混分辨率的结果。
+  - cell_size 写成**没绑定的名字**时两端行为不同：arcpy 静默退回第一个输入，GDAL 版直接报错并列出已绑定名（写错了应该当场知道）。
   - 补缺（缺失像元填 0）会改变总量，必须在报告里说明补了多少像元。
+  - 条件真假：`Con` / `SetNull` 的条件是**非 0 为真**（负值也算真，实测 arcpy Pro 3.6）：`Con(a - 5, 1, 0)` 在 a<5 的行取 1，`SetNull(a - 5, 1)` 在同一批行落 NoData；条件本身是 NoData 时结果也是 NoData。差分/变化量这类天然带负值的条件不需要先取绝对值。
+  - 输出范围按 arcpy 的**逐结点范围传播**算（不是按全局算一遍）：每个子表达式都有自己的窗口，两幅合并时逐轴取交集，再落到「交集正好等于某一侧整幅 → 用那一侧；否则用原点更大那一侧（y 比上边界、x 比左边界）」的格子上，窗口取该格子里**格心落在交集内**的像元（所以有时比交集少半格、有时多半格），其余输入最近邻落到该窗口。实测 arcpy Pro 3.6：`a+d`（同 10×10、原点错 5 m）→ 9 行 @(0,50)；`a+narrow`（x 被截到 30）→ 6 列；`a+narrow2`（x 在 2.5..32.5）→ 6 列 @x=2.5；三路 `a+c+d` → 10 行 @(0,55) 而 `d+a+c` → 9 行 @(0,50) —— **arcpy 自己就不对称，交换书写顺序可能得到不同窗口**。证据 `benchmark/reports/dair116_raster_calc_20261031/`，真实链 3c 仍是 2220×2542@elder。要固定网格请显式给 `extent_ref`（参考栅格）与 `cell_size`。
+  - 跑完会还原 `arcpy.env.cellSize` / `arcpy.env.extent` 成跑前值（arcpy 后端）：`extent_ref` 只是本配方内部的输出范围，不会留在持久内核里污染后续任务（实测未还原时，参考栅格是另一套 CRS 的话，同内核随后的 `zonal_statistics` 会报 ERROR 010568 范围无效）；真实链不需要手动清 `arcpy.env`。
+  - GDAL 后端只认 `Con` / `IsNull` / `SetNull` 三个函数（外加四则、比较、& / |）；`arcpy.sa` 其余函数（`Float` / `Int` / `Sqrt` / `FocalStatistics` 等）会**明确报错**，不会静默当常量；`and` / `or` / `not` 两端都不支持（arcpy 对栅格报 truth value is ambiguous），请用 `&` / `|`。
+  - 布尔运算：`&` / `|` 两端都是**逐像元布尔**（非零为真），实测 arcpy 对浮点与整型都如此、**不是位运算**（`Con(i & 2, 1, 0)` 在 i=1 上为真，位运算会是假）。`~` 是 arcpy 的**逻辑非**（实测 `~0 → 1`、`~1 → 0`），`//` `%` `**` `^` 也都能在 arcpy 里用，但本版一律**明确报错**（不静默给个近似值）；这几条请用 arcpy 后端，或用 `Con(x == 0, 1, 0)` 之类的等价写法。
+  - GDAL 后端输出**永远是 float32 + nodata=-3.4028235e+38**（与 `zonal_statistics_raster` 同一哨兵）；arcpy 侧会按值域挑类型（整型表达式 int32、`IsNull`/比较 uint8），两端 dtype 不同、像元值与 nodata 掩膜一致。
+  - GDAL 后端没有「裸栅格直接输出」的 dtype 透传：`expression` 就写一个输入名时，arcpy 原样复制（保留输入 dtype 与 nodata），GDAL 版会重写成 float32 + 上面的哨兵。
 examples:
   - "老年人口分摊：Con(IsNull(density), 0, density / zone_sum * elder)"
   - "把两期栅格相减求变化：r2 - r1"

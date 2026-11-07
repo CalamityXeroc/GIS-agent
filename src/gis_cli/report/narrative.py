@@ -259,7 +259,8 @@ def recipes_from_trace(trace_path: str | Path | None) -> list[RecipeCall]:
     """从 run 的 JSONL 里取出 ``run_recipe`` 的调用（配方 + 参数 + 成败）。
 
     只读 ``tool_call`` / ``tool_result`` 两种事件，且一一配对；解析失败的行
-    直接跳过——trace 是崩溃安全写的，末行可能是半行。
+    直接跳过——trace 是崩溃安全写的，末行可能是半行，也可能**截在汉字中间**
+    （非法 UTF-8）。
     """
     if not trace_path:
         return []
@@ -269,7 +270,10 @@ def recipes_from_trace(trace_path: str | Path | None) -> list[RecipeCall]:
     calls: list[RecipeCall] = []
     pending: RecipeCall | None = None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # ``errors="replace"``：严格解码会在**迭代途中**抛 UnicodeDecodeError，
+        # 把前面已经读到的合法行一起带走（成果包与溯源卡因此整份不生成，
+        # DAIR-50）。替换后的坏行过不了 json 解析，自然按坏行跳过。
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -318,6 +322,11 @@ def _recipe_title(library: Any, recipe_id: str) -> str:
     except Exception:  # pragma: no cover - 库实现异常不影响报告
         recipe = None
     return str(getattr(recipe, "name", "") or recipe_id or "未知配方")
+
+
+def recipe_title(library: Any, recipe_id: str) -> str:
+    """配方显示名（溯源卡与成果包方法段同一口径）。"""
+    return _recipe_title(library, recipe_id)
 
 
 def plain_methods(methodology: str, recipes: Iterable[RecipeCall]) -> list[str]:
@@ -378,6 +387,12 @@ def _relative(path: str, workspace: Path | None) -> str:
         return str(Path(path).relative_to(workspace)).replace("\\", "/")
     except (ValueError, OSError):
         return raw
+
+
+def relative_path(path: str | Path, workspace: str | Path | None = None) -> str:
+    """路径写给人看：能相对工作区就相对，不能就原样（统一正斜杠）。"""
+    root = Path(str(workspace)).resolve() if workspace else None
+    return _relative(str(path), root)
 
 
 # ------------------------------------------------------------------ 组装
@@ -456,6 +471,8 @@ __all__ = [
     "key_numbers",
     "plain_methods",
     "plain_verifications",
+    "recipe_title",
     "recipes_from_trace",
+    "relative_path",
     "source_rows",
 ]

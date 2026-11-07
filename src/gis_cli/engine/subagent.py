@@ -17,11 +17,18 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Mapping
 
+from ..review import (
+    ReviewClaim,
+    ReviewVerdict,
+    assertion_catalog,
+    parse_review_payload,
+)
 from ..trace.recorder import RunRecorder
 from .loop import AgentLoop
 from .state import Observation
+from .tool_codec import extract_json_object
 from .tools import EngineContext
 
 logger = logging.getLogger(__name__)
@@ -38,8 +45,9 @@ CHILD_CONTEXT_SOFT_LIMIT = 60_000
 DEFAULT_EXEC_TIMEOUT_SECONDS = 300.0
 #: 子代理 system prompt 里最多列几个技能（父默认 40 个 / 13k 字符）。
 CHILD_SKILLS_MAX = 12
-#: 子代理不能用的工具：delegate 防递归，ask_user 会让子任务停下来等人
-SUBAGENT_EXCLUDED_TOOLS = ("delegate", "ask_user")
+#: 子代理不能用的工具：delegate 防递归，ask_user 会让子任务停下来等人，
+#: review_result 防“复核者再复核”的无限套娃。
+SUBAGENT_EXCLUDED_TOOLS = ("delegate", "ask_user", "review_result")
 
 ROLE_PREAMBLE = """## 你是子代理（subagent）
 
@@ -50,6 +58,131 @@ ROLE_PREAMBLE = """## 你是子代理（subagent）
   自己的变量一律加 `sa_` 前缀（如 `sa_pts` / `sa_df`），别覆盖父代理的同名变量。
 - 你没有 ask_user（父在等你，不能停下来问人），也不能再派子代理。
 """
+
+#: 复核子代理能用的工具：**只读数据 + 跑断言 + 复算**，不给任何写产物/改任务的入口。
+REVIEW_TOOLS = ("assertion_check", "catalog_query", "read_file", "execute_code", "finish")
+
+REVIEW_ACCEPTANCE = (
+    "对 claim 里的每条断言用 assertion_check 跑一遍，并用数据独立复算关键数字；"
+    'finish 的 summary 必须是严格 JSON：'
+    '{"verdict":"pass|fail","findings":[{"code":"...","severity":"error|warning",'
+    '"detail":"...","claimed":...,"measured":...}],"checked":["..."],"notes":"..."}'
+)
+
+REVIEW_PREAMBLE = """## 你是独立复核子代理（blind reviewer）
+
+- **你看不到主代理的步骤、日志、中间推理和 trace**：任务描述里只有「任务目标 + 主代理结论（claim）
+  + 系统量测的数据摘要（facts） + 断言库」。这是刻意的：看到过程就会被过程带走，变成复述。
+- 不要猜主代理是怎么做的，也不要评价方法是否优雅；只判定**数字、几何、单位**对不对。
+- 先调用 assertion_check 跑本任务的断言；断言只是下限，关键数字要自己用 execute_code 从数据复算
+  （只读，不写产物；变量加 `rv_` 前缀，别覆盖主代理的内核变量）。
+- 不要复述 claim 的结论；发现不一致就写进 findings，并给出 claimed / measured 两个数。
+- 没有发现就 verdict=pass、findings=[]；不确定的写 warning，不要写 error。
+- finish 的 summary 必须是**严格 JSON**（不要 markdown 代码块）：
+  {"verdict":"pass|fail","findings":[{"code":"conservation.partition_mismatch","severity":"error","detail":"...","claimed":...,"measured":...}],"checked":["conservation.sum_equals"],"notes":"..."}
+"""
+
+#: 复核 prompt 里 facts 的字符上限（再大就截断，避免把子代理的上下文一次打满）。
+REVIEW_FACTS_MAX_CHARS = 22_000
+
+
+def _compact_facts(facts: Mapping[str, Any], limit: int = REVIEW_FACTS_MAX_CHARS) -> str:
+    """把量测事实压成复核 prompt 能装下的大小（保留断言要用的数字）。"""
+    datasets = facts.get("datasets") if isinstance(facts, Mapping) else None
+    compact: dict[str, Any] = {"datasets": {}}
+    if isinstance(datasets, Mapping):
+        for path, entry in list(datasets.items())[:20]:
+            if not isinstance(entry, Mapping):
+                continue
+            keep = {
+                key: entry[key]
+                for key in (
+                    "exists", "kind", "count", "crs", "geometry_types", "area_total", "area_unit",
+                    "bbox", "invalid_count", "overlap_ratio", "cell_size", "stats", "coverage", "contents",
+                    "relations",
+                )
+                if key in entry
+            }
+            if isinstance(entry.get("fields"), Mapping):
+                keep["fields"] = {
+                    str(name): {k: v for k, v in stats.items() if k in ("sum", "min", "max", "count", "mean")}
+                    for name, stats in entry["fields"].items()
+                    if isinstance(stats, Mapping)
+                }
+            if isinstance(entry.get("group_sums"), Mapping):
+                keep["group_sums"] = {
+                    str(name): dict(list(values.items())[:60])
+                    for name, values in entry["group_sums"].items()
+                    if isinstance(values, Mapping)
+                }
+            compact["datasets"][str(path)] = keep
+    text = json.dumps(compact, ensure_ascii=False, default=str)
+    if len(text) > limit:
+        text = text[:limit] + "\n…（facts 过长已截断，完整内容可用 assertion_check(paths=...) 重新量测）"
+    return text
+
+
+def build_review_task(
+    claim: ReviewClaim,
+    facts: Mapping[str, Any],
+    assertions: list[dict[str, Any]] | None = None,
+) -> str:
+    """拼复核任务：**只有**目标 + 结论 + 数据摘要 + 断言库，没有任何主轨迹。"""
+    specs = list(assertions if assertions is not None else claim.assertions)
+    catalog_lines = [
+        f"- `{item['type']}`（{item['family']}）：{item['summary']}；参数：{item['params']}"
+        for item in assertion_catalog()
+    ]
+    return (
+        "## 复核对象\n\n"
+        "### 1. 任务目标\n"
+        f"{claim.goal or '（未提供）'}\n\n"
+        "### 2. 主代理给出的结论（claim，可能含错误；不要复述）\n"
+        f"```json\n{json.dumps(claim.to_dict(), ensure_ascii=False, indent=2, default=str)}\n```\n\n"
+        "### 3. 数据与产物量测摘要（facts，系统直接从数据量测）\n"
+        f"```json\n{_compact_facts(facts)}\n```\n\n"
+        "### 4. 本任务的断言清单\n"
+        f"```json\n{json.dumps(specs, ensure_ascii=False, indent=2, default=str)}\n```\n\n"
+        "### 5. 断言库（assertion_check 的 type 只能取这些）\n"
+        + "\n".join(catalog_lines)
+        + "\n\n## 要求\n"
+        "1. 调用 assertion_check：把上面的断言清单原样传进 `assertions`，`paths` 传 claim.data_paths，"
+        "`claim` 传 claim，`group_fields` 按需声明（例如 {\"POP\": \"ZONE\"}）。"
+        "系统会重新量测数据；也可把上面的 facts 直接传给 `facts` 参数复用。\n"
+        "2. 断言只是下限：关键数字（总量/分区合计/面积/密度）自己用 execute_code 从数据复算一遍；"
+        "只读，不创建/修改任何产物。\n"
+        "3. 只判数据与结论是否一致，不评价做法；发现不一致写 finding（claimed / measured 都要有）。\n"
+        "4. 完成后调用 finish，summary 输出严格 JSON（schema 见上）。\n"
+    )
+
+
+def _verdict_from_result(result: SubtaskResult) -> ReviewVerdict:
+    """把复核子代理的 finish 摘要解析成 :class:`ReviewVerdict`（解析失败=unparsed）。"""
+    payload = extract_json_object(result.summary) if result.summary else None
+    if isinstance(payload, Mapping):
+        verdict = parse_review_payload(payload, raw=result.summary)
+        # 没跑完的子代理即使 self-report pass 也不能算通过
+        if not result.ok and verdict.status == "pass":
+            verdict.status = result.status or "error"
+    elif result.ok:
+        verdict = ReviewVerdict(
+            status="unparsed",
+            raw=result.summary[:8000],
+            notes="复核者没有按约定输出 JSON 判定",
+        )
+    else:
+        verdict = ReviewVerdict(
+            status=result.status or "error",
+            raw=result.summary[:8000],
+            notes=result.summary[:500],
+        )
+    verdict.subtask_id = result.subtask_id
+    verdict.turns = result.turns
+    verdict.tokens = result.tokens
+    verdict.elapsed_s = result.elapsed_s
+    verdict.trace = result.trace
+    verdict.error = result.error or verdict.error
+    return verdict
 
 
 @dataclass
@@ -139,6 +272,10 @@ class SubAgentRunner:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         exec_timeout_seconds: float = DEFAULT_EXEC_TIMEOUT_SECONDS,
         result_max_chars: int = 4000,
+        max_reviews_per_run: int = 1,
+        review_max_turns: int = 20,
+        review_timeout_seconds: float = 600.0,
+        review_exec_timeout_seconds: float = 300.0,
     ) -> None:
         self.parent = parent
         self.max_per_run = max(1, int(max_per_run))
@@ -146,7 +283,13 @@ class SubAgentRunner:
         self.timeout_seconds = float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS)
         self.exec_timeout = max(60.0, float(exec_timeout_seconds or DEFAULT_EXEC_TIMEOUT_SECONDS))
         self.result_max_chars = int(result_max_chars or 4000)
+        #: 复核单独计数：W5 的 token 翻倍，交付级任务默认只复核一次
+        self.max_reviews_per_run = max(1, int(max_reviews_per_run))
+        self.review_max_turns = self._clamp_turns(review_max_turns)
+        self.review_timeout = float(review_timeout_seconds or 600.0)
+        self.review_exec_timeout = max(60.0, float(review_exec_timeout_seconds or 300.0))
         self._used = 0
+        self._reviews = 0
 
     # ------------------------------------------------------------------ public
     def run(
@@ -167,20 +310,88 @@ class SubAgentRunner:
                 summary=f"本次运行最多派 {self.max_per_run} 个子代理，已达上限，剩下的请自己做。",
                 error="subagent limit reached",
             )
+        return self._execute(
+            sid=sid,
+            task=task,
+            acceptance=acceptance,
+            max_turns=max_turns,
+            tools=tools,
+            role_preamble=ROLE_PREAMBLE,
+            kind="子代理",
+            timeout_seconds=self.timeout_seconds,
+            exec_timeout=self.exec_timeout,
+            result_max_chars=self.result_max_chars,
+        )
+
+    def run_review(
+        self,
+        *,
+        claim: ReviewClaim | Mapping[str, Any],
+        facts: Mapping[str, Any],
+        assertions: list[dict[str, Any]] | None = None,
+    ) -> ReviewVerdict:
+        """跑一次**只看数据 + 结论**的复核，返回结构化判定（不抛异常）。
+
+        与 :meth:`run` 的关键差别：任务描述由 :func:`build_review_task` 现拼，
+        **不包含**父 loop 的任何消息/日志/中间推理；工具表只留只读复核所需的 5 个；
+        子代理配置里关掉 ``review_enabled``，防止复核者再触发一次复核。
+        """
+        self._reviews += 1
+        sid = f"rv{self._reviews}"
+        if self._reviews > self.max_reviews_per_run:
+            return ReviewVerdict(
+                subtask_id=sid,
+                status="refused",
+                notes=f"本次运行最多复核 {self.max_reviews_per_run} 次，已达上限",
+                error="review limit reached",
+            )
+        claim_obj = claim if isinstance(claim, ReviewClaim) else ReviewClaim.from_dict(claim)
+        raw_specs = assertions if assertions is not None else claim_obj.assertions
+        task = build_review_task(claim_obj, facts, raw_specs)
+        result = self._execute(
+            sid=sid,
+            task=task,
+            acceptance=REVIEW_ACCEPTANCE,
+            max_turns=self.review_max_turns,
+            tools=list(REVIEW_TOOLS),
+            role_preamble=REVIEW_PREAMBLE,
+            kind="复核子代理",
+            timeout_seconds=self.review_timeout,
+            exec_timeout=self.review_exec_timeout,
+            result_max_chars=8000,
+        )
+        return _verdict_from_result(result)
+
+    # --------------------------------------------------------------- internal
+    def _execute(
+        self,
+        *,
+        sid: str,
+        task: str,
+        acceptance: str,
+        max_turns: int | None,
+        tools: list[str] | None,
+        role_preamble: str,
+        kind: str,
+        timeout_seconds: float,
+        exec_timeout: float,
+        result_max_chars: int,
+    ) -> SubtaskResult:
         budget = self._clamp_turns(max_turns or self.max_turns)
-        deadline_budget = self._deadline_budget()
+        deadline_budget = self._deadline_budget(timeout_seconds)
         if deadline_budget < 60:
             result = SubtaskResult(
                 subtask_id=sid,
                 status="refused",
-                summary=f"父任务剩余时间不足（{deadline_budget:.0f}s），子代理来不及跑完，请自己完成。",
+                summary=f"父任务剩余时间不足（{deadline_budget:.0f}s），{kind}来不及跑完，请自己完成。",
                 error="insufficient parent budget",
             )
             self._emit_end(sid, result)
             return result
         self._emit(
             "subagent_start",
-            {"subtask_id": sid, "task": task[:200], "max_turns": budget, "timeout_s": round(deadline_budget)},
+            {"subtask_id": sid, "task": task[:200], "max_turns": budget, "timeout_s": round(deadline_budget),
+             "kind": kind},
         )
 
         allowed = [n for n in self.parent.registry.names() if n not in SUBAGENT_EXCLUDED_TOOLS]
@@ -193,7 +404,7 @@ class SubAgentRunner:
             result = SubtaskResult(
                 subtask_id=sid,
                 status="refused",
-                summary="子代理的工具表为空（tools 收窄过度），请放宽 tools 或自己完成。",
+                summary=f"{kind}的工具表为空（tools 收窄过度），请放宽 tools 或自己完成。",
                 error="empty tool subset",
             )
             self._emit_end(sid, result)
@@ -216,20 +427,23 @@ class SubAgentRunner:
             # 子任务的产物由父代理统一交付：子层出一份“成果包”只会把半成品
             # 写成正式报告，且会和父的同名文件抢字
             report_enabled=False,
-            role_preamble=ROLE_PREAMBLE,
+            role_preamble=role_preamble,
             # 子代理的卡死要尽快失败，别用父那档 600s
-            exec_timeout=min(float(self.parent.config.exec_timeout or 600.0), self.exec_timeout),
+            exec_timeout=min(float(self.parent.config.exec_timeout or 600.0), exec_timeout),
             # 技能目录 111 条占 13k 字符，子任务用不到那么多
             skills_max=CHILD_SKILLS_MAX,
+            # 复核子代理的 finish 不能再触发一次复核（套娃会把 token 翻成四倍）
+            review_enabled=False,
+            review_require_before_finish=False,
         )
         # 不能直接复用父的 ctx：run() 会把 context.state 覆盖成子状态，
         # 父的工具随后读到的就是子状态了。
         context = replace(self.parent.context) if isinstance(self.parent.context, EngineContext) else self.parent.context
         # execute_code 的默认超时取的是 ctx.exec_timeout，不只是 config
         try:
-            context.exec_timeout = min(float(getattr(context, "exec_timeout", 600.0) or 600.0), self.exec_timeout)
+            context.exec_timeout = min(float(getattr(context, "exec_timeout", 600.0) or 600.0), exec_timeout)
             # 模型可以自己传 timeout_seconds，这里兜住：子代理不允许超过自己的上限
-            context.max_exec_timeout = self.exec_timeout
+            context.max_exec_timeout = exec_timeout
         except Exception:
             pass
 
@@ -271,12 +485,12 @@ class SubAgentRunner:
             turns = int(state.turn or 0)
             error = str(state.error or "")
         except Exception as exc:  # 子代理崩了不能拖垮父
-            logger.exception("subagent %s crashed", sid)
+            logger.exception("%s %s crashed", kind, sid)
             status, summary, methodology, artifacts, turns = "error", "", "", [], 0
             error = f"{type(exc).__name__}: {exc}"
         elapsed = time.monotonic() - started
         if status != "completed" and not summary:
-            summary = error or f"子代理状态 {status}，没有给出结论"
+            summary = error or f"{kind}状态 {status}，没有给出结论"
 
         result = SubtaskResult(
             subtask_id=sid,
@@ -295,7 +509,7 @@ class SubAgentRunner:
                 kernel_before is not None
                 and getattr(self.parent.code_runner, "_kernel", None) is not kernel_before
             ),
-            max_chars=self.result_max_chars,
+            max_chars=result_max_chars,
         )
         self._emit_end(sid, result)
         return result
@@ -309,13 +523,13 @@ class SubAgentRunner:
             turns = DEFAULT_MAX_TURNS
         return max(MIN_MAX_TURNS, min(MAX_MAX_TURNS, turns))
 
-    def _deadline_budget(self) -> float:
+    def _deadline_budget(self, timeout_seconds: float | None = None) -> float:
         """子代理的墙钟预算 = min(自己的上限, 父的剩余 - 30s 收尾余量)。
 
         不夹的话，父只剩 3 分钟时子代理仍按 900s 跑：父会被子拖着一起超时，
         而超时后父已经没有余量做收尾了。
         """
-        budget = float(self.timeout_seconds)
+        budget = float(timeout_seconds if timeout_seconds is not None else self.timeout_seconds)
         deadline = getattr(self.parent, "_deadline", None)
         if deadline is not None:
             budget = min(budget, deadline - time.monotonic() - 30.0)

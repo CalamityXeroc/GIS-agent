@@ -5,7 +5,8 @@
 "设计 → 渲染 → 体检 → 微调 → 再渲染"的版面自修复闭环。
 
 检查项（不通过项的名字与 :func:`design.suggest_fixes` 约定一致）：
-- ``title_too_small`` / ``title_overflow``：图名字号与是否溢出图廓
+- ``title_too_small`` / ``title_overflow``：图名字号与是否溢出图廓（字号读不到时该项标
+  ``unmeasured``，即"不可评测"——不当作通过，见 :func:`_title_size_check`）
 - ``title_not_centered``：图名是否水平居中
 - ``legend_labels_unrounded``：图例标签是否残留多位小数（``11516.196000`` 这类）
 - ``legend_covers_data``：图例叠放区是否压住数据
@@ -131,6 +132,13 @@ def _is_round(value: float) -> bool:
 
 
 def _cim_symbol_height(element: Any) -> float | None:
+    """从 CIM 读文本元素字号；读不到返回 ``None``。
+
+    实测（ArcGIS Pro 3.6，DAIR-61 B3）：本管线建出来的图名元素是
+    ``CIMParagraphTextGraphic``，它的 ``graphic.symbol`` **恒为 None**；
+    ``TEXT_ELEMENT.textSize`` 回读也是 ``0.0``。所以这个函数只对"真有 symbol"的
+    文本元素有效，调用方不能把 ``None`` 当成"字号合格"。
+    """
     try:
         definition = element.getDefinition("V3")
     except Exception:
@@ -142,6 +150,26 @@ def _cim_symbol_height(element: Any) -> float | None:
         return float(height) if height is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _title_size_check(height_pt: float | None, min_title_pt: float) -> dict[str, Any]:
+    """图名字号检查：读不到字号时记 **不可评测**（``unmeasured``），不能记满分。
+
+    为什么不能把“读不到”当通过：那样 ``score.py`` 里 ``title_too_small`` 这 8 分
+    结构性永不触发，等于少一个能验证的维度（DAIR-61 B3）。
+    所以这里 ``ok=True``（不是缺陷，不挡交付闸门）但带 ``unmeasured=True``，
+    :func:`score.score_layout` 会把它列进 ``unmeasured`` 而不是当成通过。
+    """
+    if height_pt is None:
+        return {
+            "name": "title_too_small", "ok": True, "unmeasured": True,
+            "detail": "图名字号读不到（graphic.symbol 为空、textSize 回读 0）——该维度不可评测",
+        }
+    return {
+        "name": "title_too_small", "ok": height_pt >= min_title_pt,
+        "detail": f"图名字号 {height_pt:.1f}pt（下限 {min_title_pt:.0f}pt）",
+        "suggest_pt": max(min_title_pt, 18.0),
+    }
 
 
 def _image_density(image_path: str, box_px: tuple[int, int, int, int] | None = None) -> float | None:
@@ -161,6 +189,19 @@ def _image_density(image_path: str, box_px: tuple[int, int, int, int] | None = N
     except Exception as exc:  # pragma: no cover
         logger.warning("图片量测失败: %s", exc)
         return None
+
+
+def _legend_cover_check(density: float) -> dict[str, Any]:
+    """图例框内非白像素占比 → ``legend_covers_data``。
+
+    文案要说清方向：**占比高才是压住数据**（图例底下本来就有图面内容才会被描上）。
+    """
+    covers = density > 0.45
+    return {
+        "name": "legend_covers_data", "ok": not covers,
+        "detail": (f"图例框内非白像素占比 {density:.2f}，超过阈值 0.45，判为压住数据" if covers
+                   else f"图例框内非白像素占比 {density:.2f}，低于阈值 0.45，未压住数据"),
+    }
 
 
 def _image_flatness(image_path: str, box_px: tuple[int, int, int, int] | None = None) -> tuple[float, float] | None:
@@ -225,12 +266,7 @@ def check_layout(
         tx, ty, tw, th = boxes.get("Map Title", (0, 0, 0, 0))
         height_pt = _cim_symbol_height(title_element)
         min_title_pt = float((spec or {}).get("title", {}).get("min_pt") or 12.0)
-        ok_small = height_pt is None or height_pt >= min_title_pt
-        checks.append({
-            "name": "title_too_small", "ok": bool(ok_small),
-            "detail": f"图名字号 {height_pt:.1f}pt（下限 {min_title_pt:.0f}pt）" if height_pt else "无法读取图名字号",
-            "suggest_pt": max(min_title_pt, 18.0),
-        })
+        checks.append(_title_size_check(height_pt, min_title_pt))
         center_title = tx + tw / 2.0
         center_page = nx + nw / 2.0
         offset = abs(center_title - center_page)
@@ -350,10 +386,7 @@ def check_layout(
             )
             density = _image_density(image_path, box_px)
             if density is not None:
-                checks.append({
-                    "name": "legend_covers_data", "ok": density <= 0.45,
-                    "detail": f"图例框内非白像素占比 {density:.2f}（>0.45 视为压住数据）",
-                })
+                checks.append(_legend_cover_check(density))
         if frame:
             legend_box = boxes.get("Legend", (0, 0, 0, 0))
             if not (0 <= legend_box[0] and legend_box[0] + legend_box[2] <= frame[0] + frame[2] + 1e-6):

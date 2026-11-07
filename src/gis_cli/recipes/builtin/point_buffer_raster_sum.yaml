@@ -6,6 +6,8 @@ description: >
   秒级完成；缓冲区可以任意重叠（这是面转栅格类做法做不到的：一个像元只能归属一个分区）。
 domain: raster
 category: raster
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [缓冲区统计, 服务人口, 500米范围, 圆形缓冲, 点缓冲, 可达性统计, 服务半径, buffer statistics]
 preconditions:
   - 点与栅格坐标系一致（同一投影坐标系）
@@ -30,7 +32,7 @@ params:
   output_table:
     type: string
     required: true
-    description: 输出统计表（GDB 内表：标识字段 / SUM_VALUE / CELL_COUNT）
+    description: 输出统计表（字段：标识字段 / SUM_VALUE / CELL_COUNT）。arcpy 后端：.gdb 内表；gdal 后端：.csv / .gpkg（写不了 gdb 表，遇到会明确报错）
   nodata_as_zero:
     type: boolean
     default: true
@@ -52,6 +54,10 @@ code_template: |
 
   if not arcpy.Exists(points_path) or not arcpy.Exists(raster_path):
       raise ValueError("点或栅格数据不存在")
+  # 点输入给的是容器（.gpkg / .gdb / 文件夹）时先解析成具体图层（共享片段，见 fragments.py）
+  {{@zone_layer@}}
+
+  points_path = resolve_zone_layer(points_path)
   p_sr = arcpy.Describe(points_path).spatialReference
   r_sr = arcpy.Describe(raster_path).spatialReference
   if p_sr.name != r_sr.name:
@@ -111,6 +117,257 @@ code_template: |
   set_result({"output": output_table, "point_count": len(out_rows), "total_value": grand,
               "radius": radius, "points_with_data": nonzero})
   print(f"point_buffer_raster_sum: {len(out_rows)} points, total={grand:,.2f}, nonzero={nonzero}")
+code_template_gdal: |
+  # GDAL 版：逐像元对齐上方 arcpy 版（同一格网参数、同一格心判定、同一 nodata 口径、同一输出表结构）
+  import os
+  import re
+  import numpy as np
+  import pandas as pd
+  import geopandas as gpd
+  import pyogrio
+  import pyproj
+  import rasterio
+  from rasterio.windows import Window
+
+  points_path = {{points_path}}
+  id_field = {{id_field}}
+  raster_path = {{raster_path}}
+  radius = float({{radius}})
+  output_table = {{output_table}}
+  # nodata_as_zero 在 GDAL 侧不参与计算：NoData 记 0 与记 NaN 对 nansum 等价、CELL_COUNT 两档都
+  # 把 NoData 像元算进去（arcpy 实测两档同值 34546.0/80），保留参数只为与 arcpy 版签名一致。
+  nodata_as_zero = bool({{nodata_as_zero}})
+
+  #: ``x.gdb\图层`` / ``x.gpkg/图层`` 要拆成 dataset + layer 再读（pyogrio 不认拼在一起的路径）
+  _LAYER_IN_PATH = re.compile(r"^(.*\.(?:gdb|gpkg))[\\/](.+)$", re.IGNORECASE)
+
+  #: 输出格式白名单：GDAL 写不了 gdb 表，也不该把 .dbf 静默换成别的格式
+  _OUT_EXT = (".csv", ".gpkg")
+
+
+  def _read_points(path):
+      """点输入：图层本身 / 单层容器（.gpkg/.gdb/文件夹）/ 多层容器（必须指明图层）。"""
+      p = str(path)
+      m = _LAYER_IN_PATH.match(p)
+      if m and os.path.exists(m.group(1)):
+          dataset, layer = m.group(1), m.group(2)
+          try:
+              return gpd.read_file(dataset, layer=layer, engine="pyogrio")
+          except pyogrio.errors.DataLayerError:
+              # 要素类挂在要素数据集下时 pyogrio 只认裸图层名（``fd/要素类`` 三种分隔符都失败），
+              # 而 arcpy 认 ``x.gdb/数据集/要素类``：把原文换成能照着改的报错（见 pitfalls）。
+              layers = [str(row[0]) for row in pyogrio.list_layers(dataset)]
+              why = ("GDAL 的图层名不含要素数据集前缀（arcpy 认 x.gdb/数据集/要素类，GDAL 不认）"
+                     if dataset.lower().endswith(".gdb") else "GDAL 不替你猜图层名")
+              raise ValueError(
+                  f"点数据 {dataset} 里没有图层 {layer!r}：{why}；可用图层 {layers}；"
+                  f"请给 {dataset}/{layers[0] if layers else '图层名'}"
+              ) from None
+      if not os.path.exists(p):
+          raise ValueError(f"点数据不存在: {p}")
+      # 容器不替用户挑图层：恰好一层才自动用，多层要人话错误（与 arcpy 侧的共享片段同一取舍）
+      if not (os.path.isdir(p) or p.lower().endswith((".gpkg", ".gdb"))):
+          return gpd.read_file(p, engine="pyogrio")
+      layers = [str(row[0]) for row in pyogrio.list_layers(p)]
+      if not layers:
+          raise ValueError(
+              f"点输入 {p} 里没有可读的图层：请给到点图层本身（如 .shp 文件或 {p}/图层名）"
+          )
+      if len(layers) > 1:
+          raise ValueError(
+              f"点输入是多层容器（{len(layers)} 个图层: {', '.join(layers)}），"
+              f"GDAL 后端不替你挑：请指明图层，如 {p}/{layers[0]}"
+          )
+      print(f"点输入是容器（.gpkg/.gdb/文件夹），自动使用其中唯一的图层: {layers[0]}")
+      return gpd.read_file(p, layer=layers[0], engine="pyogrio")
+
+
+  #: ``x.gdb\图层`` / ``x.gdb/图层``（arcpy 侧交出来的真实形态）要翻成 GDAL 的 subdataset 写法：
+  #: 直接把 ``x.gdb\图层`` 交给 rasterio 是 ``No such file or directory``（.gdb 是目录，不是文件）。
+  _GDB_RASTER = re.compile(r"^(.*\.gdb)[\\/]([^\\/]+)$", re.IGNORECASE)
+
+
+  def _resolve_raster_path(path):
+      """栅格输入解析：``x.gdb\层名`` → ``OpenFileGDB:"x.gdb":层名``；只给 .gdb 时挑唯一栅格。
+
+      「存在性」不能靠 os.path.exists：库里的栅格不是文件系统路径（``x.gdb\层名`` 恒为 False，
+      数据其实在库里），判据是**能不能打开**——打不开才报错，且说清是哪一种形态打不开。
+      """
+      p = str(path)
+      m = _GDB_RASTER.match(p)
+      if m:
+          gdb, layer = m.group(1), m.group(2)
+          joined = os.path.join(gdb, layer)
+          if os.path.isfile(joined):      # .gdb 结尾的普通目录里的散文件，按文件路径打开
+              return joined
+          if not os.path.exists(gdb):
+              raise ValueError(f"栅格数据不存在: {gdb}（按 .gdb\\层名 解析，库本身不在）")
+          return f'OpenFileGDB:"{gdb}":{layer}'
+      if not (p.lower().endswith(".gdb") and os.path.isdir(p)):
+          return p
+      # 只给了库本身：单栅格库 rasterio 直接打得开；多栅格库打开是 count=0 的容器，
+      # 真正的数据在 subdatasets 里（GDAL 自己就是这么列的）。一份就替用户挑，多份报人话。
+      try:
+          with rasterio.open(p) as probe:
+              if int(probe.count) > 0:
+                  return p
+              subs = [str(item) for item in (probe.subdatasets or [])]
+      except Exception as exc:
+          raise ValueError(
+              f"栅格数据不存在或打不开: {p}（{type(exc).__name__}: {exc}）"
+          ) from None
+      if len(subs) == 1:
+          print(f"栅格输入是单栅格 .gdb（只给了库），自动使用其中唯一的栅格: {subs[0]}")
+          return subs[0]
+      if not subs:
+          raise ValueError(
+              f"栅格数据不存在或打不开: {p}（这是 .gdb 库、里面没有栅格）：请给到栅格本身"
+          )
+      names = "、".join(item.rsplit(":", 1)[-1] for item in subs)
+      raise ValueError(
+          f"栅格输入是含 {len(subs)} 份栅格的 .gdb（{names}），GDAL 后端不替你挑："
+          f"请指明栅格，如 {p}\\层名"
+      )
+
+
+  # 输出格式：白名单 + 拒绝时说清为什么（与 zonal_statistics 同一规矩，不静默换格式）
+  out_ext = os.path.splitext(str(output_table))[1].lower()
+  if out_ext not in _OUT_EXT:
+      why = ("GDAL 后端写不了 gdb 表（没有 FGDB 写驱动），请给 .csv 或 .gpkg"
+             if ".gdb" in str(output_table).lower() else "GDAL 版输出只支持 .csv / .gpkg")
+      raise ValueError(
+          f"GDAL 版输出格式不支持（收到 {output_table!r}）：{why}；gdb 表请用 arcpy 后端"
+      )
+
+  resolved_raster = _resolve_raster_path(raster_path)
+
+  points = _read_points(points_path)
+  # 字段名大小写不敏感（与 arcpy 的 SearchCursor 同一口径）
+  actual = next((c for c in points.columns if str(c).upper() == str(id_field).upper()), None)
+  if actual is None:
+      raise ValueError(
+          f"点数据缺少字段: {id_field}；可用: {sorted(c for c in points.columns if c != 'geometry')}"
+      )
+
+  # 标识字段按 arcpy 版落表：AddField(id_field, "LONG") + int(round(float(pid)))。
+  # 文本 ID 在 arcpy 版是 ValueError: could not convert string to float（实测），这里提前给人话。
+  ids = []
+  for index, value in enumerate(points[actual].tolist()):
+      try:
+          number = float(value)
+      except (TypeError, ValueError):
+          raise ValueError(
+              f"id_field={actual} 必须是数值型：arcpy 版按 LONG 写入、值是 int(round(float(pid)))，"
+              f"第 {index + 1} 行的值是 {value!r}"
+          ) from None
+      if not np.isfinite(number):
+          raise ValueError(f"id_field={actual} 第 {index + 1} 行是 NULL/NaN，无法写成整型 ID")
+      ids.append(int(round(number)))
+
+  # 几何为空的要素：arcpy 版在 SHAPE@XY 上抛 TypeError（它给的是 (None, None)，不是 None，
+  # 所以那句 `if shp is None: continue` 是死代码）。两端都不静默跳过，这里给明确报错。
+  empty = [str(i + 1) for i, g in enumerate(points.geometry) if g is None or g.is_empty]
+  if empty:
+      raise ValueError(
+          f"点数据有几何为空的要素（第 {'、'.join(empty[:5])} 行）：请先剔除这些要素；"
+          f"arcpy 后端同样跑不过去（TypeError）"
+      )
+
+  rows = []
+  try:
+      ds = rasterio.open(resolved_raster)
+  except Exception as exc:
+      # 不用 os.path.exists 判存在（那是 B1）：``x.gdb\层名`` 恒为 False，数据其实在库里。
+      raise ValueError(
+          f"栅格数据不存在或打不开: {raster_path}（{type(exc).__name__}: {exc}）"
+      ) from None
+  with ds:
+      if ds.count != 1:
+          raise ValueError(
+              f"栅格有 {ds.count} 个波段，本配方只接受单波段（arcpy 版对多波段直接在 Describe 上报"
+              f"「方法 width 不存在」）：请先拆出第 1 个波段"
+          )
+      if ds.transform.b or ds.transform.d:
+          raise ValueError(
+              "输入栅格是旋转格网（transform 有 b/d 分量）：本配方按正北格网判定格心，"
+              "arcpy 版会静默算错，请先重投影成正北格网"
+          )
+      raster_crs = pyproj.CRS.from_wkt(ds.crs.to_wkt()) if ds.crs else None
+      if points.crs is None or raster_crs is None:
+          raise ValueError("坐标系缺失（点或栅格没有 CRS），请先定义并统一投影坐标系")
+      # 同 EPSG 但 WKT 写法不同（ArcGIS 导出的 GeoTIFF 十有八九是 ESRI 写法）不算不一致。
+      # 判等三层（与 zonal_statistics / zonal_statistics_raster 的 GDAL 段逐字同一套）：
+      #   1) 默认置信度认出的 EPSG 码相同；
+      #   2) 退到 min_confidence=20 再认一次 —— ESRI 写法的 WKT 常常只能这样认出；
+      #   3) pyproj 等价判断（忽略轴序）。
+      # 不同码仍然拒绝（EPSG:4490 vs 32650、4508 vs 4490 都拒）——不是「都有 CRS 就放行」。
+      point_epsg, raster_epsg = points.crs.to_epsg(), raster_crs.to_epsg()
+      same_crs = point_epsg is not None and point_epsg == raster_epsg
+      if not same_crs:
+          low_point = points.crs.to_epsg(min_confidence=20)
+          same_crs = low_point is not None and low_point == raster_crs.to_epsg(min_confidence=20)
+      if not same_crs:
+          same_crs = points.crs.equals(raster_crs, ignore_axis_order=True)
+      if not same_crs:
+          raise ValueError(
+              f"坐标系不一致: points={points.crs.name}, raster={raster_crs.name}，请先投影"
+          )
+      # 半径是**输入坐标系单位**，两端都不重投影：地理坐标系下 500 就是 500 度（arcpy 实测不报错、
+      # 静默错数），这里只多打一行警告提醒，不改单位（改了就不是同一个配方了）。
+      if raster_crs.is_geographic:
+          print(
+              f"警告：栅格坐标系是地理坐标系（{raster_crs.name}），radius={radius} 会按「度」计算；"
+              f"请先把点与栅格投影到投影坐标系"
+          )
+
+      # 格网参数按 arcpy 版的推法：extent 与 width/height 反算（它没有 transform 可用）
+      left, right = ds.bounds.left, ds.bounds.right
+      bottom, top = ds.bounds.bottom, ds.bounds.top
+      ncols, nrows = ds.width, ds.height
+      cellw = (right - left) / ncols
+      cellh = (top - bottom) / nrows
+      r2 = radius * radius
+
+      for pid, geom in zip(ids, points.geometry):
+          # 非点要素按几何中心：arcpy 的 SHAPE@XY 对面要素返回的就是中心点（实测面输入与点同值）
+          point = geom if geom.geom_type == "Point" else geom.centroid
+          px, py = float(point.x), float(point.y)
+          c0 = max(0, int(np.floor((px - radius - left) / cellw)))
+          c1 = min(ncols, int(np.ceil((px + radius - left) / cellw)))
+          r0 = max(0, int(np.floor((top - (py + radius)) / cellh)))
+          r1 = min(nrows, int(np.ceil((top - (py - radius)) / cellh)))
+          if c1 <= c0 or r1 <= r0:
+              rows.append((pid, 0.0, 0))
+              continue
+          # 只读这一点的窗口：与 arcpy 读整幅再切片是同一块像元，内存却只按半径走
+          data = ds.read(1, window=Window(c0, r0, c1 - c0, r1 - r0), masked=True).astype("float64")
+          values = data.filled(np.nan)
+          xs = left + (np.arange(c0, c1) + 0.5) * cellw
+          ys = top - (np.arange(r0, r1) + 0.5) * cellh
+          inside = ((xs[None, :] - px) ** 2 + (ys[:, None] - py) ** 2) <= r2
+          # 与上面 nodata_as_zero 的注释同一件事：NoData 像元对 nansum 不贡献、但计入 CELL_COUNT
+          total = float(np.nansum(values[inside]))
+          rows.append((pid, total, int(inside.sum())))
+
+  table = pd.DataFrame(rows, columns=[str(id_field), "SUM_VALUE", "CELL_COUNT"])
+  os.makedirs(os.path.dirname(os.path.abspath(str(output_table))), exist_ok=True)
+  if os.path.exists(str(output_table)):
+      os.remove(str(output_table))
+  if out_ext == ".csv":
+      # utf-8-sig：Excel 直接打开不乱码（与 zonal_statistics 同一口径）
+      table.to_csv(str(output_table), index=False, encoding="utf-8-sig")
+  else:
+      # .gpkg 的表名取文件名：out/buf.gpkg → 表 buf
+      pyogrio.write_dataframe(
+          table, str(output_table), driver="GPKG",
+          layer=os.path.splitext(os.path.basename(str(output_table)))[0],
+      )
+
+  grand = float(sum(r[1] for r in rows))
+  nonzero = sum(1 for r in rows if r[1] > 0)
+  set_result({"output": str(output_table), "point_count": len(rows), "total_value": grand,
+              "radius": radius, "points_with_data": nonzero})
+  print(f"point_buffer_raster_sum: {len(rows)} points, total={grand:,.2f}, nonzero={nonzero}")
 validation:
   - type: vector_exists
     path: "{{output_table}}"
@@ -119,8 +376,20 @@ validation:
     value: 0
 pitfalls:
   - 缓冲区相互重叠时必须用本配方：面转栅格类做法一个像元只能属于一个分区，重叠区会丢数。
-  - 半径用投影单位（米）；地理坐标系下会按度算，结果错误。
+  - 半径用投影单位（米）；地理坐标系下会按度算，结果错误。两端都不重投影、也不改单位（arcpy 实测不报错、只静默错数），GDAL 版只多打一行警告。
   - 结果语义 = 像元中心落在圆内即计入，与分区统计口径一致。
+  - 重叠缓冲区按点各算各的圆：同一个像元落在两个点的圆里，就在两行里各记一次（arcpy 实测：A 单独跑与 A+C 一起跑，A 那行逐值相同）。这是本配方的核心语义，不是去重。
+  - 点完全在栅格外仍出一行 `0.0 / 0`（两端一致，不是不出行）；弧内全部是 NoData 时 SUM=0、CELL_COUNT>0。
+  - "`nodata_as_zero` 实测不影响结果：NoData 记 0 与记 NaN 对 nansum 等价，CELL_COUNT 两档都把 NoData 像元算进去（arcpy 实测 34546.0/80 两档一致）。"
+  - 标识字段按整型落表：两端都是 `int(round(float(pid)))`（arcpy 侧字段类型 LONG）。文本 ID 在 arcpy 侧是 ValueError、GDAL 侧提前给人话；小数 ID 会被四舍五入，请用整型 ID。
+  - 输出表字段固定为 `实际传入的 id_field` / `SUM_VALUE`（浮点）/ `CELL_COUNT`（整型）。GDAL 后端只能写 .csv / .gpkg：.gdb 表与 .dbf 明确报错（不静默换格式），gdb 表请用 arcpy 后端。
+  - 容器输入（.gpkg / .gdb / 文件夹）两端都不替你挑图层：恰好一层自动用（会 print 一行），多层报错并给「如 `x.gpkg/图层名`」的写法（两端都认）。但 `.gdb` 里要素类挂在要素数据集下时两端行为相反：arcpy 认 `x.gdb/数据集/要素类`，GDAL 只认裸图层名（`x.gdb/数据集/要素类` 会给人话报错）；如果库里恰好只有这一个图层，直接给 `x.gdb` 两端都能跑（arcpy 会报错要你指明，GDAL 自动取用）。
+  - 栅格输入给 `.gdb` 里的栅格（arcpy 侧交出来的 `x.gdb\层名`）两端都能读：GDAL 侧翻成 `OpenFileGDB:"x.gdb":层名`，只给 `.gdb` 且库里恰好一份栅格时自动取用、多份报错要你指明（如 `x.gdb\层名`）。判据是「能不能打开」，不是 `os.path.exists`（库里的栅格不是文件系统路径）。
+  - 下游要用 `attribute_join_table` 挂回（如按 BSM 挂回社区）时，GDAL 后端请输出 `.gpkg` 表：`.csv` 交给 GDAL 侧 join 时 OGR 把每一列都读成文本，数值键（BSM 整数）会报「关键字段类型不一致」（arcpy 侧走 TableToTable 导入，不受影响）。
+  - 多波段栅格两端都跑不了：arcpy 在 `Describe` 上报「方法 width 不存在」，GDAL 侧明确报错要你先拆出单波段。旋转格网同理（arcpy 会静默算错，GDAL 明确报错）。
+  - 几何为空的要素两端都不过：arcpy 抛 TypeError（`SHAPE@XY` 给 `(None, None)`，那句 `if shp is None: continue` 是死代码），GDAL 侧给明确报错。
+  - 输入不是点要素时两端都按几何中心算（`SHAPE@XY` 对面要素返回的就是中心点，实测面输入与中心点同值），不会报错。
+  - 坐标系判等：arcpy 比 `spatialReference.name`；GDAL 用「EPSG 码 → min_confidence=20 再认一次 → pyproj 等价」三层（ArcGIS 导出的 GeoTIFF 十有八九是 ESRI 写法 WKT）。没有 CRS 时 arcpy 能跑（两个空名字相等），GDAL 明确报错——跨后端比数时先补 CRS。
 examples:
   - "社区中心 500 米内的老年人口（绿地服务人口）"
   - "每个加油站 2 公里范围内的车流量合计"

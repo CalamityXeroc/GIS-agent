@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from .llm_client import EngineLLMClient, EngineLLMConfig, default_config_path
 from .loop import AgentLoop, LoopConfig
-from .tools import EngineContext, build_default_registry
+from .tools import REVIEW_TOOL_NAMES, EngineContext, build_default_registry
 from .verifier import Verifier
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,8 @@ class EngineBundle:
     verifier: Verifier
     context: EngineContext
     workspace: Path
+    #: 民生模板库（``templates/<id>/manifest.yaml``）。
+    templates: Any = None
     #: 数据目录后台预热器（``None`` = 启动时已同步扫完）
     prewarmer: Any = None
 
@@ -236,6 +238,7 @@ def build_engine(
     from ..recipes.store import RecipeLibrary
     from ..runtime.code_runner import CodeRunner
     from ..runtime.timing import StageTimer
+    from ..templates.store import TemplateLibrary
 
     _total = StageTimer("build_engine.total")
     ws = Path(workspace)
@@ -262,6 +265,10 @@ def build_engine(
     )
     recipes.load()
     _recipes_timer.done(count=len(recipes.all()))
+    # 模板库只是 manifest 的加载器（几十 KiB YAML），启动时同步读完即可；
+    # 真正执行发生在 run_template 里，按模板自己的 backend 声明门禁。
+    templates = TemplateLibrary(recipes=recipes, code_runner=code_runner)
+    templates.load()
     verifier = Verifier(
         workspace=ws,
         code_runner=code_runner,
@@ -287,12 +294,18 @@ def build_engine(
     subagent_enabled = bool(engine_cfg.get("subagent_enabled", False))
     if not subagent_enabled:
         registry = registry.subset([name for name in registry.names() if name != "delegate"])
+    # 双复核同理：默认关。关掉时 assertion_check / review_result 都不进工具表，
+    # 免得模型把“没开”当成“工具坏了”反复重试（W5 的 token 是翻倍的）。
+    review_enabled = bool(engine_cfg.get("review_enabled", False))
+    if not review_enabled:
+        registry = registry.subset([name for name in registry.names() if name not in REVIEW_TOOL_NAMES])
 
     context = EngineContext(
         workspace=ws,
         catalog=catalog,
         code_runner=code_runner,
         recipes=recipes,
+        templates=templates,
         verifier=verifier,
         output_dir=ws / "output",
         backup_dir=Path(engine_cfg.get("backup_dir", ws / ".gis_agent" / "backups")),
@@ -315,6 +328,9 @@ def build_engine(
         escalate_after_failures=int(engine_cfg.get("escalate_after_failures", 2)),
         run_deadline_seconds=float(engine_cfg.get("run_deadline_seconds", 7200)),
         report_enabled=bool(engine_cfg.get("report_enabled", True)),
+        review_enabled=review_enabled,
+        review_block_on_fail=bool(engine_cfg.get("review_block_on_fail", False)),
+        review_require_before_finish=bool(engine_cfg.get("review_require_before_finish", True)),
         verbose=verbose,
     )
 
@@ -344,9 +360,10 @@ def build_engine(
     )
     context.state = loop.state  # updated per run in loop.run
 
-    if subagent_enabled:
+    if subagent_enabled or review_enabled:
         from .subagent import SubAgentRunner
 
+        # 一个 runner 同时承载 delegate 与双复核：两者计数独立，共享同一个父 loop。
         subagent_runner = SubAgentRunner(
             loop,
             max_per_run=int(engine_cfg.get("subagent_max_per_run", 3)),
@@ -354,11 +371,27 @@ def build_engine(
             timeout_seconds=float(engine_cfg.get("subagent_timeout_seconds", 900)),
             exec_timeout_seconds=float(engine_cfg.get("subagent_exec_timeout_seconds", 300)),
             result_max_chars=int(engine_cfg.get("subagent_result_max_chars", 4000)),
+            max_reviews_per_run=int(engine_cfg.get("review_max_per_run", 1)),
+            review_max_turns=int(engine_cfg.get("review_max_turns", 20)),
+            review_timeout_seconds=float(engine_cfg.get("review_timeout_seconds", 600)),
+            review_exec_timeout_seconds=float(engine_cfg.get("review_exec_timeout_seconds", 300)),
         )
         # 工具 handler 在调用时才取工厂，所以可以在 loop 建好后再挂
-        context.extra["subagent_factory"] = subagent_runner.run
-        context.extra["subagent_runner"] = subagent_runner
-        logger.info("subagent enabled (max_per_run=%s, max_turns=%s)", subagent_runner.max_per_run, subagent_runner.max_turns)
+        if subagent_enabled:
+            context.extra["subagent_factory"] = subagent_runner.run
+            context.extra["subagent_runner"] = subagent_runner
+            logger.info(
+                "subagent enabled (max_per_run=%s, max_turns=%s)",
+                subagent_runner.max_per_run,
+                subagent_runner.max_turns,
+            )
+        if review_enabled:
+            context.extra["review_factory"] = subagent_runner.run_review
+            logger.info(
+                "second review enabled (max_per_run=%s, max_turns=%s)",
+                subagent_runner.max_reviews_per_run,
+                subagent_runner.review_max_turns,
+            )
 
     bundle = EngineBundle(
         loop=loop,
@@ -366,6 +399,7 @@ def build_engine(
         catalog=catalog,
         code_runner=code_runner,
         recipes=recipes,
+        templates=templates,
         verifier=verifier,
         context=context,
         workspace=ws,

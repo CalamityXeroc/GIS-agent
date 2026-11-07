@@ -692,8 +692,13 @@ def render_html(
     images: Sequence[tuple[ImageRef, str, bytes]] = (),
     layers: Sequence[tuple[LayerRef, dict[str, Any]]] = (),
     notes: Sequence[str] = (),
+    provenance: str = "",
 ) -> str:
-    """拼出完整的单文件 HTML（纯函数：给定内容与内嵌资源即得字符串）。"""
+    """拼出完整的单文件 HTML（纯函数：给定内容与内嵌资源即得字符串）。
+
+    ``provenance`` 是溯源卡已经渲染好的 ``<section>``（见 ``report.provenance``），
+    直接嵌在验证之后；空字符串就不加这一节。
+    """
     layers_section, payload = _layers_block(layers, notes)
     script = (
         f"<script>window.__LAYERS__ = {_json_for_script(payload)};</script>\n<script>{_JS}</script>"
@@ -722,6 +727,7 @@ def render_html(
             _methods_block(content),
             _sources_block(content),
             _verify_block(content),
+            provenance.strip(),
             f'<div class="disclaimer">{_esc(DISCLAIMER)}</div>',
             "<footer>本文件由 GIS Agent 自动生成，所需内容全部内嵌，不发起任何网络请求。</footer>",
             "</main>",

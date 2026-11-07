@@ -2,6 +2,8 @@ id: zonal_statistics
 name: 分区统计（栅格×区划）
 description: 用区划面统计栅格值（如人口栅格按行政区/社区汇总），输出统计表或连接回面要素。
 domain: spatial_analysis
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [分区统计, zonal, 栅格统计, 汇总人口, 栅格按面统计, 提取值]
 preconditions:
   - 分区面与栅格坐标系一致（否则先投影）
@@ -17,21 +19,21 @@ params:
   output_table:
     type: string
     required: true
-    description: 输出表路径（.dbf 或 .gdb/表名）
+    description: 输出表路径。arcpy 后端：.dbf 或 .gdb/表名；gdal 后端：.csv 或 .gpkg（写不了 gdb 表，遇到会明确报错）
   zone_field:
     type: string
     default: ""
-    description: 分区字段，空则用 OBJECTID
+    description: 分区字段，空则按分区数据的 OID 分区（.gdb 要素类里叫 OBJECTID、.gpkg 图层叫 fid、.shp 叫 FID，由 Describe().OIDFieldName 取真名）；输出表里的分区列名以结果里的 zone_field 为准
   statistics:
     type: string
     default: "SUM"
-    description: 统计类型，如 SUM/MEAN/MAXIMUM
+    description: 统计类型（arcpy 写法），如 SUM/MEAN/MAXIMUM/MINIMUM/RANGE/STD/MEDIAN，也可用组合写法 MIN_MAX/MEAN_STD/MIN_MAX_MEAN；多项用 ; 分隔，如 SUM;MEAN。两端都按 ; 拆开逐项统计、输出列名一致（MAXIMUM→MAX、MINIMUM→MIN）。ALL/PERCENTILE 是 arcpy 的扩展取值：PERCENTILE 要 percentile_values（本配方没这个参数），GDAL 后端对这两个都明确报不支持
 steps:
   - 检查坐标系一致性
-  - ZonalStatisticsAsTable
+  - 按 statistics 逐项调用 ZonalStatisticsAsTable（多项时逐项统计再并列成一张表）
   - 返回统计记录数
 code_template: |
-  import arcpy, os
+  import arcpy, os, re
   arcpy.env.overwriteOutput = True
 
   zone_path = {{zone_path}}
@@ -43,7 +45,12 @@ code_template: |
   if not arcpy.Exists(zone_path) or not arcpy.Exists(raster_path):
       raise ValueError("分区或栅格数据不存在")
 
-  zone_sr = arcpy.Describe(zone_path).spatialReference
+  # 分区输入给的是容器（.gpkg / .gdb / 文件夹）时先解析成具体图层（共享片段，见 fragments.py）
+  {{@zone_layer@}}
+
+  zone_path = resolve_zone_layer(zone_path)
+  zone_desc = arcpy.Describe(zone_path)
+  zone_sr = zone_desc.spatialReference
   raster_sr = arcpy.Describe(raster_path).spatialReference
   if zone_sr.name != raster_sr.name:
       raise ValueError(f"坐标系不一致: zone={zone_sr.name}, raster={raster_sr.name}，请先投影")
@@ -51,7 +58,10 @@ code_template: |
   if arcpy.Exists(output_table):
       arcpy.management.Delete(output_table)
 
-  zone = zone_field if zone_field else "OBJECTID"
+  # 空 zone_field = 「按数据的 OID 分区」。OID 字段名随数据源而变（.gdb 要素类 OBJECTID、
+  # .gpkg 图层 fid、.shp FID），写死 OBJECTID 只在 .gdb 里成立 —— 分区源是 .gpkg / .shp
+  # 时直接死在第一条 ZonalStatisticsAsTable（ERROR 001000: 字段 OBJECTID 不存在）。
+  zone = zone_field if zone_field else arcpy.Describe(zone_path).OIDFieldName
   # ZonalStatisticsAsTable 要求分区字段为整型；浮点/文本（如 BSM=Double）会报参数无效。
   # 这里自动建一个整型副本并用它统计，事后把输出表的字段名改回原名，下游 join 无需改代码。
   cast_note = ""
@@ -89,18 +99,86 @@ code_template: |
       cast_note = f"分区字段 {zone}({ftype}) 非整型，已转同名声整型副本统计（保留 {kept} 条）"
       print(cast_note)
 
-  arcpy.sa.ZonalStatisticsAsTable(
-      in_zone_data=zone_source,
-      zone_field=zone_used,
-      in_value_raster=raster_path,
-      out_table=output_table,
-      statistics_type=statistics,
-  )
+  # statistics 的多项写法（SUM;MEAN）：ZonalStatisticsAsTable 一次只认一个统计类型，
+  # 整串传进去会报 ERROR 000864（取值域里没有 "SUM;MEAN"）。这里按 ; 拆开逐项统计，
+  # 再把各自的统计列并进同一张表——列名由工具本身决定（MAXIMUM→MAX），与 GDAL 侧对齐。
+  requested = [t.strip().upper() for t in str(statistics).split(";") if t.strip()]
+  if not requested:
+      raise ValueError("statistics 不能为空（如 SUM 或 SUM;MEAN）")
+  tokens = []
+  for token in requested:
+      if token not in tokens:  # 去重保序：SUM;SUM 只跑一遍
+          tokens.append(token)
 
-  if zone_used != zone:
-      # 兜底：万一仍有名字差异，把统计表的字段名改回原名（要素类可改；表不支持则忽略）
+  def _zonal(stat, out_table):
+      arcpy.sa.ZonalStatisticsAsTable(
+          in_zone_data=zone_source,
+          zone_field=zone_used,
+          in_value_raster=raster_path,
+          out_table=out_table,
+          statistics_type=stat,
+      )
+
+  def _zone_out_field(table, expected):
+      """统计表里真正的分区列名。
+
+      ZonalStatisticsAsTable 会改写分区列名以避开该表自己的保留名：写 .gdb 表时
+      OBJECTID 让给表自身的 OID（分区列变 OBJECTID_1），写 .dbf 时 dBASE 的保留名
+      FID 会变 FID_。后续 JoinField / AlterField / 上报的 zone_field 必须用这个真名
+      —— 拿「源字段名」当「输出列名」用，.gdb 输出时会拿着表自身 OID 去 join，
+      行序恰好对得上时看着没错，真实的错数完全静默。
+      """
+      fields = [(f.name, f.type) for f in arcpy.ListFields(table)]
+      for name, ftype in fields:
+          if ftype != "OID" and name.upper() == str(expected).upper():
+              return name
+      # 撞保留名被改名：OBJECTID → OBJECTID_1 / FID → FID_。只认「精确名」
+      # 或「精确名 + 下划线（+ 序号）」——用 startswith 会把 OBJECTIDX、FIDX
+      # 这类同前缀的无关字段也吃进来，选错列就是静默串值。真出现多个改名
+      # 候选时取序号最小的那个（工具撞名时就是从 _1 往下试的）。
+      renamed = []
+      for name, ftype in fields:
+          match = re.fullmatch(re.escape(str(expected)) + r"(_\d*)", name, re.IGNORECASE)
+          if ftype != "OID" and match:
+              renamed.append((int(match.group(1)[1:] or 0), name))
+      if renamed:
+          return min(renamed)[1]
+      return expected
+
+  def _stat_tmp(index):
+      # 临时表必须与输出同一工作空间：.gdb / in_memory 里给表名，文件夹里给 .dbf
+      folder = os.path.dirname(output_table)
+      name = f"zz_zonal_tmp_{index}"
+      if str(folder).lower().endswith(".gdb") or str(folder).lower() == "in_memory":
+          return os.path.join(folder, name)
+      return os.path.join(folder, name + ".dbf") if folder else name + ".dbf"
+
+  _zonal(tokens[0], output_table)
+  zone_out = _zone_out_field(output_table, zone_used)
+  for index, token in enumerate(tokens[1:], start=1):
+      tmp_table = _stat_tmp(index)
+      if arcpy.Exists(tmp_table):
+          arcpy.management.Delete(tmp_table)
+      _zonal(token, tmp_table)
+      # 只并统计列：分区字段 / COUNT / AREA 每次统计都一样，留第一次的
+      existing = {f.name.upper() for f in arcpy.ListFields(output_table)}
+      extra = [f.name for f in arcpy.ListFields(tmp_table)
+               if f.type not in ("OID", "Geometry", "Blob", "Raster")
+               and f.name.upper() not in ("COUNT", "AREA", zone_out.upper())
+               and f.name.upper() not in existing]
+      if extra:
+          # 两张表的分区列可能各自被改名（.dbf/.gdb 规则不同），键名分开取
+          arcpy.management.JoinField(output_table, zone_out, tmp_table,
+                                     _zone_out_field(tmp_table, zone_used), extra)
+      arcpy.management.Delete(tmp_table)
+
+  if zone_out != zone and str(os.path.dirname(output_table)).lower().endswith(".gdb"):
+      # 兜底：把分区列改回 zone。只对 .gdb 表试：dBASE (.dbf) 的 AlterField 直接报
+      # ERROR 000664（数据集类型不受支持）；.gdb 表里 OBJECTID 已经是表自身的 OID，
+      # 改名会报 ERROR 002598。这两种情况都保留真名，由 set_result 的 zone_field 上报。
       try:
-          arcpy.management.AlterField(output_table, zone_used, zone, zone)
+          arcpy.management.AlterField(output_table, zone_out, zone, zone)
+          zone_out = zone
       except Exception as exc:
           print(f"AlterField 跳过: {str(exc)[:120]}")
   if "zz_zone_int_tmp" in str(zone_source) or str(zone_source).startswith("in_memory"):
@@ -109,8 +187,246 @@ code_template: |
 
   count = int(arcpy.management.GetCount(output_table)[0])
   set_result({"output": output_table, "record_count": count, "statistics": statistics,
-              "zone_field": zone, "casted_from": ftype if cast_note else None})
+              "zone_field": zone_out, "casted_from": ftype if cast_note else None})
   print(f"Zonal statistics done: {count} records")
+code_template_gdal: |
+  # GDAL 版：语义逐条对齐上方 arcpy 版（同一套 statistics 取值、同名输出字段、同样按格心取值）
+  import os
+  import re
+  import numpy as np
+  import pandas as pd
+  import geopandas as gpd
+  import pyogrio
+  import pyproj
+  import rasterio
+  from rasterio.mask import mask
+
+  zone_path = {{zone_path}}
+  raster_path = {{raster_path}}
+  output_table = {{output_table}}
+  zone_field = {{zone_field}}
+  statistics = {{statistics}}
+
+  #: ``xxx.gdb\图层`` 要拆成 dataset + layer 再读：pyogrio 的 OpenFileGDB 不认拼在一起的路径
+  _GDB_LAYER = re.compile(r"^(.*\.gdb)[\\/](.+)$", re.IGNORECASE)
+
+  #: arcpy 的 statistics_type → 输出列名。**这是唯一的取值来源**：两端能吃的字符串、
+  #: 输出字段名都由它决定，MAXIMUM→MAX / MINIMUM→MIN 这类改名只写在这里。
+  #: ALL / PERCENTILE 要 PCT90 这类百分位（arcpy 还得给 percentile_values），本配方没有那个参数，明确不支持。
+  _STAT_COLUMNS = {
+      "SUM": ("SUM",),
+      "MEAN": ("MEAN",),
+      "MAXIMUM": ("MAX",),
+      "MINIMUM": ("MIN",),
+      "RANGE": ("RANGE",),
+      "STD": ("STD",),
+      "MEDIAN": ("MEDIAN",),
+      "MIN_MAX": ("MIN", "MAX"),
+      "MEAN_STD": ("MEAN", "STD"),
+      "MIN_MAX_MEAN": ("MIN", "MAX", "MEAN"),
+  }
+
+  #: 输出列名 → 对一维有效像元做的计算。STD 取总体标准差（ddof=0）：实测 arcpy 对
+  #: 1..9 各 9 个像元给 2.581988897471611 = sqrt(60/9)，就是这个口径。
+  _STAT_OPS = {
+      "SUM": np.sum,
+      "MEAN": np.mean,
+      "MAX": np.max,
+      "MIN": np.min,
+      "RANGE": lambda values: np.max(values) - np.min(values),
+      "STD": lambda values: np.std(values, ddof=0),
+      "MEDIAN": np.median,
+  }
+
+
+  def _read_zones(path, with_fid):
+      p = str(path)
+      m = _GDB_LAYER.match(p)
+      if m and os.path.exists(m.group(1)):
+          return gpd.read_file(m.group(1), layer=m.group(2), engine="pyogrio", fid_as_index=with_fid)
+      if not os.path.exists(p):
+          raise ValueError(f"分区数据不存在: {p}")
+      return gpd.read_file(p, engine="pyogrio", fid_as_index=with_fid)
+
+
+  #: ``x.gdb\图层`` / ``x.gdb/图层``（arcpy 侧交出来的真实形态）要翻成 GDAL 的 subdataset 写法：
+  #: 直接把 ``x.gdb\图层`` 交给 rasterio 是 ``No such file or directory``（.gdb 是目录，不是文件）。
+  _GDB_RASTER = re.compile(r"^(.*\.gdb)[\\/]([^\\/]+)$", re.IGNORECASE)
+
+
+  def _resolve_raster_path(path):
+      """栅格输入解析：``x.gdb\层名`` → ``OpenFileGDB:"x.gdb":层名``；只给 .gdb 时挑唯一栅格。
+
+      「存在性」不能靠 os.path.exists：库里的栅格不是文件系统路径（``x.gdb\层名`` 恒为 False，
+      数据其实在库里），判据是**能不能打开**——打不开才报错，且说清是哪一种形态打不开。
+      """
+      p = str(path)
+      m = _GDB_RASTER.match(p)
+      if m:
+          gdb, layer = m.group(1), m.group(2)
+          joined = os.path.join(gdb, layer)
+          if os.path.isfile(joined):      # .gdb 结尾的普通目录里的散文件，按文件路径打开
+              return joined
+          if not os.path.exists(gdb):
+              raise ValueError(f"栅格数据不存在: {gdb}（按 .gdb\\层名 解析，库本身不在）")
+          return f'OpenFileGDB:"{gdb}":{layer}'
+      if not (p.lower().endswith(".gdb") and os.path.isdir(p)):
+          return p
+      # 只给了库本身：单栅格库 rasterio 直接打得开；多栅格库打开是 count=0 的容器，
+      # 真正的数据在 subdatasets 里（GDAL 自己就是这么列的）。一份就替用户挑，多份报人话。
+      try:
+          with rasterio.open(p) as probe:
+              if int(probe.count) > 0:
+                  return p
+              subs = [str(item) for item in (probe.subdatasets or [])]
+      except Exception as exc:
+          raise ValueError(
+              f"栅格数据不存在或打不开: {p}（{type(exc).__name__}: {exc}）"
+          ) from None
+      if len(subs) == 1:
+          print(f"栅格输入是单栅格 .gdb（只给了库），自动使用其中唯一的栅格: {subs[0]}")
+          return subs[0]
+      if not subs:
+          raise ValueError(
+              f"栅格数据不存在或打不开: {p}（这是 .gdb 库、里面没有栅格）：请给到栅格本身"
+          )
+      names = "、".join(item.rsplit(":", 1)[-1] for item in subs)
+      raise ValueError(
+          f"栅格输入是含 {len(subs)} 份栅格的 .gdb（{names}），GDAL 后端不替你挑："
+          f"请指明栅格，如 {p}\\层名"
+      )
+
+
+  # 输出格式：GDAL 写不了 gdb 表，也不该把 .dbf 静默换成别的格式
+  out_ext = os.path.splitext(str(output_table))[1].lower()
+  if out_ext not in (".csv", ".gpkg"):
+      why = "GDAL 后端不支持 gdb 表，请给 .csv" if ".gdb" in str(output_table).lower() else "请给 .csv 或 .gpkg 表"
+      raise ValueError(
+          f"GDAL 版输出只支持 .csv / .gpkg（收到 {output_table!r}）：{why}；.dbf 请用 arcpy 后端"
+      )
+
+  resolved_raster = _resolve_raster_path(raster_path)
+
+  # statistics 与 arcpy 同一套写法：SUM / MEAN / MAXIMUM …，多项用 ; 分隔
+  requested = [t.strip().upper() for t in str(statistics).split(";") if t.strip()]
+  if not requested:
+      raise ValueError("statistics 不能为空（如 SUM 或 SUM;MEAN）")
+  unsupported = [t for t in requested if t not in _STAT_COLUMNS]
+  if unsupported:
+      # 拒绝原因拼进报错（不只留在注释里）：COUNT 不是可选统计量，是固定输出列；
+      # ALL / PERCENTILE 要 PCT90 这类百分位（arcpy 还得给 percentile_values），本配方没有那个参数。
+      why = []
+      for token in unsupported:
+          if token == "COUNT":
+              why.append("COUNT 已是固定输出列，不需要也不能作为 statistics 指定")
+          elif token in ("ALL", "PERCENTILE"):
+              why.append(f"{token} 需要 percentile_values 参数（百分位），本配方没有，GDAL 后端没有实现")
+          else:
+              why.append(f"{token} 在 GDAL 后端没有实现")
+      raise ValueError(
+          f"statistics 里的 {unsupported} 不能这样指定：{'；'.join(why)}；"
+          f"可用 {sorted(_STAT_COLUMNS)}（多项用 ; 分隔）"
+      )
+  columns = []
+  for token in requested:
+      for column in _STAT_COLUMNS[token]:
+          if column not in columns:
+              columns.append(column)
+
+  zone_field = str(zone_field or "").strip()
+  zones = _read_zones(zone_path, not zone_field)
+  if zone_field:
+      # 与 arcpy 的 ListFields 同一口径：字段名大小写不敏感
+      actual = next((c for c in zones.columns if c.upper() == zone_field.upper()), None)
+      if actual is None:
+          raise ValueError(
+              f"分区数据缺少字段: {zone_field}；可用: {sorted(c for c in zones.columns if c != 'geometry')}"
+          )
+      zone_key = actual
+  else:
+      # 空 zone_field 等价于 arcpy 的 OBJECTID：取源数据的 FID。写 .csv/.gpkg 表时没有内建
+      # OBJECTID 字段，所以列名与 arcpy 写 .dbf 时一致是 OBJECTID（arcpy 写 .gdb 会改名 OBJECTID_1）。
+      zones = zones.assign(OBJECTID=zones.index)
+      zone_key = "OBJECTID"
+
+  try:
+      ds = rasterio.open(resolved_raster)
+  except Exception as exc:
+      # 不用 os.path.exists 判存在：``x.gdb\层名`` 恒为 False，数据其实在库里；判据是能不能打开。
+      raise ValueError(
+          f"栅格数据不存在或打不开: {raster_path}（{type(exc).__name__}: {exc}）"
+      ) from None
+  with ds:
+      raster_crs = pyproj.CRS.from_wkt(ds.crs.to_wkt()) if ds.crs else None
+      if zones.crs is None or raster_crs is None:
+          raise ValueError("坐标系缺失（分区面或栅格没有 CRS），请先定义并统一投影坐标系")
+      # 同 EPSG 但 WKT 写法不同（ArcGIS 导出的 GeoTIFF 十有八九是 ESRI 写法）不算不一致。
+      # 判等三层，只有「两边认出同一个 EPSG 码」或「pyproj 判等价」才算一致：
+      #   1) 默认置信度认出的 EPSG 码相同；
+      #   2) 退到 min_confidence=20 再认一次 —— ESRI 写法的 WKT 常常只能这样认出
+      #      （实测「1km老年人口分布.tif」与 EPSG:4508 是同一个坐标系，默认置信度给 None，
+      #       而 pyproj 的 equals 连 ignore_axis_order 都判 False）；
+      #   3) pyproj 等价判断（忽略轴序）。
+      # 不同码仍然拒绝（EPSG:4490 vs 32650、4508 vs 4490 都拒）——不是「都有 CRS 就放行」。
+      zone_epsg, raster_epsg = zones.crs.to_epsg(), raster_crs.to_epsg()
+      same_crs = zone_epsg is not None and zone_epsg == raster_epsg
+      if not same_crs:
+          low_zone = zones.crs.to_epsg(min_confidence=20)
+          same_crs = low_zone is not None and low_zone == raster_crs.to_epsg(min_confidence=20)
+      if not same_crs:
+          same_crs = zones.crs.equals(raster_crs, ignore_axis_order=True)
+      if not same_crs:
+          raise ValueError(
+              f"坐标系不一致: zone={zones.crs.name}, raster={raster_crs.name}，请先投影"
+          )
+      if ds.count > 1:
+          print(f"栅格有 {ds.count} 个波段，只统计第 1 个（与 arcpy 的 ZonalStatisticsAsTable 一致）")
+      # 像元面积（投影坐标系下是平方米；地理坐标系下是度²，那时 AREA 没有面积含义）
+      cell_area = abs(ds.transform.a * ds.transform.e - ds.transform.b * ds.transform.d)
+
+      work = zones.loc[zones.geometry.notna() & ~zones.geometry.is_empty]
+      rows = []
+      skipped = 0
+      # 按分区值分组：同名的多个面合并统计（arcpy 按分区值出唯一行，重名会合并）
+      for zone_value, group in work.groupby(zone_key, sort=False, dropna=False):
+          geoms = [g for g in group.geometry if g is not None and not g.is_empty]
+          try:
+              # all_touched=False（默认）= 按格心判定，与 arcpy 的分区统计口径一致。
+              # indexes 给**列表**：给标量时 mask() 返回 2 维数组，window[0] 就变成第一行了。
+              window, _ = mask(ds, geoms, crop=True, filled=False, indexes=[1])
+          except ValueError:
+              # 整个分区落在栅格外：arcpy 直接丢掉这一行，这里同样不留空行
+              skipped += 1
+              continue
+          values = window[0].compressed()  # nodata / 分区外都已掩掉
+          values = values[np.isfinite(values)]  # 没设 nodata 的 NaN/Inf 也不该污染统计
+          if values.size == 0:
+              skipped += 1
+              continue
+          # COUNT / AREA 与 arcpy 同口径：只数有效像元（nodata 不算），AREA = 有效像元数 × 像元面积
+          row = {zone_key: zone_value, "COUNT": float(values.size),
+                 "AREA": float(values.size) * cell_area}
+          for column in columns:
+              row[column] = float(_STAT_OPS[column](values))
+          rows.append(row)
+
+  table = pd.DataFrame(rows, columns=[zone_key, "COUNT", "AREA"] + columns)
+  os.makedirs(os.path.dirname(os.path.abspath(str(output_table))), exist_ok=True)
+  if os.path.exists(str(output_table)):
+      os.remove(str(output_table))
+  if out_ext == ".csv":
+      # utf-8-sig：Excel 直接打开不乱码（与 point_centers_by_year 同一口径）
+      table.to_csv(str(output_table), index=False, encoding="utf-8-sig")
+  else:
+      # .gpkg 的表名取文件名：out/zonal.gpkg → 表 zonal
+      pyogrio.write_dataframe(
+          table, str(output_table), driver="GPKG",
+          layer=os.path.splitext(os.path.basename(str(output_table)))[0],
+      )
+
+  set_result({"output": str(output_table), "record_count": int(len(table)),
+              "statistics": statistics, "zone_field": zone_key, "casted_from": None})
+  print(f"Zonal statistics done: {len(table)} records（{skipped} 个分区没有有效像元，已跳过）")
 validation:
   - type: vector_exists
     path: "{{output_table}}"
@@ -118,11 +434,21 @@ validation:
     path: "{{output_table}}"
     value: 0
 pitfalls:
-  - 分区字段必须是整型：浮点/文本（如社区 BSM）会被自动转成整型副本后统计（至少需能无损转整数）。
-  - 分区字段建议用唯一 ID；用名称可能因重名合并。
-  - 栅格有 NoData 时统计结果会受影响。
-  - 输出是库内表，不是文件系统路径：判定存在要用 arcpy.Exists（file_exists 断言会误判）。
+  - 分区输入给的是 **.gpkg / .gdb / 文件夹**（容器）而不是图层：arcpy 后端只在容器里恰好一个要素类时自动取用，多个图层会明确报错要你指明图层（如 `zones.gpkg/counties`）；GDAL 后端没给 layer 时默认读第一层、只留一条 warning —— 两边取舍不同，跨后端比数时一律显式指明图层。
+  - 分区字段必须是整型（arcpy 后端）：浮点/文本（如社区 BSM）会被自动转成整型副本后统计（至少需能无损转整数）；GDAL 后端不需要整型，文本分区字段只有 GDAL 后端能用。
+  - 分区字段建议用唯一 ID；用名称可能因重名合并（两端都按分区值分组，重名合并成一行）。
+  - 空 zone_field 时**不要写死 `OBJECTID`** 当输出列名：分区列的真实名字由「分区源的 OID 字段名」与「输出格式」共同决定，结果里的 `zone_field` 就是它。实测（Pro 3.6）：.gdb 要素类 + .dbf 输出 → `OBJECTID`；.gdb 要素类 + .gdb 表 → `OBJECTID_1`（OBJECTID 让给表自身 OID）；.gpkg 图层 + .dbf 输出 → `fid_`（dBASE 的保留名 FID 被加下划线）；.gpkg 图层 + .gdb 表 → `fid`；.shp 同理是 `FID` 系（且 .shp 的 OID 从 0 开始，输出的分区值就是 0..N-1）。下游 join 用结果里的 `zone_field`，别硬编码（GDAL 后端写 .csv/.gpkg 时一律叫 `OBJECTID`）。
+  - 栅格有 NoData 时统计结果会受影响：COUNT/AREA 只数有效像元（nodata 不算），两端一致。
+  - 输出是库内表，不是文件系统路径（arcpy 后端）：判定存在要用 arcpy.Exists（file_exists 断言会误判）。
+  - 多统计量（SUM;MEAN）在 arcpy 后端是逐项各跑一遍 ZonalStatisticsAsTable（N 个类型 = N 次遍历栅格），大栅格上耗时按倍数涨；GDAL 后端一次遍历出全部列。
+  - GDAL 后端只能写 .csv / .gpkg 表：.dbf 与 .gdb 表请用 arcpy 后端（会给明确报错，不会静默换格式）。
+  - GDAL 后端的 .csv 是 UTF-8（带 BOM）：用 pandas 读（encoding='utf-8-sig'）；OGR/pyogrio 在 GBK 区域设置下按 GBK 解 .csv 会报解码错，要程序化读取请用 .gpkg。
+  - GDAL 后端覆盖已有 .gpkg 时会整文件重写：同一个 .gpkg 里的其他图层会丢。
+  - 分区边界像元的归属规则两端不同（**不只是「边界正好压在格心」那一种**）：GDAL 与 arcpy 各自按自己的口径决定边界像元算不算，5 m 级小面上 COUNT 不保证相等——实测 2341 社区 × 5 m 只有 **10.0%** 的分区严格相等（与 DAIR-87 基线一致），偏移半像元的 9×9 探针 arcpy COUNT=64 vs GDAL 90。浮点量按容差卡：MEAN 实测中位差 **0.40%**、p95 **2.33%**（1 km 大面仍是 1e-7 级）；跨后端验收按 MEAN 相对差 **p95 ≤ 3%** 卡（实测 2.33%），**逐分区卡 3% 不成立**——2.74% 的分区会超、最大 14.2%，100–4999 px 的分区也会超（只有 ≥5000 px 才稳定在 **~1.3%** 以内，实测 max 1.3131%）；逐分区严格比对按 max ~14% 卡，或先按分区像元数过滤。不要按 COUNT 相等或 1e-6 卡。
+  - 分区在栅格外：个别分区在外时两端都跳过该分区、不出行（不报错）；**所有**分区都在栅格外（分区范围与栅格范围完全不重叠）时 arcpy 整体报错（ERROR 010568 范围无效），GDAL 跳过全部分区、写出 0 行表，随后栽在 feature_count_gt（count=0）。
+  - AREA 是「有效像元覆盖的面积」（COUNT×像元面积），不是分区面积；地理坐标系下单位是度²，没有面积含义。
   - 很慢：缓冲区（数千个）分区统计 5 米栅格通常要十几分钟，调用时把 timeout_seconds 调到 1800 以上。
+  - 栅格输入给 `.gdb` 里的栅格（arcpy 侧交出来的 `x.gdb\层名`）两端都能读：GDAL 侧翻成 `OpenFileGDB:"x.gdb":层名`，只给 `.gdb` 且库里恰好一份栅格时自动取用、多份报错要你指明（如 `x.gdb\层名`）。判据是「能不能打开」，不是 `os.path.exists`（库里的栅格不是文件系统路径）。
 examples:
   - "统计每个行政区的人口栅格总和"
   - "按社区汇总建筑物尺度人口"

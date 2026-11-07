@@ -15,7 +15,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .state import Observation
 
@@ -42,6 +42,10 @@ GIS_OUTPUT_EXT = {
 
 #: 归档/中间产物后缀：即使名字里带上面某个扩展名也不算产出
 _NON_OUTPUT_EXT = {".tmp", ".bak", ".log", ".pkl", ".pyc"}
+
+#: 分析正确性双复核（W5）的工具：默认关，关闭时由 runner 从工具表剔除
+#: （与 delegate 同一处理：留着只会让模型白花一轮去调一个不可用的工具）。
+REVIEW_TOOL_NAMES = ("assertion_check", "review_result")
 
 #: 代码里的 .gdb 路径（绝对或相对）。只用来做“是不是假库”的预检。
 _GDB_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\"'\n]*?\.gdb|[\w][\w./\\-]*\.gdb", re.IGNORECASE)
@@ -486,6 +490,8 @@ class EngineContext:
     catalog: Any = None
     code_runner: Any = None
     recipes: Any = None
+    #: 民生模板库（``templates/<id>/manifest.yaml``）；由 runner 装配，测试可注入。
+    templates: Any = None
     verifier: Any = None
     state: Any = None
     kernel: Any = None
@@ -943,6 +949,9 @@ def build_default_registry() -> EngineToolRegistry:
             "mode", "explicit_bounds", "class_bounds", "classification", "color_ramp",
             "category_names", "category_colors", "category_order", "legend_title",
             "map_kind", "note",
+            # 合规闸门（P1-2）的三个声明：图面已标的审图号、未送审水印、对外/内部用途。
+            # 闸门读的是“图面文字 + 声明”，不读像素（见 docs/compliance.md）。
+            "approval_number", "watermark", "audience",
         ):
             if args.get(key):
                 intent[key] = args[key]
@@ -954,10 +963,18 @@ def build_default_registry() -> EngineToolRegistry:
             intent["fields"] = args["fields"]
 
         aprx_path = str(args.get("aprx_path", "") or "")
+        # 数据目录里与本次图层相关的登记记录（来源/许可）。拿不到就是 None，
+        # rule② 据此不下“来源未登记”的结论 —— 没证据不等于没登记。
+        try:
+            from ..compliance.facts import catalog_rows_for
+
+            catalog_rows = catalog_rows_for(ctx.catalog, layers)
+        except Exception:
+            catalog_rows = None
         code = (
             "from gis_cli.cartography import create_map\n"
             f"_r = create_map({layers!r}, {intent!r}, output_path={output_path!r}, "
-            f"aprx_path={aprx_path!r}, code_runner=None)\n"
+            f"aprx_path={aprx_path!r}, catalog_rows={catalog_rows!r}, code_runner=None)\n"
             # 设计规格边车（同名 .spec.json）：制图配方里有这一步，create_map 没有。
             # 后果是同一个任务两条出图路径证据不一致：模型用 create_map 出图时
             # 验收找不到 .spec.json，判“未统一图例”并把 agent 逼去反复重做
@@ -994,6 +1011,13 @@ def build_default_registry() -> EngineToolRegistry:
                 hint="看 traceback 修正参数；overlay 的坐标系必须与图层一致（数据坐标，不是像素）。",
             )
         payload = result.result if isinstance(result.result, dict) else {}
+        # 质量分（0–100 + 三维度 + 扣分明细）只是**信息**：挂在 data 上给人看，
+        # 不参与下面的 ok 判定——闸门仍然是 qc_ok / map_layout，不新增硬失败。
+        payload = dict(payload)
+        if isinstance(payload.get("qc"), dict):
+            from ..cartography.score import score_layout
+
+            payload["quality"] = score_layout(payload["qc"]).to_dict()
         artifacts = extract_outputs(
             [output_path, aprx_path, payload.get("spec"), payload.get("output"), payload.get("aprx")],
             ctx.workspace,
@@ -1002,9 +1026,13 @@ def build_default_registry() -> EngineToolRegistry:
             for path in artifacts:
                 ctx.state.add_artifact(path)
         qc_ok = payload.get("qc_ok")
+        compliance = payload.get("compliance") if isinstance(payload.get("compliance"), dict) else {}
+        compliance_findings = compliance.get("findings") if isinstance(compliance.get("findings"), list) else []
         summary = f"出图完成：{output_path}"
         if qc_ok is not None:
             summary += f"（版面体检 {'通过' if qc_ok else '未通过'}）"
+        if compliance_findings:
+            summary += f"（合规{'阻断' if compliance.get('blocked') else '提醒'} {len(compliance_findings)} 项）"
         if qc_ok is False:
             # 体检不通过**不能放行**：以前这里返回 ok=True，模型看到“未通过”也照样
             # 走到 finish，交付的 .aprx 就带着未取整的图例标签（DAIR-32 基准 4a 实测）。
@@ -1023,11 +1051,35 @@ def build_default_registry() -> EngineToolRegistry:
                     "explicit_bounds 传整齐的上界；元素越界/压盖 → 用 overrides 调位置或换 style_profile。"
                 ),
             )
+        if compliance.get("blocked"):
+            # 阻断级不能放行：图已经出了（产物照常登记），但不能当作可对外交付的成果。
+            # 跟版面体检同一处理：ok=false 把问题摆到模型眼前，修完再重出。
+            blocked = [item for item in compliance_findings if item.get("level") == "block"]
+            detail = "；".join(str(item.get("message") or "") for item in blocked[:3])
+            advice = " ".join(str(item.get("advice") or "") for item in blocked[:2])
+            return Observation(
+                ok=False,
+                summary=f"合规闸门阻断：{output_path}",
+                data=payload,
+                artifacts=artifacts,
+                error={"type": "ComplianceBlocked", "message": detail[:400]},
+                hint=(
+                    f"这张图不能直接交付（闸门只做提示与阻断，不做合规判定）：{detail}\n{advice}\n"
+                    "处理方式：给 create_map 传 approval_number（已取得审图号）或 watermark=\"未送审·不得对外发布\""
+                    "（按内部图件交付，水印请同时用 overlay.labels 画到图上），或用已送审的底图重出；"
+                    "确实无法解决时如实告知用户，不要绕开闸门。"
+                ),
+            )
         return Observation(
             ok=True,
             summary=summary,
             data=payload,
             artifacts=artifacts,
+            hint=(
+                "合规提醒（不阻断交付）：" + "；".join(str(item.get("message") or "") for item in compliance_findings[:3])
+                if compliance_findings
+                else ""
+            ),
         )
 
     registry.register(
@@ -1050,7 +1102,11 @@ def build_default_registry() -> EngineToolRegistry:
                 "【版式微调】要覆盖自动设计（如比例尺长度）用 overrides，点路径写法："
                 '{"scale_bar.element_width_mm": 55}；出图后看 qc_summary 的提示即可。\n'
                 "【硬约束】版面体检不通过时本工具返回失败（ok=false）并列出要改的参数，"
-                "必须改完重出，不要带着未通过的版面去 finish。"
+                "必须改完重出，不要带着未通过的版面去 finish。\n"
+                "【合规闸门（只做提示 + 阻断，不做合规判定）】国界/敏感要素图层缺审图号又不标「未送审」时"
+                "本工具返回失败（阻断）；边界数据来源未登记、内部图缺未送审水印只提醒、不拦。"
+                "图面审图号请写进 approval_number（或用 overlay.labels 落在图上），未送审水印写进 watermark，"
+                "内部/送审前用途传 audience=internal。"
             ),
             parameters={
                 "type": "object",
@@ -1104,6 +1160,18 @@ def build_default_registry() -> EngineToolRegistry:
                         ),
                     },
                     "overrides": {"type": "object", "description": "强制覆盖设计（点路径，如 scale_bar.element_width_mm）"},
+                    "approval_number": {
+                        "type": "string",
+                        "description": "可选：图面已标注的审图号（形如 GS(2023)1234号）。国界/敏感要素图没有它会被合规闸门阻断",
+                    },
+                    "watermark": {
+                        "type": "string",
+                        "description": "可选：图面上的未送审水印文字（如「未送审·不得对外发布」，建议同时用 overlay.labels 画上去）",
+                    },
+                    "audience": {
+                        "type": "string",
+                        "description": "可选：public（对外图件，默认）/ internal（内部使用、送审前）",
+                    },
                     "timeout_seconds": {"type": "number", "description": "可选：执行超时秒数"},
                 },
                 "required": ["layers", "output_path"],
@@ -1141,6 +1209,89 @@ def build_default_registry() -> EngineToolRegistry:
             },
             handler=_list_recipes,
             readonly=True,
+        )
+    )
+
+    # ---------------------------------------------------------- list_templates
+    def _list_templates(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        from ..recipes.backends import runner_backends
+
+        if ctx.templates is None:
+            return Observation(ok=False, summary="模板库不可用", error={"type": "NoTemplates"})
+        query = str(args.get("query", "") or "").strip()
+        available = runner_backends(ctx.code_runner)
+        items = []
+        for template in ctx.templates.search(query):
+            info = template.to_dict()
+            # 本机能跑吗：执行器没声明能力时不猜（None），避免误报“跑不了”。
+            info["runnable"] = (
+                None if available is None else bool(set(template.backend) & available)
+            )
+            items.append(info)
+        summary = f"模板目录（{len(items)} 个）" if not query else f"找到 {len(items)} 个模板"
+        return Observation(ok=True, summary=summary, data={"templates": items})
+
+    registry.register(
+        EngineTool(
+            name="list_templates",
+            description=(
+                "列出民生模板：每个模板需要的输入（用途/类型/是否必需）、支持的执行后端、配方链。"
+                "query 留空返回全部；确认数据齐了再用 run_template 一次跑完整条链。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "关键词；留空表示全部"}},
+            },
+            handler=_list_templates,
+            readonly=True,
+        )
+    )
+
+    # ----------------------------------------------------------- run_template
+    def _run_template(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        if ctx.templates is None:
+            return Observation(ok=False, summary="模板库不可用", error={"type": "NoTemplates"})
+        template_id = str(args.get("template_id", "") or "").strip()
+        data = args.get("data") or {}
+        if not isinstance(data, dict):
+            return Observation(ok=False, summary="data 必须是对象（输入名 → 路径/值）", error={"type": "BadParams"})
+        output_dir = str(args.get("output_dir", "") or "").strip() or None
+        raw_timeout = args.get("timeout_seconds")
+        try:
+            timeout = float(raw_timeout) if raw_timeout else None
+        except (TypeError, ValueError):
+            timeout = None
+        return ctx.templates.run(
+            template_id, data, ctx, output_dir=output_dir, timeout=timeout
+        )
+
+    registry.register(
+        EngineTool(
+            name="run_template",
+            description=(
+                "按模板 manifest 跑配方链：自动把上一步的产物绑给下一步，逐步执行配方自带断言，"
+                "最后跑模板级断言。返回每一步的 recipe_id / 参数 / 成败 / 产物路径与断言明细。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "template_id": {"type": "string", "description": "模板 id（见 list_templates）"},
+                    "data": {
+                        "type": "object",
+                        "description": "输入名 → 路径/值，如 {\"zones\": \"input/zones.shp\", \"population_raster\": \"input/pop.tif\"}",
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "可选：产物目录（默认 workspace/output/<模板id>，相对路径按工作区解析）",
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "可选：每一步的执行超时秒数（重的统计步骤建议 1800 以上）",
+                    },
+                },
+                "required": ["template_id"],
+            },
+            handler=_run_template,
         )
     )
 
@@ -1384,6 +1535,214 @@ def build_default_registry() -> EngineToolRegistry:
         )
     )
 
+    # ------------------------------------------------------ 分析正确性双复核
+    def _assertion_check(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """跑守恒/拓扑/量纲断言（独立于配方，也不调模型）。
+
+        复核 subagent 用它把「claim 的自报数字」和「从数据量测的事实」对上。
+        ``facts`` 可复用系统已经量测好的摘要（省一次内核往返），也可以只给
+        ``paths`` 让这里重新量测。
+        """
+        from ..review import ReviewClaim, collect_facts, run_assertions
+
+        claim = ReviewClaim.from_dict(args.get("claim") or {})
+        raw_facts = args.get("facts")
+        facts: dict[str, Any] | None = (
+            raw_facts if isinstance(raw_facts, dict) and isinstance(raw_facts.get("datasets"), dict) else None
+        )
+        if facts is None:
+            paths = args.get("paths") or claim.data_paths
+            if not paths:
+                paths = list(getattr(getattr(ctx, "state", None), "artifacts", []) or [])
+            facts = collect_facts(
+                paths,
+                workspace=ctx.workspace,
+                runner=ctx.code_runner,
+                group_fields=args.get("group_fields") or {},
+            )
+        specs = args.get("assertions")
+        report = run_assertions(specs if isinstance(specs, list) else None, facts, claim)
+        return Observation(
+            ok=not report.errors,
+            summary=report.summary,
+            data={
+                "report": report.to_dict(),
+                "facts_paths": list(facts.get("paths") or []),
+                "datasets": sorted((facts.get("datasets") or {}).keys()),
+                "facts": facts,
+            },
+            error=(
+                {"type": "AssertionError", "message": "；".join(report.errors[:3])}
+                if report.errors
+                else None
+            ),
+            hint=(
+                "断言写错或事实缺失不会自动判失败：先看 report.errors / report.skipped；"
+                "缺事实时把 paths 指向真实数据再跑一次。"
+                if (report.errors or report.skipped)
+                else ""
+            ),
+        )
+
+    registry.register(
+        EngineTool(
+            name="assertion_check",
+            description=(
+                "对「主代理自报的数字（claim）」跑守恒/拓扑/量纲断言，返回逐条结论。\n"
+                "守恒：分项合计 == 总量、分区值 == 源数据分组汇总、分区面积合计 == 总面积；\n"
+                "拓扑：非法几何、重叠率、覆盖缺口、结果超出研究区、要素数变化有无解释；\n"
+                "量纲：CRS 单位与声明单位是否匹配（米 vs 度）、面积/密度/像元面积口径。\n"
+                "facts 参数可复用系统已量测的摘要；也可以只给 paths 让本工具重新量测（shp/.gdb/.tif 需要 ArcPy 内核）。\n"
+                "这是纯确定性检查，不调模型；断言 skipped/errors 要当成「没检查」而不是「通过」。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "assertions": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "断言清单，每条含 type 及参数（类型见系统提示里的断言库）",
+                    },
+                    "claim": {
+                        "type": "object",
+                        "description": "主代理结论：{goal, summary, metrics, units, expected, data_paths}",
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要量测的数据/产物路径；不给就用 claim.data_paths",
+                    },
+                    "group_fields": {
+                        "type": "object",
+                        "description": "分组汇总声明 {数值字段: 分组字段}，或按路径 {路径: {数值字段: 分组字段}}",
+                    },
+                    "facts": {
+                        "type": "object",
+                        "description": "可选：复用已量测的事实（系统 facts 摘要），省一次量测",
+                    },
+                },
+                "required": ["assertions"],
+            },
+            handler=_assertion_check,
+        )
+    )
+
+    def _review_result(args: dict[str, Any], ctx: EngineContext) -> Observation:
+        """把结论交给独立复核 subagent（看不到主轨迹），返回结构化判定。
+
+        ``verdict.ok`` 为真才算复核通过；发现不一致时 ``ok=false``，findings
+        里带 claimed / measured，主代理据此修结果或补解释。
+        """
+        from ..review import ReviewClaim, collect_facts
+
+        factory = ctx.extra.get("review_factory")
+        if factory is None:
+            return Observation(
+                ok=False,
+                summary="双复核不可用（engine.review_enabled 未开）",
+                error={"type": "NoReview", "message": "second review is disabled in engine config"},
+            )
+        raw_claim = args.get("claim")
+        claim = ReviewClaim.from_dict(raw_claim if isinstance(raw_claim, dict) else args)
+        if not claim.summary.strip():
+            return Observation(
+                ok=False,
+                summary="claim.summary 为空：复核者看不到结论，无从判定",
+                error={"type": "BadParams", "message": "claim.summary is required"},
+                hint="把结论、关键数字（metrics）、产物路径（data_paths）写进 claim；数字要带单位。",
+            )
+        paths = args.get("data_paths") or claim.data_paths
+        if not paths:
+            paths = list(getattr(getattr(ctx, "state", None), "artifacts", []) or [])
+        raw_facts = args.get("facts")
+        facts = (
+            raw_facts if isinstance(raw_facts, dict) and isinstance(raw_facts.get("datasets"), dict) else None
+        )
+        if facts is None:
+            facts = collect_facts(
+                paths,
+                workspace=ctx.workspace,
+                runner=ctx.code_runner,
+                group_fields=args.get("group_fields") or {},
+            )
+        try:
+            verdict = factory(
+                claim=claim,
+                facts=facts,
+                assertions=args.get("assertions") or claim.assertions,
+            )
+        except Exception as exc:  # 复核崩了不能把主任务拖挂
+            logger.exception("second review crashed")
+            return Observation(
+                ok=False,
+                summary=f"双复核启动失败：{exc}",
+                error={"type": type(exc).__name__, "message": str(exc)},
+                hint="可以缩小 claim 的 data_paths 后再试一次；复核不可用不应阻断交付（除非配置了 review_block_on_fail）。",
+            )
+        if ctx.state is not None:
+            payload = verdict.to_dict()
+            payload["signature"] = sorted(str(x) for x in (ctx.state.artifacts or []))
+            payload["paths"] = [str(x) for x in paths]
+            ctx.state.review = payload
+        return Observation(
+            ok=bool(verdict.ok),
+            summary=verdict.summary(),
+            data=verdict.to_dict(),
+            error=(
+                None
+                if verdict.ok
+                else {"type": "SecondReviewFailed", "message": verdict.summary()}
+            ),
+            hint=(
+                ""
+                if verdict.ok
+                else "按 findings 里的 claimed/measured 差异查清：要么重算结果，要么在 claim.expected 里给出可解释的原因，然后重新 review_result。"
+            ),
+        )
+
+    registry.register(
+        EngineTool(
+            name="review_result",
+            description=(
+                "交付前的独立复核：把一个**只含结论**的 claim 交给复核 subagent。\n"
+                "复核者看不到你的对话/步骤/日志，只拿到「任务目标 + 你的结论 + 数据量测摘要 + 断言库」，"
+                "用守恒/拓扑/量纲断言和独立复算来验算。\n"
+                "claim 必须写：summary（结论）、metrics（关键数字，如 total_pop/zone_pop/area_km2/密度）、"
+                "data_paths（输入与产物路径）、units（area/distance 单位）、expected（可解释的变化，如溶解）。\n"
+                "返回 status=pass 才算复核通过；fail 时 findings 里有 claimed/measured，改完再复核。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "claim": {
+                        "type": "object",
+                        "description": (
+                            "结论对象：{goal, summary, metrics: {…}, data_paths: [...], units: {area, distance}, "
+                            "expected: {count_change: \"删除 5 条重复记录\"}（解释里要有与变化对得上的数量）, "
+                            "assertions: [...]}"
+                        ),
+                    },
+                    "assertions": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "可选：覆盖 claim.assertions 的断言清单",
+                    },
+                    "data_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选：覆盖 claim.data_paths（输入数据 + 产物）",
+                    },
+                    "group_fields": {
+                        "type": "object",
+                        "description": "分组汇总声明 {数值字段: 分组字段}，用于核对分区明细",
+                    },
+                },
+                "required": ["claim"],
+            },
+            handler=_review_result,
+        )
+    )
+
     # --------------------------------------------------------- map_design
     def _map_design(args: dict[str, Any], ctx: EngineContext) -> Observation:
         """先出"设计说明"（纸张/图名/图例/比例尺/指北针 + 理由），再照它出图。
@@ -1475,10 +1834,60 @@ def build_default_registry() -> EngineToolRegistry:
         if args.get("elements"):
             raw["elements"] = list(args["elements"])
         result = ctx.recipes.run_assertions([raw])[0]
+        data = result.to_dict()
+        if result.error_type:
+            # 环境/路径/核验自身的问题（缺 arcpy / 路径没解析出来 / 核验过程报错）都不是
+            # 「工程不合格」：既不打分也不下结论。跟 create_map 拿不到体检结果时不硬造
+            # 分数是同一个口径：缺证据 ≠ 证据为假。
+            from ..recipes.store import ENV_CHECK_ERROR, ENV_NEEDS_ARCGIS, ENV_PATH_UNRESOLVED
+
+            # summary 只补 detail 自己没带的前缀：detail 已经写了「未核验（需 ArcGIS）：…」
+            # 就不要再补一层「工程未核验（需 ArcGIS）」——那是啰嗦，不是说清楚（DAIR-63）。
+            # 三种 error_type 的补救动作不一样，所以 label/hint 分开写。
+            label, hint = {
+                ENV_NEEDS_ARCGIS: (
+                    "未核验（需 ArcGIS）",
+                    "这是**环境失败**，不是版面不合格——不要据此改图、重出图或重建工程。"
+                    "换到 ArcGIS 解释器里重跑 check_map_project（等引擎的 code_runner 内核就绪）即可。",
+                ),
+                ENV_PATH_UNRESOLVED: (
+                    "工程路径无法解析",
+                    "这是**路径问题**，不是版面不合格——不要据此改图。确认 aprx_path 在调用方"
+                    "目录或引擎工作区里真实存在（相对路径两者都会试）后重跑 check_map_project。",
+                ),
+                ENV_CHECK_ERROR: (
+                    "核验过程报错",
+                    "这是**核验过程自己抛异常**（工程损坏 / arcpy 版本…），不是版面不合格、"
+                    "也不是没测——把 error.message 给人看，别据此改图或重出图。",
+                ),
+            }.get(
+                result.error_type,
+                ("工程未核验", "这不是版面不合格——不要据此改图、重出图或重建工程。"),
+            )
+            detail = result.detail[:300]
+            # detail 已经自带前缀的（「未核验（…）」「工程路径无法解析」「核验过程报错」）就不
+            # 再补一层：老代码补成了「工程未核验（需 ArcGIS）: 未核验（需 ArcGIS）：…」。
+            summary = detail if detail.startswith(("未核验", label)) else f"{label}: {detail}"
+            return Observation(
+                ok=False,
+                summary=summary,
+                data=data,
+                error={"type": result.error_type, "message": result.detail[:400]},
+                hint=hint,
+            )
+        # 质量分只挂在 data 上，**不参与 ok 判定**（ok 仍由断言结果决定，闸门行为不变）。
+        # 本工具不做版面体检——那要再开一次 .aprx，实测会挂死（见本函数 docstring），
+        # 所以这里只有正确性维度有输入（断言通过率）；版面两个维度由 create_map 那边打分。
+        from ..cartography.score import score_layout
+
+        data["quality"] = score_layout(
+            {"ok": bool(result.ok), "checks": []},
+            assertions=[{"name": "aprx_map_check", "ok": bool(result.ok), "detail": result.detail}],
+        ).to_dict()
         return Observation(
             ok=bool(result.ok),
             summary=("工程核验通过：" if result.ok else "工程核验未通过：") + result.detail[:400],
-            data=result.to_dict(),
+            data=data,
             hint="" if result.ok else "按提示修正渲染器/配色/布局后重新出图（用 category_map / graduated_colors_map）。",
         )
 

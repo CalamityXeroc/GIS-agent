@@ -200,6 +200,17 @@ class CodeRunner:
     def backend(self) -> str:
         return self.last_backend
 
+    @property
+    def backends(self) -> set[str]:
+        """这个执行器能跑的后端：内核与子进程都在 ArcGIS 的 Python 里，只有 arcpy。
+
+        为什么要如实声明：``[gdal]`` 配方要的是**另一个**执行器（P0-1b 接）。
+        声明成"什么都能跑"就会把 GDAL 代码丢给 ArcPy 内核，报一堆看不懂的
+        ImportError；声明成 arcpy，配方层才能给出"需 GDAL 后端"这种明确的错。
+        注意与上面 ``backend``（上一次实际走的执行路径）不是一回事。
+        """
+        return {"arcpy"}
+
 
 # --------------------------------------------------------------------- backup
 _DESTRUCTIVE_MARKERS = (

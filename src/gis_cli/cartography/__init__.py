@@ -82,8 +82,15 @@ def create_map(
     code_runner: Any = None,
     facts: dict[str, Any] | None = None,
     max_rounds: int = MAX_REPAIR_ROUNDS,
+    catalog_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """出图（含版面自修复）：facts → design → render → qc →（不合格）微调重渲。"""
+    """出图（含版面自修复）：facts → design → render → qc →（不合格）微调重渲。
+
+    出图后还会跑一次**合规自检**（P1-2）：结论写在 ``result["compliance"]``，
+    并以 ``<图名>.compliance.json`` 边车落盘，供 ``verify_outputs`` / ``finish``
+    汇总。``catalog_rows`` 是数据目录里与本次图层相关的登记记录（None = 没拿到，
+    来源类规则不下结论）。合规自检**不改变出图成败**，是否阻断由调用方决定。
+    """
     from . import apply as _apply
     from . import qc as _qc
 
@@ -138,6 +145,8 @@ def create_map(
         result["aprx_saved"] = True
     except Exception:
         pass
+    # 合规自检放在最后：此时图已落盘，边车能挨着图写；失败也绝不能带崩出图
+    _compliance_selfcheck(result, layers=layers, intent=normalized, catalog_rows=catalog_rows)
     import shutil as _shutil
 
     _shutil.rmtree(work_dir, ignore_errors=True)
@@ -145,6 +154,43 @@ def create_map(
     result["design_note"] = result.get("design_note") or ""
     result["summary_note"] = describe_spec(result.get("spec") or {})
     return result
+
+
+def _compliance_selfcheck(
+    result: dict[str, Any],
+    *,
+    layers: list[Any],
+    intent: dict[str, Any],
+    catalog_rows: list[dict[str, Any]] | None,
+) -> None:
+    """出图后的合规自检（P1-2）：事实 → YAML 规则 → 分级结论 + 边车。
+
+    为什么在这里而不是工具层：``create_map`` 是配方与工具共用的出图入口，
+    自检放在最里层，两条调用路径都跑得到（工具层再按级别决定放不放行）。
+    """
+    from ..compliance import check_map
+    from ..compliance.facts import context_from_spec
+    from ..compliance.store import write_sidecar
+
+    image = str(result.get("output") or "")
+    try:
+        context = context_from_spec(
+            result.get("spec") or {},
+            layers=layers,
+            catalog_rows=catalog_rows,
+            intent=intent,
+            image=image,
+        )
+        report = check_map(context)
+        result["compliance"] = report.to_dict()
+        if image:
+            try:
+                result["compliance_sidecar"] = str(write_sidecar(image, report, context=context))
+            except OSError as exc:
+                result["compliance_sidecar_error"] = str(exc)[:200]
+    except Exception as exc:  # pragma: no cover - 闸门自身故障不许影响出图
+        logger.warning("合规自检未完成: %s", exc)
+        result["compliance_error"] = str(exc)[:200]
 
 
 def _publish(source: str, target: str) -> str:

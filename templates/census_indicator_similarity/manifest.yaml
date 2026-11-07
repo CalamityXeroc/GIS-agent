@@ -1,0 +1,172 @@
+id: census_indicator_similarity
+name: 普查指标汇总到地市 + 相似城市识别
+description: >-
+  口径：区县逐年人口 CSV + 普查三项指标 CSV（老年人占比 / 育龄女性占比 / 性别比）+
+  区县面 + 地市面 → 先把人口挂接到区县，再按人口加权把三项指标汇总到地市
+  （OLD_PCT / FERT_PCT / SEX_RATIO）→ 用 z-score 标准化后的欧氏距离找出与参考地市
+  最相似的地市并写成 JSON → 三个指标各出一张分级设色专题图（JPG + 同名 .aprx）。
+  回答「这三项指标的空间格局如何、哪个地市与参照城市最像」。
+  不做聚类分区、不做时间序列比较，也不改动加权口径（人口取 Y2020）。
+version: "1.0"
+# 只声明 arcpy：csv_points_spatial_join / census_city_indicators / similarity_ranking /
+# graduated_colors_map 四个配方都只有 arcpy 实现（.aprx 也只有 arcpy.mp 能写）。
+backend: [arcpy]
+
+data:
+  population_csv:
+    type: file
+    required: true
+    purpose: 区县逐年人口 CSV（含区县中心点经纬度，默认 CenterLon/CenterLat 与 Y2011..Y2020 列）
+  census_csv:
+    type: file
+    required: true
+    purpose: >-
+      区县普查指标 CSV。列名固定：name / code / F65岁及以上人口比重_百分比_ /
+      F15_49岁育龄妇女比重_百分比_ / 男女性别比；按 code 与区县面匹配
+  county:
+    type: vector
+    required: true
+    purpose: 区县面（挂接人口与普查指标；需有 code 字段与普查表对齐）
+  city:
+    type: vector
+    required: true
+    purpose: >-
+      地市面（汇总单元与出图底图）。需有唯一字符串字段 name：
+      census_city_indicators 与 similarity_ranking 都按 name 回写/查找
+  target_srid:
+    type: integer
+    required: false
+    default: 4508
+    purpose: 分析用投影坐标系 EPSG/WKID（默认 4508；面积/距离与出图都需要投影坐标系）
+  reference_name:
+    type: string
+    required: false
+    default: 郑州市
+    purpose: 相似度分析的参照地市名（必须与 city 层的 name 完全一致）
+  lon_field:
+    type: string
+    required: false
+    default: CenterLon
+    purpose: 人口 CSV 里的经度列名（WGS84 十进制度）
+  lat_field:
+    type: string
+    required: false
+    default: CenterLat
+    purpose: 人口 CSV 里的纬度列名（WGS84 十进制度）
+
+pipeline:
+  - id: county_pop
+    recipe_id: csv_points_spatial_join
+    params:
+      csv_path: $data.population_csv
+      lon_field: $data.lon_field
+      lat_field: $data.lat_field
+      target_path: $data.county
+      output_path: $out/result_data.gdb/county_pop
+      source_srid: 4326
+      target_srid: $data.target_srid
+  - id: city_proj
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.city
+      output_path: $out/result_data.gdb/city_4508
+      target_srid: $data.target_srid
+  # 加权口径：区县三项指标先乘区县人口换成人数量（占比先 /100），汇总到地市后
+  # 再用 SUM_人数 / SUM_人口 还原成市级指标。人口字段固定 Y2020——换年份要同时改
+  # 这一步与下面断言里的 SUM_Y2020。
+  - id: city_census
+    recipe_id: census_city_indicators
+    params:
+      county_path: $steps.county_pop.output
+      census_csv: $data.census_csv
+      city_path: $steps.city_proj.output
+      output_path: $out/result_data.gdb/city_census
+      pop_field: Y2020
+  # 相似度：三个指标各自 z-score 后算与参照城市的欧氏距离，取最近的若干个写 JSON。
+  - id: similarity
+    recipe_id: similarity_ranking
+    params:
+      input_path: $steps.city_census.output
+      fields: "OLD_PCT,FERT_PCT,SEX_RATIO"
+      reference_name: $data.reference_name
+      output_json: $out/similarity.json
+      name_field: name
+      top_n: 3
+  # 三张图各带图名/图例/比例尺/指北针，并在图片同目录产出同名 .aprx（可编辑工程）。
+  - id: map_old
+    recipe_id: graduated_colors_map
+    params:
+      input_path: $steps.city_census.output
+      field_name: OLD_PCT
+      output_path: $out/old_pct_map.jpg
+      title: 地市老年人口占比
+      purpose: 分布
+  - id: map_fert
+    recipe_id: graduated_colors_map
+    params:
+      input_path: $steps.city_census.output
+      field_name: FERT_PCT
+      output_path: $out/fert_pct_map.jpg
+      title: 地市育龄女性占比
+      purpose: 分布
+  - id: map_sex
+    recipe_id: graduated_colors_map
+    params:
+      input_path: $steps.city_census.output
+      field_name: SEX_RATIO
+      output_path: $out/sex_ratio_map.jpg
+      title: 地市男女性别比
+      purpose: 分布
+
+assertions:
+  - type: fields_present
+    path: $steps.city_census.output
+    value: ["OLD_PCT", "FERT_PCT", "SEX_RATIO", "SRC_COUNT"]
+  - type: crs_wkid
+    path: $steps.city_census.output
+    value: $data.target_srid
+  # 人口加权汇总没落上时 SRC_COUNT / SUM_Y2020 是空或 0
+  - type: field_sum_gt
+    path: $steps.city_census.output
+    field: SRC_COUNT
+    value: 0
+  - type: field_sum_gt
+    path: $steps.city_census.output
+    field: SUM_Y2020
+    value: 0
+  # 占比字段是百分数：均值落在 [0,100] 之外说明加权时漏了 /100 或 ×100
+  - type: field_stats_between
+    path: $steps.city_census.output
+    field: OLD_PCT
+    stat: mean
+    value: [0, 100]
+  - type: field_stats_between
+    path: $steps.city_census.output
+    field: FERT_PCT
+    stat: mean
+    value: [0, 100]
+  - type: file_exists
+    path: $steps.similarity.output
+  # 结果必须真的是「相似度排序」：JSON 里要有 most_similar 这个结论字段
+  - type: file_contains
+    path: $steps.similarity.output
+    value: "most_similar"
+  # 三张图 + 三个可编辑工程（.aprx 与图片同名同目录，由 graduated_colors_map 自动落盘）
+  - type: file_exists
+    path: $steps.map_old.output
+  - type: image_not_blank
+    path: $steps.map_old.output
+  - type: file_exists
+    path: $steps.map_old.aprx
+  - type: file_exists
+    path: $steps.map_fert.output
+  - type: image_not_blank
+    path: $steps.map_fert.output
+  - type: file_exists
+    path: $steps.map_fert.aprx
+  - type: file_exists
+    path: $steps.map_sex.output
+  - type: image_not_blank
+    path: $steps.map_sex.output
+  - type: file_exists
+    path: $steps.map_sex.aprx

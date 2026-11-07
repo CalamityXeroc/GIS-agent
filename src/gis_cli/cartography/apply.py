@@ -1087,6 +1087,7 @@ def render(
             font_name=str(spec["title"].get("font") or "宋体"),
             size_pt=float(spec["title"].get("height_pt") or 20.0),
             bold=bool(spec["title"].get("bold", True)),
+            align=str(spec["title"].get("align") or "center"),
         )
         # 比例尺单位标签：ArcGIS 的 units/unitLabel 在 API 上改不动（units 是只读单位对象），导出后换成中文
         unit_text = str(spec["scale_bar"].get("unit_label") or "")

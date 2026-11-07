@@ -6,7 +6,8 @@
 
 1. ``narrative`` 把验收结论/配方调用翻成人话；
 2. ``html_pack`` 内嵌图片（超 1600px 先缩）与 GeoJSON，模板零外部请求；
-3. ``pdf_pack`` 用 matplotlib ``PdfPages`` 拼结论页/图页/方法页（可不装）。
+3. ``pdf_pack`` 用 matplotlib ``PdfPages`` 拼结论页/图页/方法页（可不装）；
+4. ``provenance`` 另出一张溯源卡（数据/步骤/参数/验证），嵌进成果包并写独立文件。
 
 任何一步失败都只写进 ``notes``，绝不阻断交付：成果包是交付的**附加物**，
 不是交付本身。
@@ -16,10 +17,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import narrative, html_pack, pdf_pack
+from . import narrative, html_pack, pdf_pack, provenance
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ IMAGE_PROFILES = ((1600, 82), (1280, 78), (1000, 74), (800, 70))
 
 HTML_NAME = "成果包.html"
 PDF_NAME = "成果包.pdf"
+PROVENANCE_NAME = provenance.CARD_NAME
 
 
 @dataclass
@@ -41,13 +44,18 @@ class Deliverables:
 
     html: Path | None = None
     pdf: Path | None = None
+    provenance: Path | None = None
     layers: int = 0
     images: int = 0
     notes: list[str] = field(default_factory=list)
 
     @property
     def paths(self) -> list[str]:
-        return [str(path) for path in (self.html, self.pdf) if path is not None]
+        return [
+            str(path)
+            for path in (self.html, self.pdf, self.provenance)
+            if path is not None
+        ]
 
 
 def build_deliverables(
@@ -71,7 +79,7 @@ def build_deliverables(
         result.notes.append("本次没有任何产物，未生成成果包")
         return result
 
-    content = narrative.build_content(
+    material = dict(
         goal=str(getattr(state, "goal", "") or ""),
         summary=str(getattr(state, "final_summary", "") or ""),
         methodology=str(getattr(state, "methodology", "") or ""),
@@ -83,12 +91,32 @@ def build_deliverables(
         trace_path=trace_path,
         library=recipes,
     )
+    try:
+        content = narrative.build_content(**material)
+    except Exception as exc:
+        # 正文失败不许带走整个交付：丢掉 trace / catalog 这两个外部输入再试一次，
+        # 最坏也还能出一份只有结论/验证/产物的成果包。
+        logger.warning("成果包正文生成失败，降级重试: %s", exc)
+        result.notes.append(f"成果包正文降级生成：{exc}")
+        content = narrative.build_content(**{**material, "catalog": None, "trace_path": None})
 
     layers, layer_notes = _collect_layers(content.layers, code_runner=code_runner, workspace=ws)
     image_refs, image_notes = _collect_images(content.images)
     result.notes.extend(layer_notes + image_notes)
 
-    kept_images, html_text = _fit_html(content, image_refs, layers, max_bytes, result.notes)
+    card, card_html, card_notes = _build_provenance(
+        state=state,
+        verdict=verdict,
+        catalog=catalog,
+        trace_path=trace_path,
+        recipes=recipes,
+        workspace=ws,
+    )
+    result.notes.extend(card_notes)
+
+    kept_images, html_text = _fit_html(
+        content, image_refs, layers, max_bytes, result.notes, card_html
+    )
     target_dir = Path(out_dir) if out_dir else ws / "output"
     target_dir.mkdir(parents=True, exist_ok=True)
     # 写的就是刚才量过体积的那份字符串：重渲染一次虽然结果相同，但“量过的”与
@@ -100,6 +128,9 @@ def build_deliverables(
     result.layers = len(layers)
     result.images = len(kept_images)
 
+    if card is not None:
+        result.provenance = _write_card_page(card, target_dir, result.notes)
+
     if want_pdf:
         pdf_path = pdf_pack.write_pdf(content, out_path=target_dir / PDF_NAME, images=kept_images)
         if pdf_path is None:
@@ -107,6 +138,49 @@ def build_deliverables(
         else:
             result.pdf = pdf_path
     return result
+
+
+# ------------------------------------------------------------------ 溯源卡
+def _build_provenance(
+    *,
+    state: Any,
+    verdict: dict[str, Any] | None,
+    catalog: Any,
+    trace_path: str | Path | None,
+    recipes: Any,
+    workspace: Path,
+) -> tuple[provenance.ProvenanceCard | None, str, list[str]]:
+    """生成溯源卡与嵌页片段；任何失败只记 note（溯源卡不阻断交付）。"""
+    try:
+        card = provenance.build_card(
+            state=state,
+            verdict=verdict,
+            catalog=catalog,
+            trace_path=trace_path,
+            recipes=recipes,
+            workspace=workspace,
+            generated_at=datetime.now().strftime(provenance.CARD_TIME_FORMAT),
+        )
+        return card, provenance.render_card_html(card), []
+    except Exception as exc:  # pragma: no cover - 卡片是附加物，不能拖垮成果包
+        logger.warning("溯源卡生成失败（不影响交付）: %s", exc)
+        return None, "", [f"溯源卡未生成：{exc}"]
+
+
+def _write_card_page(
+    card: provenance.ProvenanceCard,
+    target_dir: Path,
+    notes: list[str],
+) -> Path | None:
+    """写独立的 ``output/溯源卡.html``；写不出来只记 note。"""
+    try:
+        path = target_dir / provenance.CARD_NAME
+        path.write_text(provenance.render_card_page(card), encoding="utf-8", newline="\n")
+        return path
+    except Exception as exc:  # pragma: no cover - 磁盘满/占用
+        logger.warning("溯源卡写入失败（不影响交付）: %s", exc)
+        notes.append(f"溯源卡未写成独立文件：{exc}")
+        return None
 
 
 # ------------------------------------------------------------------ 收集
@@ -145,6 +219,7 @@ def _fit_html(
     layers: list[tuple[narrative.LayerRef, dict[str, Any]]],
     max_bytes: int,
     notes: list[str],
+    provenance_html: str = "",
 ) -> tuple[list[tuple[narrative.ImageRef, str, bytes]], str]:
     """把 HTML 压进 ``max_bytes``：先降图档，再少放几张，最后连图层一起丢。
 
@@ -168,7 +243,9 @@ def _fit_html(
                 notes.append(f"图「{ref.caption}」读不出来，未内嵌")
                 continue
             kept.append((ref, got[0], got[1]))
-        text = html_pack.render_html(content, images=kept, layers=layers, notes=notes)
+        text = html_pack.render_html(
+            content, images=kept, layers=layers, notes=notes, provenance=provenance_html
+        )
         if len(text.encode("utf-8")) <= max_bytes:
             return kept, text
 
@@ -176,17 +253,23 @@ def _fit_html(
     while kept and len(text.encode("utf-8")) > max_bytes:
         dropped = kept.pop()
         notes.append(f"为保证单文件体积上限，图「{dropped[0].caption}」未内嵌")
-        text = html_pack.render_html(content, images=kept, layers=layers, notes=notes)
+        text = html_pack.render_html(
+            content, images=kept, layers=layers, notes=notes, provenance=provenance_html
+        )
 
     # 图丢光了还超限：再逐层丢。多环面图层抽稀压不下去，只能少画一层。
     if len(text.encode("utf-8")) > max_bytes:
         while layers and len(text.encode("utf-8")) > max_bytes:
             dropped_layer = layers.pop()
             notes.append(f"为保证单文件体积上限，图层「{dropped_layer[0].name}」未内联")
-            text = html_pack.render_html(content, images=kept, layers=layers, notes=notes)
+            text = html_pack.render_html(
+                content, images=kept, layers=layers, notes=notes, provenance=provenance_html
+            )
         notes.append(f"成果包超过 {round(max_bytes / (1024 * 1024), 1):g}MB，已按体积上限裁剪")
         # 兜底说明也要出现在页面上：重渲染一次，才算真写进去了。
-        text = html_pack.render_html(content, images=kept, layers=layers, notes=notes)
+        text = html_pack.render_html(
+            content, images=kept, layers=layers, notes=notes, provenance=provenance_html
+        )
     return kept, text
 
 
@@ -198,5 +281,6 @@ __all__ = [
     "MAX_IMAGES",
     "MAX_LAYERS",
     "PDF_NAME",
+    "PROVENANCE_NAME",
     "build_deliverables",
 ]

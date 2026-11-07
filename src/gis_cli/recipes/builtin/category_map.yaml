@@ -84,6 +84,7 @@ code_template: |
   output_path = {{output_path}}
 
   if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
   # 分类栅格（如土地覆盖编码）没有属性字段，按像元值分类即可；只有矢量才校验字段
   _desc = arcpy.Describe(input_path)
   _is_raster = str(getattr(_desc, "dataType", "")).lower().startswith("raster") or bool(getattr(_desc, "isRaster", False))

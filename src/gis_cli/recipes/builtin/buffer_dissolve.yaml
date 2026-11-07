@@ -2,6 +2,8 @@ id: buffer_dissolve
 name: 缓冲区分析并融合
 description: 对输入要素按距离生成缓冲区，并按指定字段融合（dissolve）得到连续范围。
 domain: spatial_analysis
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [缓冲区, buffer, 融合, dissolve, 服务半径, 影响范围]
 preconditions:
   - 已投影到投影坐标系（距离单位与 CRS 单位一致）
@@ -28,6 +30,7 @@ steps:
   - 校验投影坐标系
   - Buffer_analysis（按 dissolve_type 决定融合方式）
   - 返回面积与要素数
+# arcpy 版：老配方原样保留（47 个配方 arcpy 渲染逐字不变的快照测试盯这一段）
 code_template: |
   import arcpy
   arcpy.env.overwriteOutput = True
@@ -69,6 +72,137 @@ code_template: |
               "distance": distance, "dissolve_option": option,
               "kept_field": bool(field and field in fields)})
   print(f"Buffer done: {count} features, area={area:.2f}, option={option}")
+code_template_gdal: |
+  # GDAL 版：语义逐条对齐上方 arcpy 版（投影校验 / dissolve 三种分支 / 返回键）
+  import os
+  import re
+  import geopandas as gpd
+  import pyogrio
+  import shapely
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  distance = {{distance}}
+  dissolve_field = {{dissolve_field}}
+  dissolve_type = str({{dissolve_type}}).strip().upper() or "ALL"
+
+  # "1000 Meters" / "1 Kilometers" / "1.5km" / "500 米" → 米数（arcpy 版直接吃带单位的字符串）
+  _UNITS = {
+      "m": 1.0, "meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0, "米": 1.0,
+      "km": 1000.0, "kilometer": 1000.0, "kilometers": 1000.0,
+      "kilometre": 1000.0, "kilometres": 1000.0, "千米": 1000.0, "公里": 1000.0,
+      "ft": 0.3048, "foot": 0.3048, "feet": 0.3048, "英尺": 0.3048,
+      "mi": 1609.344, "mile": 1609.344, "miles": 1609.344, "英里": 1609.344,
+  }
+
+
+  def _split_distance(text):
+      raw = str(text).strip()
+      digits = ""
+      for ch in raw:
+          if ch.isdigit() or (digits and ch in "."):
+              digits += ch
+          else:
+              break
+      unit = raw[len(digits):].strip().lower()
+      try:
+          value = float(digits.strip())
+      except ValueError:
+          raise ValueError(f"缓冲距离写法看不懂: {text!r}（示例：'1000 Meters' / '1 Kilometers'）")
+      return value, unit
+
+
+  #: ``x.gdb\要素类`` / ``x.gdb/要素类`` 要拆成 dataset + layer 再读：GDAL 把 ``.gdb`` 当目录，
+  #: 拼在一起的路径既不是文件、也不是图层名（真实链路里 arcpy 侧交出来的正是这个形状）。
+  _LAYERED = re.compile(r"^(.*\.(?:gdb|gpkg|sqlite))[\\/](.+)$", re.IGNORECASE)
+
+
+  def _read_input(path):
+      """读输入要素：``x.gdb\要素类`` 拆成「库 + 图层」再读，其余路径原样交给 pyogrio。"""
+      p = str(path)
+      m = _LAYERED.match(p)
+      if not m:
+          if not os.path.exists(p):
+              raise ValueError(f"输入数据不存在: {p}")
+          return gpd.read_file(p, engine="pyogrio")
+      dataset, layer = m.group(1), m.group(2)
+      if not os.path.exists(dataset):
+          raise ValueError(f"输入数据不存在: {dataset}（按 .gdb\\图层 解析，库本身不在）")
+      try:
+          return gpd.read_file(dataset, layer=layer, engine="pyogrio")
+      except pyogrio.errors.DataLayerError:
+          available = [str(row[0]) for row in pyogrio.list_layers(dataset)]
+          why = ("GDAL 的图层名不含要素数据集前缀（arcpy 认 x.gdb/数据集/要素类，GDAL 不认）"
+                 if dataset.lower().endswith(".gdb") else "GDAL 不替你猜图层名")
+          raise ValueError(
+              f"输入 {dataset} 里没有图层 {layer!r}：{why}；可用图层 {available}；"
+              f"请给 {dataset}/{available[0] if available else '图层名'}"
+          ) from None
+
+
+  gdf = _read_input(input_path)
+  crs = gdf.crs
+  if crs is None:
+      raise ValueError("缓冲区分析需要投影坐标系，请先投影（当前数据没有坐标系）")
+  if crs.is_geographic:
+      raise ValueError(
+          f"缓冲区分析需要投影坐标系，请先投影（当前是地理坐标系 {crs.name}，按度算缓冲区结果完全错）"
+      )
+  # 坐标系线性单位 → 米（米制 CRS 为 1.0；英尺制 CRS 要换算，否则和 arcpy 差 3.28 倍）
+  try:
+      unit_factor = float(crs.axis_info[0].unit_conversion_factor) or 1.0
+  except Exception:
+      unit_factor = 1.0
+
+  value, unit = _split_distance(distance)
+  if unit:
+      factor = _UNITS.get(unit)
+      if factor is None:
+          raise ValueError(f"缓冲距离单位不认识: {unit!r}（支持 Meters/Kilometers/Feet/Miles）")
+      buffer_distance = value * factor / unit_factor
+  else:
+      buffer_distance = value  # 没写单位 = 坐标系线性单位（与 arcpy 一致，不擅自当成米）
+
+  # 融合方式与 arcpy 版逐条对齐（Buffer 的 dissolve_option 语义）：
+  #   NONE=保留每条要素（属性不丢，可后续回连）；LIST=按字段融合；ALL=全部合一。
+  if dissolve_type == "NONE" or dissolve_type == "KEEP":
+      option, field = "NONE", ""
+  elif dissolve_field:
+      option, field = "LIST", dissolve_field
+  else:
+      option, field = "ALL", ""
+
+  if option == "NONE":
+      out = gdf.copy()
+      out["geometry"] = gdf.geometry.buffer(buffer_distance)
+  elif option == "LIST":
+      if dissolve_field not in gdf.columns:
+          known = [c for c in gdf.columns if c != "geometry"]
+          raise ValueError(f"融合字段不存在: {dissolve_field}（现有字段 {known}）")
+      buffered = gdf.copy()
+      buffered["geometry"] = gdf.geometry.buffer(buffer_distance)
+      # dropna=False：arcpy 的 dissolve_option=LIST 会把字段为空的行单独归成
+      # 一个 NULL 组；pandas 默认 dropna=True 把它们整组丢掉，要素数就对不上了。
+      out = buffered.dissolve(by=dissolve_field, as_index=False, dropna=False)
+  else:
+      merged = shapely.union_all(gdf.geometry.buffer(buffer_distance))
+      out = gpd.GeoDataFrame({"geometry": [merged]}, crs=crs)
+  out = out.reset_index(drop=True)
+
+  out_dir = os.path.dirname(os.path.abspath(output_path))
+  os.makedirs(out_dir, exist_ok=True)
+  if os.path.exists(output_path):
+      os.remove(output_path)
+  # GPKG 而不是 shp：shapefile 字段名截断到 10 字符，融合字段名一批就失真
+  out.to_file(output_path, driver="GPKG", engine="pyogrio", layer="buffer")
+
+  count = int(len(out))
+  area = float(out.geometry.area.sum())
+  fields = [c for c in out.columns if c != "geometry"]
+  set_result({"output": output_path, "feature_count": count, "total_area": area,
+              "distance": distance, "dissolve_option": option,
+              "kept_field": bool(field and field in fields)})
+  print(f"Buffer done: {count} features, area={area:.2f}, option={option}")
 validation:
   - type: vector_exists
     path: "{{output_path}}"
@@ -76,11 +210,13 @@ validation:
     path: "{{output_path}}"
     value: 0
 pitfalls:
+  - 输入可以是 `.gdb` 里的要素类（`x.gdb\要素类` / `x.gdb/要素类`）：GDAL 后端会拆成「库 + 图层」再读（不靠 `os.path.exists` 判存在）；要素类挂在要素数据集下时两端写法不同（arcpy 认 `x.gdb/数据集/要素类`，GDAL 只认裸图层名，给人话报错）。
   - 缓冲距离单位要写清楚（Meters/Kilometers）。
   - 地理坐标系下 Buffer 会用度，结果错误。
   - 需要把缓冲结果回连到原要素（如按 BSM 统计）时必须用 dissolve_type=NONE，
     否则融合会丢掉标识字段，后续 join 无键可用。
   - 只有确实需要连续范围（如服务区总面积）时才用 ALL。
+  - 面积只承诺 **1e-3** 相对差，不是 1e-6：两端都用折线近似圆弧、但**顶点数不同**（同一份 2341 社区 30 m 输入实测 LIST 2.07e-4 / NONE 1.12e-4 / ALL 1.61e-6，顶点 195147/267724、335757/313571、2575/3342），这是几何离散化差异、不是 bug。双端比面积请按 1e-3 卡；要位级一致请先统一缓冲的圆弧离散参数再比。
 examples:
   - "医院 1 公里缓冲区"
   - "河流两侧 500 米缓冲并融合"

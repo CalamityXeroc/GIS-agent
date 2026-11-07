@@ -303,6 +303,44 @@ def test_overrides_can_force_decisions():
     )["spec"]
     assert spec["legend"]["outside"] is True
     assert spec["title"]["height_pt"] == 16
+    assert spec["ignored_overrides"] == []
+
+
+def test_unknown_override_paths_are_reported_not_swallowed():
+    """DAIR-61 B5：不存在的点路径 / 同值写入不再静默吞掉，要回到 ``ignored_overrides``。"""
+    facts = make_facts(field_stats=CONTINUOUS)
+    spec = design_only(
+        [],
+        {"theme": "老年人口", "overrides": {
+            "legend.box.x": -120.0,      # legend 下只有扁平的 x，没有 box：点路径不存在
+            "legend.outside": False,     # 设计本来就是图框内，同值写入 → 图上不可能有变化
+            "title.height_pt": 16,       # 合法覆盖：照旧生效
+        }},
+        facts=facts,
+    )["spec"]
+
+    ignored = {item["path"]: item["reason"] for item in spec["ignored_overrides"]}
+    assert set(ignored) == {"legend.box.x", "legend.outside"}
+    assert "不存在" in ignored["legend.box.x"]
+    assert "相同" in ignored["legend.outside"]
+    assert spec["title"]["height_pt"] == 16          # 合法 override 行为不变
+    assert spec["legend"]["outside"] is False
+    assert "x" in spec["legend"] and "box" not in spec["legend"]   # 没有凭空造出 box 键
+
+
+def test_design_external_override_keys_still_apply():
+    """设计不产出、但渲染层要读的键（例：比例尺元素宽）必须照旧可写，不报成未知路径。"""
+    spec = design_only(
+        [],
+        {"theme": "老年人口", "overrides": {
+            "scale_bar.element_width_mm": 55,
+            "legend.frame_margin_mm": 5,
+        }},
+        facts=make_facts(field_stats=CONTINUOUS),
+    )["spec"]
+    assert spec["scale_bar"]["element_width_mm"] == 55
+    assert spec["legend"]["frame_margin_mm"] == 5
+    assert spec["ignored_overrides"] == []
 
 
 def test_suggest_fixes_maps_qc_failures_to_hints():
@@ -545,3 +583,52 @@ def test_qc_categorical_labels_only_reject_raw_floats():
     assert ok is False and "193833.858800001" in detail
     for labels in (["1982", "1993"], ["110101", "110102"], ["1.2", "2.5"], ["水域", "林地"]):
         assert _categorical_labels_detail(labels)[0] is True, labels
+
+
+def test_title_align_override_is_real_and_not_ignored():
+    """DAIR-67：``title.align`` 是设计层真会产出的键，覆盖后必须真改图，不许记成 ignored。"""
+    spec = design_only(
+        [], {"theme": "老年人口", "overrides": {"title.align": "left"}},
+        facts=make_facts(field_stats=CONTINUOUS),
+    )["spec"]
+    assert spec["title"]["align"] == "left"
+    assert spec["ignored_overrides"] == []
+
+
+def test_stamp_title_alignment_moves_text_in_exported_image(tmp_path):
+    """DAIR-67：成品图图名要真的按 align 对齐（改的是导出图，不是工程 spec）。
+
+    像素级比对：图 400×400、dpi=25.4（1mm=1px）、图名框 (50, 100, 100, 20)，
+    左对齐贴框左沿、右对齐贴框右沿、居中落在两者之间；不传 align 与 center 完全一致。
+    """
+    from PIL import Image
+
+    from gis_cli.cartography.image_overlay import stamp_title
+
+    box = (50.0, 100.0, 100.0, 20.0)      # x, y, w, h（mm，y 自页面左下角）
+    page_h, dpi = 400.0, 25.4             # 1mm = 1px
+    top, bottom = int(page_h - (box[1] + box[3])), int(page_h - box[1])
+
+    def column_span(align: str | None, name: str) -> tuple[int, int]:
+        img_path = tmp_path / f"{name}.jpg"
+        Image.new("RGB", (400, 400), "white").save(img_path)
+        kwargs = {} if align is None else {"align": align}
+        result = stamp_title(str(img_path), "图名", box_mm=box, page_height_mm=page_h,
+                             dpi=dpi, size_pt=40.0, bold=False, **kwargs)
+        assert result.get("ok") is True, result
+        with Image.open(img_path) as img:
+            gray = img.convert("L")
+            xs = [x for x in range(400)
+                  if any(gray.getpixel((x, y)) < 128 for y in range(top, bottom))]
+        assert xs, f"{name}: 图上没画出字"
+        return min(xs), max(xs)
+
+    left_span = column_span("left", "left")
+    center_span = column_span("center", "center")
+    right_span = column_span("right", "right")
+
+    assert abs(left_span[0] - box[0]) <= 2, left_span                 # 贴框左沿
+    assert right_span[1] >= (box[0] + box[2]) - 5, right_span        # 贴框右沿（含末字右侧字距）
+    assert center_span[0] > left_span[0] + 10, (left_span, center_span)
+    assert center_span[1] < right_span[1] - 10, (center_span, right_span)
+    assert column_span(None, "default") == center_span                # 默认仍是居中（老输出不变）

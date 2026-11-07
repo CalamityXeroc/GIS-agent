@@ -1,0 +1,104 @@
+# 地图合规闸门规则库（P1-2 / W3）
+#
+# 设计约定（改规则前先读）：
+# 1. 每条规则 = 事实（facts）上的一个布尔条件 + 分级 + 一句话结论 + 修法建议。
+#    事实由 ``gis_cli.compliance.facts`` 采集，规则里不写代码、不读文件、不碰 arcpy，
+#    所以整份 YAML 可以替换，也可以在运行时按 id 单独开关（``check_map(enabled=...)``）。
+# 2. 条件 DSL 只有四种形状：``all``（全部成立）/ ``any``（其一成立）/ ``not``（取反）
+#    与叶子 ``{fact, op, value}``；算子见 ``rules.py`` 的 ``OPS``。
+# 3. ``message`` / ``advice`` 里的 ``{xxx}`` 只能是 facts 里的键，写错在装载时就报错。
+# 4. **本闸门只做提示 + 阻断，不做合规判定**：它提醒你"可能少东西了"，
+#    是不是合法、能不能对外发布，以自然资源主管部门的审核结论为准。
+
+version: 1
+
+notice: "合规闸门只提醒你图面与数据里可能缺了什么，并可按严重程度阻断交付；它不做合规判定：是否合法、能否对外发布，以自然资源主管部门的地图审核结论为准。"
+
+levels:
+  block: 阻断
+  warn: 警告
+  info: 提示
+
+rules:
+  # ① 国界与敏感要素：缺审图号、又没标"未送审" → 阻断
+  - id: national_boundary_unapproved
+    title: 国界与敏感要素（未审图）
+    category: 国界与敏感要素
+    level: block
+    enabled: true
+    rationale: "公开使用的国界/敏感要素图件须经地图审核并标注审图号；既没有审图号、也没有「未送审」水印的图，按对外发布处理，是这套闸门里风险最高的一档。"
+    when:
+      all:
+        # 图层名里带国界/敏感要素，或者图名/注记里直接写了（两种都算“这张图涉及”）
+        - any:
+            - fact: sensitive_count
+              op: gt
+              value: 0
+            - fact: sensitive_in_text
+              op: eq
+              value: present
+        - fact: approval
+          op: ne
+          value: valid
+        - fact: watermark
+          op: eq
+          value: absent
+        - fact: audience
+          op: eq
+          value: public
+    message: "{sensitive_hint}，{approval_note}，也没有「未送审」水印"
+    advice: "国界与敏感要素图件须送审并标注审图号（形如 GS(2023)1234号）；未送审的图请加「未送审·不得对外发布」水印后按内部使用交付。"
+
+  # ② 边界数据来源未登记（含国界、行政界、海岸线） → 警告
+  - id: boundary_source_unregistered
+    title: 边界数据来源未登记
+    category: 数据来源
+    level: warn
+    enabled: true
+    rationale: "边界数据的出处决定能不能用。数据目录里没有来源登记（或只登记成本机文件）时，成果无法自证来源，溯源卡也只能写「来源未标注」。"
+    when:
+      all:
+        - fact: boundary_count
+          op: gt
+          value: 0
+        - fact: boundary_source
+          op: in
+          value: [unregistered, partial]
+    message: "{boundary_count} 个边界类图层里有 {unregistered_count} 个来源未登记（{unregistered_layers}）"
+    advice: "用 ingest 登记数据来源与许可（source/license，如天地图、自然资源部标准地图），让溯源卡能写清出处。"
+
+  # ③ 未送审水印缺失：按内部/未送审用途出图，却没打水印 → 警告
+  - id: watermark_missing
+    title: 未送审水印缺失
+    category: 送审状态
+    level: warn
+    enabled: true
+    rationale: "内部使用或送审前的图件必须以水印标明状态，否则容易被当成可对外发布的成品；这条只对显式声明了「内部使用」的图生效，不打扰对外图件。"
+    when:
+      all:
+        - fact: audience
+          op: eq
+          value: internal
+        - fact: watermark
+          op: eq
+          value: absent
+    message: "本图按内部/未送审用途出图（audience=internal），但图面没有「未送审/内部使用」水印"
+    advice: "在图上加「未送审·不得对外发布」水印（可用 overlay.labels 落在图框角落），或取得审图号后按对外图件交付。"
+
+  # ④ 审图号缺失：只做提示，不阻断
+  - id: approval_missing
+    title: 审图号缺失
+    category: 送审状态
+    level: info
+    enabled: true
+    rationale: "审图号是公开地图的合规标识之一。这条只是提一句：单张专题图不一定需要，对外发布前需要；已标「未送审」的图不再重复提示。"
+    when:
+      all:
+        - fact: approval
+          op: ne
+          value: valid
+        - fact: watermark
+          op: eq
+          value: absent
+    message: "{approval_note}；如本图对外发布，需按地图审核规定办理并标注审图号"
+    advice: "仅内部/汇报使用可以忽略；对外发布前补审图号（形如 GS(2023)1234号）。"

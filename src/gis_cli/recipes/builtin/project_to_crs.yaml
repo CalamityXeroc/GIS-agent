@@ -2,6 +2,8 @@ id: project_to_crs
 name: 投影/坐标系转换
 description: 将矢量要素投影到目标投影坐标系，支持 EPSG/WKID。距离/面积/密度分析前必须执行。
 domain: projection
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [投影, 坐标系, crs, epsg, wkid, 高斯, utm, albers, project]
 preconditions:
   - 输入数据已存在
@@ -14,7 +16,7 @@ params:
   output_path:
     type: string
     required: true
-    description: 输出要素类路径（建议 .shp 或 .gdb/名称）
+    description: 输出要素类路径（arcpy 可用 .shp 或 .gdb/名称；GDAL 只支持 .gpkg / .shp）
   target_srid:
     type: integer
     default: 4527
@@ -22,22 +24,40 @@ params:
   overwrite:
     type: boolean
     default: true
+    description: 输出已存在时是否覆盖
+  transformation:
+    type: string
+    default: ""
+    description: >-
+      基准面变换；留空 = 按后端默认。arcpy 侧写 ESRI 名（如 Beijing_1954_To_WGS_1984_1），
+      GDAL 侧写等价的 PROJ 名（如 "Beijing 1954 to WGS 84 (1)"）或一条 +proj= 管线
 steps:
   - 检查输入存在与源坐标系
   - 构造目标 SpatialReference
-  - 执行 Project
+  - 执行 Project（给了 transformation 就按它做基准面变换）
   - 返回要素数与新坐标系
+  - （GDAL 后端：容器输入自动解析、输出只支持 .gpkg / .shp、基准面变换必须显式指定）
 code_template: |
-  import arcpy
+  import arcpy, os
   arcpy.env.overwriteOutput = True
 
   input_path = {{input_path}}
   output_path = {{output_path}}
   target_srid = {{target_srid}}
   overwrite = {{overwrite}}
+  transformation = {{transformation}}
 
   if not arcpy.Exists(input_path):
       raise ValueError(f"输入数据不存在: {input_path}")
+
+  # 容器输入（.gpkg / .gdb / 文件夹）先解析成具体图层（共享片段，见 fragments.py）。
+  # 片段里的措辞是给分区配方写的，这里把「分区」换成「输入」再抛，别让人以为要去找分区。
+  {{@zone_layer@}}
+
+  try:
+      input_path = resolve_zone_layer(input_path)
+  except ValueError as exc:
+      raise ValueError(str(exc).replace("分区输入", "输入").replace("分区图层", "图层")) from None
 
   src_desc = arcpy.Describe(input_path)
   src_sr = getattr(src_desc, "spatialReference", None)
@@ -46,10 +66,16 @@ code_template: |
 
   target_sr = arcpy.SpatialReference(int(target_srid))
 
-  if overwrite and arcpy.Exists(output_path):
+  # 顶层把 overwriteOutput 打开了，Project 对已存在的输出会**静默覆盖**（不报错），
+  # 所以 overwrite=false 必须在这里自己拦，否则这个参数就是个摆设。
+  if arcpy.Exists(output_path):
+      if not overwrite:
+          raise ValueError(f"输出已存在且 overwrite=false: {output_path}")
       arcpy.management.Delete(output_path)
 
-  arcpy.management.Project(input_path, output_path, target_sr)
+  # transformation 为空 = 保持 arcpy 的自动选择（Pro 3.6 实测：传空串/None 与不传第 4 参
+  # 逐点一致）；给了就用同一个变换。GDAL 侧不会替用户猜，见该后端与 pitfalls。
+  arcpy.management.Project(input_path, output_path, target_sr, transformation)
 
   count = int(arcpy.management.GetCount(output_path)[0])
   out_sr = arcpy.Describe(output_path).spatialReference
@@ -61,6 +87,282 @@ code_template: |
       "target_wkid": out_sr.factoryCode,
   })
   print(f"Projected {count} features -> {out_sr.name}")
+code_template_gdal: |
+  # GDAL 版：与上方 arcpy 版同一份语义（投影 / 轴序 / 容器输入 / 输出白名单）。
+  # 基准面变换按 Pro 3.6 实测对齐：arcpy 会自动挑一个变换，PROJ 的默认可能挑另一个，
+  # 所以这里**不猜**——有真实变换可用时必须由 transformation 指定（见 pitfalls）。
+  import os
+  import re
+
+  import geopandas as gpd
+  import numpy as np
+  import pyogrio
+  from pyproj import CRS, Transformer
+  from pyproj.transformer import TransformerGroup
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  target_srid = {{target_srid}}
+  overwrite = {{overwrite}}
+  transformation = {{transformation}}
+
+  #: ``xxx.gdb\图层`` / ``xxx.gpkg/图层`` 要拆成 dataset + layer 再读：pyogrio 不认拼在一起的
+  #: 路径（OpenFileGDB 尤其），而 arcpy 侧 resolve_zone_layer 返回的正是这个形状——两端同一
+  #: 输入都得认，否则多层容器报错里让你写 ``xxx.gpkg/图层名`` 这句话就是空头支票。
+  _LAYERED = re.compile(r"^(.*\.(?:gdb|gpkg|sqlite))[\\/](.+)$", re.IGNORECASE)
+
+  #: 输出格式白名单：GDAL 没有 FileGDB 写驱动，也不该把 .gdb 静默换成别的格式
+  _OUT_DRIVERS = {".gpkg": "GPKG", ".shp": "ESRI Shapefile"}
+
+
+  def _split(path):
+      """``x.gdb/图层`` → (x.gdb, 图层)；其余原样返回 (路径, None)。"""
+      m = _LAYERED.match(str(path))
+      if m and os.path.exists(m.group(1)):
+          return m.group(1), m.group(2)
+      return str(path), None
+
+
+  def _read_layer(path):
+      """读要素类：容器（.gpkg / .gdb / 文件夹）里恰好一个图层就自动取用，多层要指明。
+
+      与 arcpy 侧的 resolve_zone_layer 同一口径（容器判定、要素数据集里的要素类），
+      但这里只能用 pyogrio.list_layers（GDAL 侧没有 arcpy.Describe）。
+      """
+      p = str(path)
+      dataset, layer = _split(p)
+      if layer is not None:
+          # 要素数据集里的要素类（``x.gdb/数据集名/要素类名``）：GDAL 的图层名里**没有**数据集
+          # 前缀，整段读不到就退到末段再试（arcpy 自己认这种写法）；要素数据集只存在于 .gdb。
+          candidates = [layer]
+          if dataset.lower().endswith(".gdb"):
+              leaf = re.split(r"[\\/]", layer)[-1]
+              if leaf != layer:
+                  candidates.append(leaf)
+          for name in candidates:
+              try:
+                  gdf = gpd.read_file(dataset, layer=name, engine="pyogrio")
+              except pyogrio.errors.DataLayerError:
+                  continue
+              except Exception as exc:
+                  raise ValueError(f"输入读不出来: {dataset}/{name}（{exc}）")
+              if name != layer:
+                  print(f"图层名 {layer} 带要素数据集前缀，按末段 {name} 读（GDAL 的图层名不含数据集前缀）")
+              return gdf
+          available = ", ".join(str(row[0]) for row in pyogrio.list_layers(dataset))
+          raise ValueError(f"输入 {dataset} 里没有图层 {layer!r}；可用图层: {available}")
+      if not os.path.exists(p):
+          raise ValueError(f"输入数据不存在: {p}")
+      if not (os.path.isdir(p) or p.lower().endswith((".gpkg", ".gdb"))):
+          # 单文件（.shp / .geojson / .dbf）：没有容器这一层，直接读
+          try:
+              return gpd.read_file(p, engine="pyogrio")
+          except Exception as exc:
+              raise ValueError(f"输入读不出来: {p}（{exc}）")
+      layers = pyogrio.list_layers(p)
+      if len(layers) == 0:
+          raise ValueError(f"输入 {p} 是工作空间容器、里面没有图层：请给出图层本身（如 {p}/图层名）")
+      if len(layers) > 1:
+          names = ", ".join(str(row[0]) for row in layers)
+          raise ValueError(
+              f"输入是多层容器（{len(layers)} 个图层: {names}），GDAL 后端不替你挑："
+              f"请指明图层，如 {p}/图层名"
+          )
+      print(f"输入是工作空间容器（.gpkg/.gdb/文件夹），自动使用其中唯一的图层: {layers[0][0]}")
+      return gpd.read_file(p, layer=str(layers[0][0]), engine="pyogrio")
+
+
+  def _geodetic(crs):
+      """CRS 的地理坐标系那一层（投影坐标系 → 它的 GCS；本来就是 GCS 就原样返回）。"""
+      return crs.geodetic_crs if crs.is_projected else crs
+
+
+  def _norm(text):
+      return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+  def _tokens(text):
+      """名字切成词：ESRI 的 ``Beijing_1954_To_WGS_1984_1`` 与 PROJ 的
+      ``Beijing 1954 to WGS 84 (1)`` 归一后是同一串词（实测两者是同一个操作，差 <0.00003 m）。"""
+      head = str(text).split(" (with ")[0]
+      out = []
+      for token in _norm(head).split():
+          # 年份写法不同：ESRI 用 4 位（1984 / 1980），PROJ 用 2 位（84 / 80）
+          out.append(token[2:] if len(token) == 4 and token.isdigit() and token.startswith("19") else token)
+      return out
+
+
+  def _datum_candidates(src_crs, dst_crs):
+      """(源 GCS, 目标 GCS) 这一对在 PROJ 里的**真实**基准面变换（ballpark/空变换不算）。
+
+      为什么以「地理坐标系」这一层为准：投影带号不影响基准面这一步，而 PROJ 只在 GCS→GCS
+      这一层给出 Helmert 候选（直接查 4214→4548 只有一条 ballpark，候选全被藏起来）。
+      """
+      src_geo, dst_geo = _geodetic(src_crs), _geodetic(dst_crs)
+      if src_geo == dst_geo:
+          return []
+      try:
+          group = TransformerGroup(src_geo, dst_geo, always_xy=True)
+      except Exception as exc:
+          raise ValueError(f"查不到 {src_geo.name} -> {dst_geo.name} 的基准面变换候选：{exc}")
+      return [t for t in group.transformers if not t.description.lower().startswith("ballpark")]
+
+
+  def _pick_datum(spec, candidates):
+      """按名字挑一个候选；PROJ 名与 ESRI 名都认。"""
+      wanted = _tokens(spec)
+      hits = [t for t in candidates if _tokens(t.description) == wanted]
+      names = "\n".join(f"  - {t.description.split(' (with ')[0]}" for t in candidates) or "  （无）"
+      if len(hits) == 1:
+          return hits[0]
+      if hits:
+          raise ValueError(f"transformation={spec!r} 同时匹配多个 PROJ 变换，请写全名：\n{names}")
+      raise ValueError(
+          f"transformation={spec!r} 不在这一对坐标系的可用变换里：\n{names}\n"
+          f"（也可以直接给 PROJ 管线，如 '+proj=pipeline +step ...'）"
+      )
+
+
+  def _steps(src_crs, dst_crs):
+      """拼出「源 → 目标」的执行步骤（逆投影 + 基准面变换 + 投影），并回报用了哪个变换。"""
+      src_geo, dst_geo = _geodetic(src_crs), _geodetic(dst_crs)
+      steps = []
+      label = ""
+      if src_crs != src_geo:
+          steps.append(Transformer.from_crs(src_crs, src_geo, always_xy=True))
+      spec = str(transformation).strip()
+      if spec:
+          if spec.startswith("+") or "=" in spec:
+              steps.append(Transformer.from_pipeline(spec))
+              label = spec
+          else:
+              matched = _pick_datum(spec, _datum_candidates(src_crs, dst_crs))
+              steps.append(matched)
+              label = matched.description.split(" (with ")[0]
+      else:
+          candidates = _datum_candidates(src_crs, dst_crs)
+          if candidates:
+              names = "\n".join(f"  - {t.description.split(' (with ')[0]}" for t in candidates)
+              raise ValueError(
+                  f"{src_geo.name} -> {dst_geo.name} 有可用的基准面变换，GDAL 后端不替你挑"
+                  f"（arcpy 会自动选一个，且与 PROJ 的默认选择不一定相同）：\n{names}\n"
+                  f"请用 transformation 指定（PROJ 名，或 ESRI 名如 Beijing_1954_To_WGS_1984_1）"
+              )
+          if src_geo != dst_geo:
+              print(f"基准面: {src_geo.name} -> {dst_geo.name} 没有可用的基准面变换，"
+                    f"按无变换执行（与 arcpy 默认一致）")
+      if dst_crs != dst_geo:
+          steps.append(Transformer.from_crs(dst_geo, dst_crs, always_xy=True))
+      return steps, label
+
+
+  def _move(coords, steps):
+      """把一组坐标按步骤顺序过一遍（coords 是 (N,2) 或 (N,3) 的 numpy 数组）。"""
+      x, y = coords[:, 0], coords[:, 1]
+      z = coords[:, 2] if coords.shape[1] > 2 else None
+      for step in steps:
+          if z is None:
+              x, y = step.transform(x, y)
+          else:
+              x, y, z = step.transform(x, y, z)
+      return np.column_stack([x, y]) if z is None else np.column_stack([x, y, z])
+
+
+  def _scalar_steps(steps):
+      """给 shapely 2.0 的 ops.transform 用的标量版本（没有向量化 transform 时的退路）。"""
+      def _one(x, y, z=None):
+          for step in steps:
+              if z is None:
+                  x, y = step.transform(x, y)
+              else:
+                  x, y, z = step.transform(x, y, z)
+          return (x, y) if z is None else (x, y, z)
+      return _one
+
+
+  def _project_geoms(geoms, steps):
+      """逐几何投影（保留 Z；NULL / 空几何原样留着）。"""
+      if not steps:
+          return list(geoms)
+      try:
+          import shapely
+          fast = hasattr(shapely, "transform")
+      except Exception:
+          shapely, fast = None, False
+      scalar = None if fast else _scalar_steps(steps)
+      out = []
+      for geom in geoms:
+          if geom is None or geom.is_empty:
+              out.append(geom)
+          elif fast:
+              out.append(shapely.transform(
+                  geom, lambda coords: _move(coords, steps), include_z=bool(shapely.has_z(geom))
+              ))
+          else:
+              from shapely.ops import transform as _ops_transform
+              out.append(_ops_transform(scalar, geom))
+      return out
+
+
+  # ---------------------------------------------------------------- 主流程
+  # 输出格式先判：给 .gdb 时应当在读输入之前就说清「写不了」，而不是先跑完再失败
+  out_ext = os.path.splitext(str(output_path))[1].lower()
+  if out_ext not in _OUT_DRIVERS:
+      why = ("GDAL 没有 FileGDB 写驱动，.gdb 要素类请用 arcpy 后端"
+             if ".gdb" in str(output_path).lower() else "请给 .gpkg 或 .shp")
+      raise ValueError(f"GDAL 版输出只支持 .gpkg / .shp（收到 {output_path!r}）：{why}")
+
+  try:
+      target_crs = CRS.from_epsg(int(target_srid))
+  except Exception as exc:
+      raise ValueError(f"目标坐标系 EPSG:{target_srid} 不认识（{exc}）")
+
+  gdf = _read_layer(input_path)
+  if "geometry" not in gdf.columns:
+      raise ValueError(f"输入不是要素类（没有几何字段）: {input_path}")
+  if gdf.crs is None:
+      raise ValueError(f"输入数据缺少坐标系，请先用 DefineProjection 明确源坐标系: {input_path}")
+  src_crs = gdf.crs  # geopandas 1.x 给的就是 pyproj.CRS
+
+  steps, applied = _steps(src_crs, target_crs)
+  out = gdf.copy()
+  out["geometry"] = _project_geoms(out.geometry, steps)
+  # always_xy=True 一路到底：两端都是 x=经度/东坐标、y=纬度/北坐标，与 arcpy 的轴序口径一致。
+  out = out.set_crs(target_crs, allow_override=True)
+
+  out_path = str(output_path)
+  os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+  if os.path.exists(out_path):
+      if not overwrite:
+          raise ValueError(f"输出已存在且 overwrite=false: {out_path}")
+      if out_ext == ".shp":
+          stem = os.path.splitext(out_path)[0]
+          for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix", ".sbn", ".sbx"):
+              if os.path.exists(stem + ext):
+                  os.remove(stem + ext)
+      else:
+          os.remove(out_path)
+
+  layer_name = os.path.splitext(os.path.basename(out_path))[0]
+  if out_ext == ".shp":
+      out.to_file(out_path, driver=_OUT_DRIVERS[out_ext], engine="pyogrio")
+  else:
+      if layer_name.lower().startswith("gpkg"):
+          # GPKG 规范把 gpkg_ 前缀留给系统表，图层名不能以它开头
+          layer_name = "lyr_" + layer_name
+          print(f"输出图层名不能以 gpkg 开头（GPKG 保留前缀），改用 {layer_name}")
+      out.to_file(out_path, driver=_OUT_DRIVERS[out_ext], engine="pyogrio", layer=layer_name)
+
+  count = int(len(out))
+  set_result({
+      "output": out_path,
+      "feature_count": count,
+      "source_crs": src_crs.name,
+      "target_crs": target_crs.name,
+      "target_wkid": target_crs.to_epsg(),
+      "transformation": applied,
+  })
+  print(f"Projected {count} features -> {target_crs.name}")
 validation:
   - type: vector_exists
     path: "{{output_path}}"
@@ -73,6 +375,16 @@ validation:
 pitfalls:
   - 只做展示时不要用投影坐标系；面积/距离统计必须用等积/投影坐标系。
   - 源坐标系为 Unknown 时要先确认源 CRS，不能直接 Project。
+  - 基准面变换两端口径不同（Pro 3.6 + PROJ 9.8 实测）。arcpy 不给 transformation 时会自动挑一个（北京54→WGS84 实测自动用了 `Beijing_1954_To_WGS_1984_1`，而 `ListTransformations` 首位是 `_4`，所以连"取第一个"都预测不了）；pyproj 默认对同一对只做 ballpark（无变换）。两端默认差 **42~74 m**（6 个公开变换彼此也差 0.7~74 m）。
+  - 所以 GDAL 后端**不猜**：只要 PROJ 对这对基准面有真实变换，就必须给 `transformation`，否则报错并列出候选。给了就按它做——arcpy 写 ESRI 名（`Beijing_1954_To_WGS_1984_1`），GDAL 写 PROJ 名（`Beijing 1954 to WGS 84 (1)`）或 `+proj=` 管线；实测这两者是同一个操作（逐点差 <0.00003 m）。
+  - 同一基准面（如 4490 → 4548/4527）两端都不做基准面变换，逐点一致（相对差 ~1e-9，见下一条）。
+  - 投影算法有细微差别：PROJ 用精确 Krüger 级数、ArcGIS 用级数近似，离中央经线越远差越大——实测 CM 117E 带内 <1 mm，lon=105（差 12°）处 3.1 cm。相对差 ~1e-8，不影响任何面积/距离结论，但**别拿绝对坐标做位级比对**。
+  - 轴序：GDAL 全程 `always_xy=True`（x=经度/东坐标、y=纬度/北坐标），与 arcpy 一致；目标给地理坐标系（如 4490）时输出也是经度/纬度，不是纬度/经度。
+  - 目标基准面不同且没有公开变换时（如北京54 → 4548，ArcGIS 也没有北京54→CGCS2000 的变换），两端都按无变换执行——结果会带米级系统偏移，这是数据问题不是后端差异；要修正得先转 WGS84 再转 CGCS2000（两步各给各自的 transformation）。
+  - 越界坐标：arcpy 会把投影后落在目标 CRS 有效范围外的顶点写成**空几何**（实测 (0,0)、(179.9,89) → null，数据静默丢失）；GDAL 后端仍给数学结果（不丢点）。要跟 arcpy 完全一致请自行按目标范围过滤。
+  - 容器输入（.gpkg / .gdb / 文件夹）：两端都在「恰好一个图层」时自动取用，多层报人话错误要你指明（如 `zones.gpkg/district`）。.gdb 要素数据集里的要素类两端都认 `x.gdb/数据集/要素类` 写法。
+  - GDAL 后端只能写 .gpkg / .shp：.gdb 要素类请用 arcpy 后端（会给明确报错，不会静默换格式）。`overwrite=false` 且输出已存在时两端都报错、不覆盖（arcpy 的 `Project` 在 `overwriteOutput=True` 下会静默覆盖，配方拦在写之前）。
+  - 返回的 `source_crs` / `target_crs` 是各自后端的坐标系**名字**（arcpy 给 ESRI 名如 `CGCS2000_3_Degree_GK_CM_117E`，GDAL 给 pyproj 名如 `CGCS2000 / 3-degree Gauss-Kruger CM 117E`），跨后端比对请用 `target_wkid`（都是 EPSG 码）。
 examples:
   - "把 city.shp 投影到 4527"
   - "统一所有图层到 CGCS2000 高斯 3 度带"

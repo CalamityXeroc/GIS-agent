@@ -435,3 +435,47 @@ def test_degrade_refuses_when_signature_is_empty(tmp_path: Path):
     )
     state = loop.run("测试任务")
     assert state.status == "failed"
+
+
+def test_tool_result_trace_carries_quality(tmp_path: Path):
+    """B4 回归：质量分要进 trace，基准才能自动取数（不用让模型抄分）。
+
+    实测（DAIR-57）：``tool_result`` 只记 ok/summary/artifacts，``data["quality"]``
+    丢了，基准只能让被测模型把分数抄进 markdown——抄错查不出来。
+    """
+    from gis_cli.recipes.store import ValidationResult
+
+    class _Recipes:
+        def run_assertions(self, raws):
+            return [
+                ValidationResult(
+                    "aprx_map_check", "map.aprx", False, "布局缺少「图例」"
+                )
+            ]
+
+    loop, _ = _make_loop(
+        tmp_path,
+        [
+            _tc("check_map_project", {"aprx_path": str(tmp_path / "map.aprx")}),
+            _tc("finish", {"summary": "核验完成"}),
+        ],
+    )
+    loop.context.recipes = _Recipes()
+    loop.run("核验工程")
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "traces" / "run_unit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    payload = next(
+        e["payload"]
+        for e in events
+        if e["event"] == "tool_result" and e["payload"].get("tool") == "check_map_project"
+    )
+    quality = payload["quality"]
+    assert set(quality) == {"total", "normativity", "readability", "correctness",
+                            "deductions", "unmeasured"}
+    assert quality["total"] == 0.0 and quality["correctness"] == 0.0
+    assert quality["deductions"] == ["aprx_map_check"]      # 只留名字，不带 reason
+    assert quality["unmeasured"] == []                      # 没有“读不到量”的项
+    assert "布局缺少" not in json.dumps(quality, ensure_ascii=False)

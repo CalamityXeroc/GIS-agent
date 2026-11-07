@@ -253,7 +253,22 @@ def to_unit(event: str, payload: dict[str, Any] | None = None) -> RenderUnit | N
 
     if event == "verification":
         passed = bool(data.get("pass"))
-        return RenderUnit("verify", _short(data.get("summary", ""), 200), ok=passed, meta={"verdict": data})
+        # 合规闸门：把提醒/阻断摆到验收旁边，并把责任边界写清楚（只提醒，不判定）。
+        compliance = data.get("compliance") if isinstance(data.get("compliance"), dict) else {}
+        findings = [item for item in (compliance.get("findings") or []) if isinstance(item, dict)]
+        lines: list[str] = []
+        for item in findings[:3]:
+            level = {"block": "阻断", "warn": "警告", "info": "提示"}.get(str(item.get("level")), "提示")
+            lines.append(f"合规{level} · {item.get('title')}：{item.get('message')}")
+        if findings:
+            lines.append(str(compliance.get("notice") or ""))
+        return RenderUnit(
+            "verify",
+            _short(data.get("summary", ""), 200),
+            lines=[line for line in lines if line],
+            ok=passed,
+            meta={"verdict": data},
+        )
 
     if event == "deliverables":
         # 成果包（P0-4）：告诉人“发哪个文件出去”，路径只留文件名

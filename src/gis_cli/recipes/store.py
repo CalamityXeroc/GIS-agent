@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import json
 import re
@@ -14,9 +15,70 @@ from typing import Any
 #: 真假 GDB 的判定（execute_code 预检与配方参数检查共用同一份）
 from ..runtime.gdb import GDB_MARKERS as _GDB_MARKERS, is_real_gdb as _is_real_gdb
 
+from .backends import (
+    DEFAULT_BACKEND,
+    backend_hint,
+    pick_backend,
+    runner_backends,
+    unavailable_message,
+)
+from .gdal_checks import gdal_raster_check, gdal_vector_check
 from .schema import WORKSPACE_SENTINEL, Recipe
 
 logger = logging.getLogger(__name__)
+
+#: 断言「未核验」的错误类型：环境里没有 arcpy / ArcGIS 解释器没跑出结论。
+#: 必须与断言失败（``ok=False`` 且 ``error_type`` 为空）严格分开——前者是「没测」，
+#: 后者是「做错了」。实测（DAIR-57）一个完全合格的 .aprx 在没有 arcpy 的 CLI 里
+#: 19.9 ms 被判「无法打开工程」并算出 0 分，而 arcgispro-py3 里同一条断言 ok=true。
+ENV_NEEDS_ARCGIS = "NeedsArcGIS"
+
+#: 断言目标路径没解析出来的错误类型：相对路径在当前 CWD 与 code_runner 工作区都找不到。
+#: 与「工程文件不存在」的断言失败分开——路径给错是「没测」，不是版面不合格；也不并入
+#: ``NeedsArcGIS``：要补救的地方不一样（换解释器 vs 换路径），混在一起又会误导模型。
+ENV_PATH_UNRESOLVED = "PathUnresolved"
+
+#: 核验过程本身报错的错误类型：工程打开了，但遍历图层/布局时抛异常（工程损坏、arcpy
+#: 版本不兼容…）。这是「真报错」，既不是「版面不合格」，也不是「没测」。
+ENV_CHECK_ERROR = "CheckError"
+
+#: 后端专属的断言实现：``(backend, kind) -> 处理函数``。
+#:
+#: 为什么需要：同一断言语义在不同后端下判法不同（``raster_exists`` 在 arcpy 里
+#: 是 ``arcpy.Exists``，在 GDAL 里是 ``osgeo`` 能不能打开）。配方声明了 backend，
+#: 断言就必须用**同一个后端**去验，否则"GDAL 写出来的产物拿 arcpy 判"全是假阴性。
+#: 没登记的组合一律走内置实现 —— 现有 arcpy 断言行为因此一行不变。
+_BACKEND_CHECKS: dict[tuple[str, str], Any] = {}
+
+
+def register_backend_assertion(backend: str, kind: str, func: Any) -> None:
+    """登记某后端专属的断言实现（P0-1b 的 GDAL 断言从这里接进来）。
+
+    ``func`` 的调用约定与 ``RecipeLibrary._check`` 一致：
+    ``func(library, kind, target, expected, raw, result) -> ValidationResult``。
+    """
+    _BACKEND_CHECKS[(str(backend).strip().lower(), str(kind).strip())] = func
+
+
+def backend_assertion(backend: str, kind: str) -> Any:
+    """取某后端对某 kind 的专属实现；没登记 → ``None``（用内置实现）。"""
+    return _BACKEND_CHECKS.get((str(backend).strip().lower(), str(kind).strip()))
+
+
+def _backend_note(recipe: Recipe, available: set[str] | None) -> str:
+    """操作目录里的后端标注。
+
+    arcpy 配方（缺省值）且本机能跑时一个字不加 —— 47 个老配方在目录里的样子
+    必须与以前完全一致，不拿一行行“后端: arcpy”把 5200 字的预算吃光。
+    """
+    declared = list(recipe.backend or [DEFAULT_BACKEND])
+    note = ""
+    if declared != [DEFAULT_BACKEND]:
+        note = f" ｜后端: {','.join(declared)}"
+    if available is not None and not set(declared) & available:
+        note += " ｜本机缺此后端"
+    return note
+
 
 _SLOT = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 #: ``@@param@@``：参数嵌进文本/正则/表达式时用的原样替换（与 Recipe.render 一致）。
@@ -70,9 +132,15 @@ class ValidationResult:
     target: str
     ok: bool
     detail: str = ""
+    #: ``""`` = 这是对产物的判定；非空 = 根本没判定成（缺 arcpy / 解释器没跑出结论）。
+    #: 只在非空时写进 ``to_dict()``：普通断言的结果 JSON 保持原样。
+    error_type: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind, "target": self.target, "ok": self.ok, "detail": self.detail}
+        out = {"kind": self.kind, "target": self.target, "ok": self.ok, "detail": self.detail}
+        if self.error_type:
+            out["error_type"] = self.error_type
+        return out
 
 
 class RecipeLibrary:
@@ -134,6 +202,8 @@ class RecipeLibrary:
         目的是让模型不必反复调用 list_recipes 就能看到全部可选操作。
         """
         self.ensure_loaded()
+        # 本机可用的后端（执行器没声明时是 None：不知道就不标）
+        available = runner_backends(self.code_runner)
         groups: dict[str, list[Recipe]] = {}
         for recipe in self._recipes.values():
             groups.setdefault(recipe.category or recipe.domain or "general", []).append(recipe)
@@ -167,7 +237,7 @@ class RecipeLibrary:
                 params = ", ".join(required) if required else "—"
                 brief = (recipe.name or recipe.description).strip()
                 brief = brief.split("（")[0].split("(")[0].strip()
-                lines.append(f"- {recipe.id}: {brief} ｜必填: {params}")
+                lines.append(f"- {recipe.id}: {brief} ｜必填: {params}{_backend_note(recipe, available)}")
         text = "\n".join(lines)
         if len(text) > max_chars:
             text = text[: max_chars - 40] + "\n…（更多配方用 list_recipes 关键词检索）"
@@ -191,6 +261,25 @@ class RecipeLibrary:
         if self.code_runner is None and getattr(ctx, "code_runner", None) is None:
             return Observation(ok=False, summary="没有可用的代码执行器", error={"type": "NoRunner"})
         runner = getattr(ctx, "code_runner", None) or self.code_runner
+        # 按 backend 声明路由：配方说要用哪个后端，就得有能跑它的执行器。
+        # 一个都没有就当场报清楚，不要把 GDAL 代码丢给 ArcPy 内核去撞
+        # "No module named osgeo" 这种看不懂的错。
+        available = runner_backends(runner)
+        backend = pick_backend(recipe.backend, available)
+        if backend is None:
+            message = unavailable_message(recipe.backend, available)
+            return Observation(
+                ok=False,
+                summary=f"配方 {recipe.id} 在本机跑不了: {message}",
+                error={
+                    "type": "BackendUnavailable",
+                    "message": message,
+                    "recipe": recipe.id,
+                    "required": list(recipe.backend),
+                    "available": sorted(available or []),
+                },
+                hint=backend_hint(recipe.backend),
+            )
         # 把工作区哨兵换成真实路径：蒸馏出来的配方常用 `ws = {{workspace}}`，
         # 而内核的 CWD 不是工作区，写 `.` 会找不到 input/。
         params = dict(params or {})
@@ -219,7 +308,7 @@ class RecipeLibrary:
                 "只是放 TIFF/表格就换成普通目录（如 output/）。",
             )
         try:
-            code = recipe.render(params)
+            code = recipe.render(params, backend=backend)
         except Exception as exc:
             return Observation(
                 ok=False,
@@ -243,7 +332,14 @@ class RecipeLibrary:
             )
 
         resolved = recipe.resolve_params(params)
-        assertions = self._run_assertions(recipe, resolved, result, workspace=getattr(ctx, "workspace", None))
+        assertions = self._run_assertions(
+            recipe,
+            resolved,
+            result,
+            workspace=getattr(ctx, "workspace", None),
+            backend=backend,
+            runner=runner,
+        )
         failed = [a for a in assertions if not a.ok]
         from ..engine.tools import extract_outputs
 
@@ -270,6 +366,7 @@ class RecipeLibrary:
                 "result": result.result,
                 "assertions": [a.to_dict() for a in assertions],
                 "recipe": recipe.to_dict(),
+                "backend": backend,
             },
             artifacts=artifacts,
             images=result.display_images[:3],
@@ -277,7 +374,13 @@ class RecipeLibrary:
         )
 
     # ------------------------------------------------------------- assertions
-    def run_assertions(self, assertions: list[dict[str, Any]], *, result: Any = None) -> list[ValidationResult]:
+    def run_assertions(
+        self,
+        assertions: list[dict[str, Any]],
+        *,
+        result: Any = None,
+        backend: str = DEFAULT_BACKEND,
+    ) -> list[ValidationResult]:
         """Public entry for evaluating raw assertion dicts (used by benchmarks)."""
         out: list[ValidationResult] = []
         for raw in assertions or []:
@@ -285,14 +388,27 @@ class RecipeLibrary:
             target = str(raw.get("path", "") or raw.get("target", ""))
             expected = raw.get("value")
             try:
-                out.append(self._check(kind, target, expected, raw, result))
+                out.append(self._check(kind, target, expected, raw, result, backend=backend))
             except Exception as exc:
                 out.append(ValidationResult(kind, target, False, f"断言执行异常: {exc}"))
         return out
 
     def _run_assertions(
-        self, recipe: Recipe, params: dict[str, Any], result: Any, *, workspace: str | Path | None = None
+        self,
+        recipe: Recipe,
+        params: dict[str, Any],
+        result: Any,
+        *,
+        workspace: str | Path | None = None,
+        backend: str | None = None,
+        runner: Any = None,
     ) -> list[ValidationResult]:
+        """跑配方自带断言。
+
+        ``backend`` 缺省取配方自己声明的第一个后端；``runner`` 是 ``run()``
+        实际执行这段代码的那一个执行器——断言必须问同一个执行器（见 ``_check``）。
+        """
+        backend = backend or pick_backend(recipe.backend, None) or DEFAULT_BACKEND
         out: list[ValidationResult] = []
         # 断言里可以用 {{output}} 引用配方自己返回的产物：多期配方的文件名带期号
         # （kde_1982-1986.tif …），静态 path 写不出来，只能取返回值里的第一个产物。
@@ -313,7 +429,7 @@ class RecipeLibrary:
                 expected = [_resolve(str(v), slots) for v in expected]
             target = self._absolutize(target, workspace)
             try:
-                out.append(self._check(kind, target, expected, raw, result))
+                out.append(self._check(kind, target, expected, raw, result, backend=backend, runner=runner))
             except Exception as exc:
                 out.append(ValidationResult(kind, target, False, f"断言执行异常: {exc}"))
         return out
@@ -341,7 +457,27 @@ class RecipeLibrary:
         expected: Any,
         raw: dict[str, Any],
         result: Any,
+        *,
+        backend: str = DEFAULT_BACKEND,
+        runner: Any = None,
     ) -> ValidationResult:
+        # 后端专属实现优先：登记了就用它，没登记走下面的内置实现（arcpy 口径）。
+        impl = backend_assertion(backend, kind)
+        if impl is not None:
+            return impl(self, kind, target, expected, raw, result)
+        # GDAL 后端没有 arcpy：向量产物的存在性/要素数得让 .venv-gdal 自己数
+        # （pyogrio）；栅格产物的极值同理（rasterio）。只接管这几个 kind，
+        # 其余与后端无关的（file_exists 等）照旧。
+        if backend == "gdal":
+            # 用**执行了这段代码**的那个执行器去数要素，不是库里自带的那个：
+            # run() 里执行器是 ``ctx.code_runner or self.code_runner``，两者不同时
+            # 断言会换一个解释器去读，读到什么全看那个解释器装没装 pyogrio。
+            gdal_runner = runner or self.code_runner
+            verdict = gdal_vector_check(gdal_runner, kind, target, expected, raw)
+            if verdict is None:
+                verdict = gdal_raster_check(gdal_runner, kind, target, expected, raw)
+            if verdict is not None:
+                return ValidationResult(kind, target, verdict[0], verdict[1])
         path = Path(target)
         if kind == "file_exists":
             return ValidationResult(kind, target, path.exists(), "" if path.exists() else "文件不存在")
@@ -1317,74 +1453,103 @@ class RecipeLibrary:
           renderer: 期望渲染器类型（UniqueValueRenderer / GraduatedColorsRenderer）
           colors: 期望配色，形如 "标杆社区=#1F77B4;需整改社区=#2CA02C"
           elements: 必须存在的布局要素（子集：图名/图例/比例尺/指北针）
+
+        本进程没有 arcpy 时**不能判“版面不合格”**：那样是环境失败被当成断言失败。
+        做法与 ``map_layout_ok`` 一致——有 arcpy 就地算，没有就交给 code_runner 去
+        ArcGIS 解释器里算同一份判定；两样都没有就明确报「未核验」并带上
+        ``error_type``，让下游能把「没测」和「做错了」分开。
         """
-        target = Path(path)
+        target = _resolve_assert_target(Path(path), self.code_runner)
+        if target is None:
+            # 解析不出来 ≠ 工程文件不存在：这是路径问题，不能算成「版面不合格」。
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"工程路径无法解析：{path}（当前目录与代码执行器工作区都没有这个文件）",
+                error_type=ENV_PATH_UNRESOLVED,
+            )
         if not target.exists():
             return ValidationResult("aprx_map_check", path, False, "工程文件不存在")
+        if not _arcpy_importable():
+            if self.code_runner is not None:
+                return self._aprx_map_via_runner(str(target), raw)
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                "未核验（需 ArcGIS）：当前进程没有 arcpy，也没有可用的代码执行器",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
         try:
-            from arcpy import mp  # type: ignore
+            verdict = _aprx_map_verdict(str(target), raw)
+        except ImportError as exc:  # find_spec 说在、真导入却失败（arcpy 目录坏了）
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"未核验（需 ArcGIS）: {str(exc)[:120]}",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        return ValidationResult(
+            "aprx_map_check",
+            path,
+            bool(verdict["ok"]),
+            str(verdict["detail"]),
+            error_type=str(verdict.get("error_type", "") or ""),
+        )
 
-            project = mp.ArcGISProject(str(target))
-        except Exception as exc:
-            return ValidationResult("aprx_map_check", path, False, f"无法打开工程: {str(exc)[:120]}")
+    def _aprx_map_via_runner(self, path: str, raw: dict[str, Any]) -> ValidationResult:
+        """在 ArcGIS 解释器（内核/子进程）里核验 .aprx，把结论回传。
 
-        problems: list[str] = []
-        want_renderer = str(raw.get("renderer", "") or "")
-        want_colors = _parse_color_expectations(str(raw.get("colors", "") or ""))
-        want_elements = [str(e) for e in (raw.get("elements") or [])]
-
-        found_colors: dict[str, str] = {}
-        renderer_types: list[str] = []
-        for map_obj in project.listMaps():
-            for layer in map_obj.listLayers():
-                if layer.isGroupLayer:
-                    continue
-                try:
-                    renderer = layer.symbology.renderer
-                except Exception:
-                    continue
-                renderer_types.append(type(renderer).__name__)
-                if type(renderer).__name__ == "UniqueValueRenderer":
-                    for group in renderer.groups:
-                        for item in group.items:
-                            vals = list(item.values) if item.values else []
-                            key = ""
-                            if vals:
-                                v0 = vals[0]
-                                key = str(v0[0]) if isinstance(v0, (list, tuple)) else str(v0)
-                            found_colors[key] = _symbol_hex(item.symbol)
-
-        if want_renderer and want_renderer not in renderer_types:
-            problems.append(f"渲染器为 {renderer_types or ['(无图层)']}，期望 {want_renderer}")
-        for key, expected_hex in want_colors.items():
-            actual = found_colors.get(key, "")
-            if actual.upper() != expected_hex.upper():
-                problems.append(f"{key} 配色={actual or '(未找到)'} 期望 {expected_hex}")
-
-        if want_elements:
-            element_names: list[str] = []
-            element_types: list[str] = []
-            for layout in project.listLayouts():
-                for element in layout.listElements():
-                    element_names.append(str(element.name))
-                    element_types.append(str(element.type).upper())
-            joined = " ".join(element_names).lower()
-            surrounds = sum(1 for t in element_types if "MAPSURROUND" in t)
-            checks = {
-                "图名": any("TEXT" in t for t in element_types),
-                "图例": any("LEGEND" in t for t in element_types),
-                "比例尺": ("scale" in joined or "比例尺" in " ".join(element_names)) or surrounds >= 2,
-                "指北针": ("north" in joined or "指北针" in " ".join(element_names)) or surrounds >= 2,
-                "地图框": any("MAPFRAME" in t for t in element_types),
-            }
-            for name in want_elements:
-                if not checks.get(name, False):
-                    problems.append(f"布局缺少「{name}」")
-
-        detail = "；".join(problems[:4])
-        if not problems:
-            detail = f"渲染器={renderer_types[:1]} 配色={found_colors}"
-        return ValidationResult("aprx_map_check", path, not problems, detail)
+        benchmark/CLI 的 .venv 里没有 arcpy，而工程核验必须用 arcpy 打开 .aprx，
+        所以这段固定要让 code_runner 去跑。判据只有 :func:`_aprx_map_verdict` 一份，
+        这里只换进程，不在子进程里另抄一套。
+        """
+        code = (
+            "import json as _json\n"
+            "from gis_cli.recipes.store import _aprx_map_verdict as _verdict\n"
+            f"_raw = _json.loads({json.dumps(json.dumps(raw, ensure_ascii=False))})\n"
+            f"set_result(_verdict({path!r}, _raw))\n"
+        )
+        try:
+            outcome = self.code_runner.run(code, timeout=300)
+        except Exception as exc:  # pragma: no cover - 内核不可用
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"未核验（代码执行器异常）: {str(exc)[:120]}",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        if not outcome.ok:
+            detail = ""
+            if isinstance(outcome.error, dict):
+                detail = str(outcome.error.get("message") or outcome.error.get("type") or "")
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"未核验（ArcGIS 解释器失败）: {detail[:160]}",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        payload = outcome.result if isinstance(outcome.result, dict) else {}
+        if "ok" not in payload:  # 没拿到结论 ≠ 零问题
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                "未核验（ArcGIS 解释器没有返回结论）",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        return ValidationResult(
+            "aprx_map_check",
+            path,
+            bool(payload.get("ok")),
+            str(payload.get("detail") or ""),
+            # 子进程回传的 error_type 原样带回：核验报错不能被改写成「没测（需 ArcGIS）」。
+            error_type=str(payload.get("error_type") or ""),
+        )
 
     def _image_check(self, path: str) -> ValidationResult:
         target = Path(path)
@@ -1471,6 +1636,141 @@ def _symbol_hex(symbol: Any) -> str:
         return "#{:02X}{:02X}{:02X}".format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
     except Exception:
         return ""
+
+
+def _arcpy_importable() -> bool:
+    """当前进程能不能 import arcpy（只查不导：arcpy 导入实测要 8~11 s）。"""
+    try:
+        return importlib.util.find_spec("arcpy") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _resolve_assert_target(path: Path, code_runner: Any) -> Path | None:
+    """把工程路径解析成绝对路径（存在性判断与交给执行器都用它）。
+
+    相对路径默认按当前 CWD 解析（与就地 arcpy 的行为一致）；CWD 下找不到再看
+    code_runner 的工作区——内核的 CWD 是工作区，不先解析成绝对路径的话，同一条
+    断言只是换个进程就会报“无法打开工程”（实测 DAIR-60：CLI 传
+    ``output/成果图/x.aprx``，内核在另一个目录下打不开）。
+
+    两处都没有 → ``None``：这是**路径问题**（DAIR-63 复查列的残余面），调用方要把它
+    记成 ``PathUnresolved``，而不是拿原相对路径去 ``exists()`` 报「工程文件不存在」。
+
+    **有意的取舍（DAIR-73 复查 3，别当 bug 改回去）**：相对路径一律先解析，解析不出来
+    就记 ``PathUnresolved``，于是「产物没生成（忘了出图）」和「路径写错」在 CLI 侧不再
+    可分——两者都算「没测成」，不再给 0 分。副作用是 ``_aprx_map_check`` 里「工程文件
+    不存在」那条普通失败分支现在**只有绝对路径才走得到**（见那里的 ``target.exists()``）。
+    基准侧会把 path 绝对化，所以不受影响；CLI 侧宁可把「没产出」当「没测」，也不要拿
+    路径问题去误判版面不合格、把模型逼去乱改图。
+    """
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return Path.cwd() / path
+    workspace = getattr(code_runner, "workspace", None)
+    if workspace and (Path(workspace) / path).exists():
+        return Path(workspace) / path
+    return None
+
+
+def _aprx_map_verdict(path: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """用 arcpy 打开 .aprx，核验渲染器/配色/布局要素，返回 ``{"ok", "detail"}``。
+
+    **必须在有 arcpy 的解释器里跑**：benchmark/CLI 的 .venv 没有 arcpy，
+    ``RecipeLibrary._aprx_map_check`` 会把同一份判定交给 code_runner（内核/
+    子进程）；本函数只负责判定，不关心在哪个进程里被执行。
+
+    打开工程失败、遍历图层/布局阶段抛异常都带回 ``error_type="CheckError"``：那是
+    **真报错**，既不能算「版面不合格」，也不能算「没测（需 ArcGIS）」（DAIR-63 复查
+    列出的残余面）。第一次打开失败曾漏了 ``error_type``，于是工具层说「工程核验未通过
+    + 按提示修正渲染器/配色/布局」，而 ``CheckError`` 的 hint 又说这是「工程损坏」——
+    同一个事实两处提示互相矛盾（DAIR-73 复查 1）。
+    """
+    from arcpy import mp  # type: ignore
+
+    try:
+        project = mp.ArcGISProject(str(path))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "detail": f"无法打开工程: {str(exc)[:120]}",
+            "error_type": ENV_CHECK_ERROR,
+        }
+
+    try:
+        problems, renderer_types, found_colors = _aprx_scan(project, raw)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "detail": f"核验过程报错: {type(exc).__name__}: {str(exc)[:120]}",
+            "error_type": ENV_CHECK_ERROR,
+        }
+
+    detail = "；".join(problems[:4])
+    if not problems:
+        detail = f"渲染器={renderer_types[:1]} 配色={found_colors}"
+    return {"ok": not problems, "detail": detail}
+
+
+def _aprx_scan(
+    project: Any, raw: dict[str, Any]
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """遍历工程里的图层与布局，返回 ``(problems, renderer_types, found_colors)``。"""
+    problems: list[str] = []
+    want_renderer = str(raw.get("renderer", "") or "")
+    want_colors = _parse_color_expectations(str(raw.get("colors", "") or ""))
+    want_elements = [str(e) for e in (raw.get("elements") or [])]
+
+    found_colors: dict[str, str] = {}
+    renderer_types: list[str] = []
+    for map_obj in project.listMaps():
+        for layer in map_obj.listLayers():
+            if layer.isGroupLayer:
+                continue
+            try:
+                renderer = layer.symbology.renderer
+            except Exception:
+                continue
+            renderer_types.append(type(renderer).__name__)
+            if type(renderer).__name__ == "UniqueValueRenderer":
+                for group in renderer.groups:
+                    for item in group.items:
+                        vals = list(item.values) if item.values else []
+                        key = ""
+                        if vals:
+                            v0 = vals[0]
+                            key = str(v0[0]) if isinstance(v0, (list, tuple)) else str(v0)
+                        found_colors[key] = _symbol_hex(item.symbol)
+
+    if want_renderer and want_renderer not in renderer_types:
+        problems.append(f"渲染器为 {renderer_types or ['(无图层)']}，期望 {want_renderer}")
+    for key, expected_hex in want_colors.items():
+        actual = found_colors.get(key, "")
+        if actual.upper() != expected_hex.upper():
+            problems.append(f"{key} 配色={actual or '(未找到)'} 期望 {expected_hex}")
+
+    if want_elements:
+        element_names: list[str] = []
+        element_types: list[str] = []
+        for layout in project.listLayouts():
+            for element in layout.listElements():
+                element_names.append(str(element.name))
+                element_types.append(str(element.type).upper())
+        joined = " ".join(element_names).lower()
+        surrounds = sum(1 for t in element_types if "MAPSURROUND" in t)
+        checks = {
+            "图名": any("TEXT" in t for t in element_types),
+            "图例": any("LEGEND" in t for t in element_types),
+            "比例尺": ("scale" in joined or "比例尺" in " ".join(element_names)) or surrounds >= 2,
+            "指北针": ("north" in joined or "指北针" in " ".join(element_names)) or surrounds >= 2,
+            "地图框": any("MAPFRAME" in t for t in element_types),
+        }
+        for name in want_elements:
+            if not checks.get(name, False):
+                problems.append(f"布局缺少「{name}」")
+
+    return problems, renderer_types, found_colors
 
 
 def _parse_color_expectations(text: str) -> dict[str, str]:

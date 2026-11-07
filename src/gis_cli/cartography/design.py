@@ -923,20 +923,59 @@ def _design_note(spec: dict[str, Any]) -> str:
     return "｜".join(bits)
 
 
+#: 设计**不产出**、但渲染/体检层会读的覆盖键（点路径）。
+#:
+#: ``_apply_overrides`` 不允许凭空造键（造出来的键没人读就是"静默无效"），
+#: 但这几个键确实是下游消费的字段，必须允许写：
+#: - ``scale_bar.element_width_mm``：``apply._configure_scale_bar`` 用它校正比例尺元素宽度；
+#: - ``legend.frame_margin_mm``：``apply`` / ``qc`` 用它算图例与图框的留边；
+#: - ``title.min_pt``：``qc`` 用它算图名字号下限。
+#: 新增条目之前先确认渲染层真的读它，否则又会变成静默无效。
+_OVERRIDE_ONLY_PATHS = frozenset({
+    "scale_bar.element_width_mm",
+    "legend.frame_margin_mm",
+    "title.min_pt",
+})
+
+
 def _apply_overrides(spec: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
-    """按点路径强制覆盖（如 ``{"legend.outside": True}``）。"""
+    """按点路径强制覆盖（如 ``{"legend.outside": True}``）。
+
+    **没有生效**的覆盖不静默吞掉，而是记进 ``spec["ignored_overrides"]``
+    （形如 ``[{"path": "legend.box.x", "reason": "..."}]``）：
+
+    - 点路径在 spec 里不存在（如 ``legend.box.x``——legend 下只有扁平的 ``x``）；
+    - 写入的值与设计算出来的值一样（本来就是这个值，图上不可能有变化）。
+
+    以前这两种情况都默默无事发生，调用方看到的就是"传了 override 却没效果"（DAIR-61 B5）。
+    设计不产出、但下游会读的键列在 :data:`_OVERRIDE_ONLY_PATHS`，照旧可写。
+    """
+    ignored: list[dict[str, str]] = []
     for path, value in (overrides or {}).items():
-        parts = str(path).split(".")
-        node = spec
-        ok = True
+        key_path = str(path)
+        parts = key_path.split(".")
+        node: Any = spec
+        missing = ""
         for part in parts[:-1]:
             if isinstance(node, dict) and part in node:
                 node = node[part]
             else:
-                ok = False
+                missing = part
                 break
-        if ok and isinstance(node, dict):
-            node[parts[-1]] = value
+        exists = not missing and isinstance(node, dict) and parts[-1] in node
+        if missing or not isinstance(node, dict) or (not exists and key_path not in _OVERRIDE_ONLY_PATHS):
+            ignored.append({"path": key_path,
+                            "reason": f"点路径不存在：spec 里没有 {missing or key_path}"})
+            continue
+        if exists and node[parts[-1]] == value:
+            ignored.append({"path": key_path,
+                            "reason": f"写入值与设计值相同（{value!r}），不会带来任何变化"})
+            continue
+        node[parts[-1]] = value
+    if ignored:
+        logger.warning("override 未生效: %s",
+                       "；".join(f"{item['path']}（{item['reason']}）" for item in ignored))
+    spec["ignored_overrides"] = ignored
     return spec
 
 

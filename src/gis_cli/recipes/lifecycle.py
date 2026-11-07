@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .backends import DEFAULT_BACKEND, pick_backend, runner_backends, unavailable_message
 from .schema import WORKSPACE_SENTINEL, _RAW_SLOT, _SLOT, Recipe
 
 logger = logging.getLogger(__name__)
@@ -197,6 +198,16 @@ class RecipeLifecycle:
     def _candidate_meta(self, recipe_id: str) -> Path:
         return self.candidate_dir / f"{recipe_id}.meta.json"
 
+    # ---------------------------------------------------------------- backend
+    def _available_backends(self, runner: Any = None) -> set[str] | None:
+        """本机能跑的后端；执行器都没声明就返回 ``None``（不设门禁）。"""
+        available: set[str] | None = None
+        for item in (runner, self.code_runner, getattr(self.library, "code_runner", None)):
+            got = runner_backends(item)
+            if got:
+                available = (available or set()) | got
+        return available
+
     # ------------------------------------------------------------------ gate
     def static_gate(self, recipe: Recipe, *, source_workspace: str = "") -> GateResult:
         """不跑 GIS 的静态门禁：字段、渲染、语法、硬编码路径、槽位一致。
@@ -207,8 +218,10 @@ class RecipeLifecycle:
         checks: list[GateCheck] = []
         warnings: list[str] = []
 
-        # 1) 必填字段
-        missing = [name for name in ("id", "name", "code_template") if not str(getattr(recipe, name, "") or "").strip()]
+        # 1) 必填字段（代码模板按声明的后端算：只有 GDAL 版的配方也是完整的）
+        missing = [name for name in ("id", "name") if not str(getattr(recipe, name, "") or "").strip()]
+        if not (recipe.code_template or recipe.code_template_gdal).strip():
+            missing.append("code_template")
         checks.append(
             GateCheck(
                 "required_fields",
@@ -239,11 +252,22 @@ class RecipeLifecycle:
 
         defaults = {name: spec.default for name, spec in (recipe.params or {}).items() if spec.default is not None}
 
+        # 模板按**配方声明的后端**取：gdal-only 配方拿 arcpy 模板渲染出的是空串，
+        # "0 字符 / 未渲染出代码" 这种结论等于没检查（DAIR-68 非阻塞项 2）。
+        # 本机明明跑不了声明的后端时仍按声明渲染——门禁验的是配方本身，
+        # “本机能不能跑”是 run()/replay 的事。
+        available = self._available_backends()
+        backend = pick_backend(recipe.backend, available) or (list(recipe.backend) or [DEFAULT_BACKEND])[0]
+        try:
+            template = recipe.template_for(backend)
+        except Exception:
+            template = recipe.code_template
+
         # 3) 渲染
         rendered = ""
         try:
-            rendered = recipe.render(defaults)
-            checks.append(GateCheck("renders", True, f"{len(rendered)} 字符"))
+            rendered = recipe.render(defaults, backend=backend)
+            checks.append(GateCheck("renders", True, f"{len(rendered)} 字符（{backend}）"))
         except Exception as exc:
             checks.append(GateCheck("renders", False, f"{type(exc).__name__}: {exc}"))
 
@@ -295,7 +319,7 @@ class RecipeLifecycle:
 
         # 6) 槽位一致性：代码里用到的必须声明
         declared = set((recipe.params or {}).keys())
-        used = _slots_in(recipe.code_template)
+        used = _slots_in(template)
         undeclared = sorted(used - declared)
         checks.append(
             GateCheck(
@@ -479,6 +503,24 @@ class RecipeLifecycle:
         runner = self.code_runner or getattr(self.library, "code_runner", None)
         if runner is None:
             return GateResult(False, checks + [GateCheck("runner", False, "没有可用的代码执行器")], warnings)
+        # 回放的执行器决定能跑哪个后端；按配方声明选模板，选不出来就当场报缺什么
+        # （拿空串渲染结果去跑等于什么都没验）。
+        replay_backends = runner_backends(runner)
+        backend = pick_backend(recipe.backend, replay_backends)
+        if backend is None:
+            return GateResult(
+                False,
+                checks
+                + [
+                    GateCheck(
+                        "backend",
+                        False,
+                        unavailable_message(recipe.backend, replay_backends),
+                    )
+                ],
+                warnings,
+            )
+        checks.append(GateCheck("backend", True, backend))
 
         # 1) 准备参数：默认值 + 输出类参数重定向到隔离目录
         scratch = self.replay_dir / recipe.id
@@ -526,7 +568,7 @@ class RecipeLifecycle:
 
         # 2) 渲染并执行
         try:
-            code = recipe.render(params)
+            code = recipe.render(params, backend=backend)
             ast.parse(code)
         except Exception as exc:
             return GateResult(False, checks + [GateCheck("render", False, f"{type(exc).__name__}: {exc}")], warnings)
@@ -537,9 +579,11 @@ class RecipeLifecycle:
             return GateResult(False, checks + [GateCheck("executes", False, detail)], warnings)
         checks.append(GateCheck("executes", True, "代码执行成功"))
 
-        # 3) 跑自带断言（路径也已重定向到隔离目录）
+        # 3) 跑自带断言（路径也已重定向到隔离目录；口径与代码同一个后端、同一个执行器）
         resolved = recipe.resolve_params(params)
-        results = self.library._run_assertions(recipe, resolved, outcome, workspace=str(self.workspace))
+        results = self.library._run_assertions(
+            recipe, resolved, outcome, workspace=str(self.workspace), backend=backend, runner=runner
+        )
         failed = [r for r in results if not r.ok]
         for r in results:
             checks.append(

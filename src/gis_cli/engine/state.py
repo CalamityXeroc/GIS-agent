@@ -135,6 +135,9 @@ class TaskState:
     turn: int = 0
     methodology: str = ""
     final_summary: str = ""
+    #: 分析正确性双复核的最近一次判定（W5；含 signature = 复核时的产物清单）。
+    #: ``signature`` 与当前产物不一致 = 复核后又改了交付物，finish 前要重做。
+    review: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now)
 
     # ------------------------------------------------------------- task list
@@ -218,6 +221,7 @@ class TaskState:
             "artifacts": list(self.artifacts),
             "methodology": self.methodology,
             "final_summary": self.final_summary,
+            "review": dict(self.review),
             "error": self.error,
             "created_at": self.created_at,
         }
@@ -247,6 +251,7 @@ class TaskState:
         state.artifacts = [str(x) for x in (data.get("artifacts") or [])]
         state.methodology = str(data.get("methodology") or "")
         state.final_summary = str(data.get("final_summary") or "")
+        state.review = dict(data.get("review") or {}) if isinstance(data.get("review"), dict) else {}
         state.error = str(data.get("error") or "")
         state.created_at = str(data.get("created_at") or "")
         return state

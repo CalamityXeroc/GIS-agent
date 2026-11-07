@@ -49,6 +49,11 @@ code_template: |
 
   if not arcpy.Exists(zone_path) or not arcpy.Exists(raster_path):
       raise ValueError("分区或栅格数据不存在")
+
+  # 分区输入给的是容器（.gpkg / .gdb / 文件夹）时先解析成具体图层（共享片段，见 fragments.py）
+  {{@zone_layer@}}
+
+  zone_path = resolve_zone_layer(zone_path)
   zone_sr = arcpy.Describe(zone_path).spatialReference
   raster_sr = arcpy.Describe(raster_path).spatialReference
   if zone_sr.name != raster_sr.name:
@@ -149,6 +154,7 @@ validation:
     stat: "sum"
     value: [1, 100000000000]
 pitfalls:
+  - 分区输入给的是 **.gpkg / .gdb / 文件夹**（容器）而不是图层时：arcpy 后端在里面恰好一个要素类就自动取用，多个图层会报错要你指明（如 `zones.gpkg/counties`）。
   - 本配方适合**互不重叠**的分区（行政区/地块）。分区若有重叠（缓冲区），一个像元只能归属一个分区，
     重叠区会丢数，必须改用 point_buffer_raster_sum（圆形缓冲区解析计算）。
   - 分区太多、相互重叠（几千个缓冲区）时，ZonalStatisticsAsTable 要十几分钟，还可能让持久内核致命崩溃；

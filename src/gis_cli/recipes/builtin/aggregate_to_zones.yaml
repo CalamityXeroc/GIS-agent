@@ -2,6 +2,8 @@ id: aggregate_to_zones
 name: 聚合到分区（空间归属+汇总+字段回写）
 description: 把源要素（区县面/点）按空间位置归属到分区面（如地级市），对指定数值字段做 SUM/MEAN 汇总并回写到分区面属性表中。用于“把区县人口汇总到地市，并添加至 city 面要素”。
 domain: spatial_analysis
+# 同一配方的两个后端；两段代码语义必须一致（行为差异由双端对比测试锁住）
+backend: [arcpy, gdal]
 triggers: [汇总到市, 聚合到, 汇总统计, 地级市总人口, 分区汇总, 归属到, 统计得到每个]
 preconditions:
   - 源要素与分区面坐标系一致（否则先投影）
@@ -52,6 +54,11 @@ code_template: |
       raise ValueError(f"分区数据不存在: {zones_path}")
   if not arcpy.Exists(source_path):
       raise ValueError(f"源数据不存在: {source_path}")
+
+  # 分区输入给的是容器（.gpkg / .gdb / 文件夹）时先解析成具体图层（共享片段，见 fragments.py）
+  {{@zone_layer@}}
+
+  zones_path = resolve_zone_layer(zones_path)
   zsr = arcpy.Describe(zones_path).spatialReference.name
   ssr = arcpy.Describe(source_path).spatialReference.name
   if zsr != ssr:
@@ -131,6 +138,201 @@ code_template: |
       "sample_zones": sample,
   })
   print(f"Aggregate done: {count} zones, fields={join_fields}, sample={sample[:2]}")
+code_template_gdal: |
+  # GDAL 版：语义逐条对齐上方 arcpy 版（中心点归属 / 字段命名 / SRC_COUNT / 坐标系拒绝）
+  import os
+  import re
+  import geopandas as gpd
+  import pandas as pd
+  import pyogrio
+
+  zones_path = {{zones_path}}
+  source_path = {{source_path}}
+  output_path = {{output_path}}
+  stat_fields = {{stat_fields}}
+  stat_type = {{stat_type}}
+  match_option = {{match_option}}
+
+  #: ``xxx.gdb\图层`` 这种写法要拆成 dataset + layer 再读：pyogrio 的 OpenFileGDB
+  #: 不认拼在一起的路径，而 arcpy 用户的输入常常就是 .gdb 里的要素类。
+  _GDB_LAYER = re.compile(r"^(.*\.gdb)[\\/](.+)$", re.IGNORECASE)
+
+
+  def _read_vector(path):
+      p = str(path)
+      m = _GDB_LAYER.match(p)
+      if m and os.path.exists(m.group(1)):
+          return gpd.read_file(m.group(1), layer=m.group(2), engine="pyogrio")
+      if not os.path.exists(p):
+          raise ValueError(f"输入数据不存在: {p}")
+      return gpd.read_file(p, engine="pyogrio")
+
+  #: 文件里声明的 OGR 数值类型。为什么不用 pandas dtype：整列全是空值的时候
+  #: pyogrio 读回来是 object，`is_numeric_dtype` 会把一个真·数值字段误判成文本。
+  _NUMERIC_OGR = {"OFTInteger", "OFTInteger64", "OFTReal"}
+
+  def _ogr_types(path):
+      """字段名 → OGR 类型；读不出就返回空字典（调用方退回 pandas dtype 判断）。"""
+      p = str(path)
+      m = _GDB_LAYER.match(p)
+      try:
+          if m and os.path.exists(m.group(1)):
+              info = pyogrio.read_info(m.group(1), layer=m.group(2))
+          else:
+              info = pyogrio.read_info(p)
+      except Exception:
+          return {}
+      fields, types = info.get("fields"), info.get("ogr_types")
+      if fields is None or types is None:
+          return {}
+      return {str(n): str(t) for n, t in zip(fields, types)}
+
+
+  if not str(output_path).lower().endswith(".gpkg"):
+      raise ValueError(
+          f"GDAL 版输出只支持 .gpkg（收到 {output_path!r}）；"
+          "arcpy 的 .gdb 要素类请用 arcpy 后端"
+      )
+
+  zones = _read_vector(zones_path)
+  source = _read_vector(source_path)
+
+  if zones.crs is None or source.crs is None:
+      raise ValueError("坐标系缺失（分区面或源要素没有 CRS），请先定义并统一投影坐标系")
+  if zones.crs != source.crs:
+      raise ValueError(
+          f"坐标系不一致（{zones.crs.name} vs {source.crs.name}），请先统一投影到投影坐标系"
+      )
+
+  stat_list = [f.strip() for f in str(stat_fields).split(",") if f.strip()]
+  if not stat_list:
+      raise ValueError("stat_fields 不能为空")
+  missing = [f for f in stat_list if f not in source.columns]
+  if missing:
+      raise ValueError(
+          f"源数据缺少字段: {missing}；可用: {sorted(c for c in source.columns if c != 'geometry')}"
+      )
+
+  stat = str(stat_type).strip().upper()
+  if stat not in ("SUM", "MEAN", "MAX", "MIN", "COUNT"):
+      raise ValueError(f"stat_type 只支持 SUM/MEAN/MAX/MIN/COUNT，收到 {stat_type!r}")
+  # arcpy 的 MAX/MIN 也认文本字段，SUM/MEAN 不认；这里统一要求数值：
+  # “把文本字段当数字汇总”从来不是用户想要的，早点报错比产出错数好。
+  non_numeric = []
+  source_types = _ogr_types(source_path)
+  for f in stat_list:
+      declared = source_types.get(f)
+      if declared is not None:
+          if declared not in _NUMERIC_OGR:
+              non_numeric.append(f)
+      elif not pd.api.types.is_numeric_dtype(source[f]):
+          non_numeric.append(f)
+  if non_numeric:
+      raise ValueError(f"stat_fields 里有非数值字段: {non_numeric}；{stat} 只能对数值字段做")
+
+  # 分区标识字段：与 arcpy 版同一套挑选规则（先找 name，再退到第一个字符串字段）
+  def _is_text(series):
+      return pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)
+
+  text_fields = [c for c in zones.columns if c != "geometry" and _is_text(zones[c])]
+  zone_key = next((c for c in text_fields if c.lower() == "name"), None)
+  if zone_key is None and text_fields:
+      zone_key = text_fields[0]
+  if zone_key is None:
+      raise ValueError("分区数据缺少字符串标识字段（如 name）")
+
+  match = str(match_option).strip().upper()
+  # arcpy SpatialJoin 的 match_option 里能对上的四项：源要素是 target，分区是 join。
+  _MATCH = {
+      "HAVE_THEIR_CENTER_IN": ("centroid", "intersects"),
+      "INTERSECT": ("shape", "intersects"),
+      "WITHIN": ("shape", "within"),
+      "CONTAINS": ("shape", "contains"),
+  }
+  if match not in _MATCH:
+      raise ValueError(f"match_option 不支持: {match_option!r}；可用 {sorted(_MATCH)}")
+  center_mode, predicate = _MATCH[match]
+
+  work = source.loc[source.geometry.notna() & ~source.geometry.is_empty]
+  # HAVE_THEIR_CENTER_IN 用的是要素的**几何中心**（ArcGIS 的 Shape.Centroid），
+  # 不是代表点：凹面/多部分的中心可以落在要素之外，那样就归属不进去 —— arcpy 版同样如此。
+  # 点位压在两个分区的公共边界上时两边都算命中，下面按分区顺序取第一个（与 arcpy 实测一致）。
+  left = gpd.GeoDataFrame(
+      geometry=(work.geometry.centroid if center_mode == "centroid" else work.geometry),
+      crs=source.crs,
+      index=work.index,
+  )
+  right = zones[[zone_key, "geometry"]].copy()
+  right["_zone_order"] = range(len(right))
+  joined = gpd.sjoin(left, right, how="inner", predicate=predicate)
+  # 分区重叠 / 相交类关系下，一条源要素可能命中多个分区：arcpy 的 JOIN_ONE_TO_ONE
+  # 只保留一个，这里也按分区原顺序取第一个，避免同一要素被重复计入。
+  joined = joined.sort_values("_zone_order", kind="stable")
+  joined = joined[~joined.index.duplicated(keep="first")]
+
+  matched = work.loc[joined.index].copy()
+  matched["_zone_key"] = joined[zone_key]
+  grouped = matched.groupby("_zone_key", dropna=False)
+
+  # 统计口径与 arcpy 的 Statistics 逐项对齐：空值不参与计算，整组全空时
+  # max/min/mean 留空；SUM 用 min_count=1 让“全空”是空值而不是 0。
+  stats = pd.DataFrame(index=grouped.size().index)
+  for f in stat_list:
+      if stat == "SUM":
+          stats[f] = grouped[f].sum(min_count=1)
+      elif stat == "MEAN":
+          stats[f] = grouped[f].mean()
+      elif stat == "MAX":
+          stats[f] = grouped[f].max()
+      elif stat == "MIN":
+          stats[f] = grouped[f].min()
+      else:
+          stats[f] = grouped[f].count()
+  # SRC_COUNT 与 arcpy 版同一口径：Statistics 的 COUNT 数的是**非空值**个数
+  # （stat_fields 第一个字段）。没有源要素落入的分区是空值，落入了但值全空则是 0。
+  src_count = grouped[stat_list[0]].count()
+
+  out = zones.copy()
+  join_fields = [f"{stat}_{f}" for f in stat_list]
+  for f, col in zip(stat_list, join_fields):
+      values = zones[zone_key].map(stats[f])
+      out[col] = values.astype("Int64") if stat == "COUNT" else values
+  out["SRC_COUNT"] = zones[zone_key].map(src_count).astype("Int64")
+
+  out_dir = os.path.dirname(os.path.abspath(output_path))
+  os.makedirs(out_dir, exist_ok=True)
+  if os.path.exists(output_path):
+      os.remove(output_path)
+  # GPKG 而不是 shp：SUM_Y2011 这类字段名 11 个字符，shapefile 会截断到 10
+  out.to_file(output_path, driver="GPKG", engine="pyogrio", layer="aggregate")
+
+
+  def _plain(value):
+      if value is None:
+          return None
+      if hasattr(value, "item"):
+          value = value.item()
+      try:
+          if pd.isna(value):
+              return None
+      except (TypeError, ValueError):
+          pass
+      return value
+
+
+  count = int(len(out))
+  sample_fields = [zone_key] + join_fields[:1] + ["SRC_COUNT"]
+  sample = []
+  for _, row in out.head(5).iterrows():
+      sample.append({str(k): _plain(row[k]) for k in sample_fields})
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "zone_key": zone_key,
+      "stat_fields": {stat: join_fields},
+      "sample_zones": sample,
+  })
+  print(f"Aggregate done: {count} zones, fields={join_fields}, sample={sample[:2]}")
 validation:
   - type: vector_exists
     path: "{{output_path}}"
@@ -145,11 +347,15 @@ validation:
     field: "SRC_COUNT"
     value: 0
 pitfalls:
+  - 分区输入给的是 **.gpkg / .gdb / 文件夹**（容器）而不是图层时：arcpy 后端在里面恰好一个要素类就自动取用，多个图层会报错要你指明（如 `zones.gpkg/counties`）。
   - 不要用 SpatialJoin 的 field_mapping 简写（如 "Y2011 SUM"）：字段会建出来但值全为 0，必须走 Statistics+JoinField。
   - 区县边界与地市边界常不一致（源面伸出所属市面），match_option 必须用 HAVE_THEIR_CENTER_IN 按中心点归属；
     用 INTERSECT 会把区县随机归给相邻地市（曾导致郑州 25 个区县这种错误）。
   - 分区面与源面坐标系必须一致，否则先投影。
   - 输出分区数与输入分区数一致；没有源要素落入的分区汇总值为空。
+  - arcpy 版目前无法用 stat_type=COUNT（Statistics 已经产出 COUNT_<字段>，JoinField 重名直接报
+    Cannot find field）；需要“计数”语义时用 GDAL 后端，或把 stat_type 留在 SUM 只看 SRC_COUNT。
+  - 全空值分组的 MEAN：arcpy 的 Statistics 会写 0，GDAL 版保留空值（没有数据就是没有数据）。
 examples:
   - "把区县人口按地市汇总，得到每个地级市的历年总人口并添加到 city 面要素"
   - "统计每个地市包含的区县数量"

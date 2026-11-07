@@ -754,6 +754,33 @@ class Verifier:
         return self._normalize_vision(parsed, model=getattr(response, "model", ""))
 
     # ----------------------------------------------------------------- verify
+    def compliance_check(self, artifacts: list[str]) -> dict[str, Any]:
+        """汇总本次产物的合规自检（``create_map`` 写的 ``.compliance.json`` 边车）。
+
+        只读文件 + 跑规则（毫秒级），不碰 arcpy、不调模型。没有边车的产物
+        （配方出图、旧版本出图）不计入，也不扣分 —— 没记录不等于有问题，
+        但会在 ``checked`` 里如实写 0，不冒充“查过了」。
+        """
+        from ..compliance import NOTICE
+        from ..compliance.store import aggregate, collect_reports
+
+        try:
+            entries = collect_reports(artifacts)
+            return aggregate(entries)
+        except Exception as exc:  # pragma: no cover - 汇总异常不许把验收带崩
+            logger.debug("合规汇总失败: %s", exc)
+            return {
+                "level": "none",
+                "blocked": False,
+                "checked": 0,
+                "images": [],
+                "counts": {"block": 0, "warn": 0, "info": 0},
+                "findings": [],
+                "problems": [],
+                "summary": f"合规闸门：汇总失败（{str(exc)[:80]}）",
+                "notice": NOTICE,
+            }
+
     def verify(self, state: Any) -> dict[str, Any]:
         """Full verification of the current state."""
         # 已删除的产物（如误建后又清理的目录）要从产物清单里剔除，
@@ -824,6 +851,12 @@ class Verifier:
         if hygiene.get("problems") and self.hygiene_mode == "block":
             problems.extend(f"交付卫生: {item}" for item in hygiene["problems"])
 
+        # 合规闸门（P1-2）：只汇总 create_map 自己写的自检结论；阻断级否决交付。
+        compliance = self.compliance_check(artifacts)
+        blocked_findings = [
+            item for item in (compliance.get("findings") or []) if item.get("level") == "block"
+        ]
+
         # 图面识图质检：中文是否可读、图例/图名是否齐全（模型支持识图时）
         vision_warnings: list[str] = []
         image_records = [r for r in structural if isinstance(r.get("image"), dict)]
@@ -847,7 +880,13 @@ class Verifier:
             for item in (semantic.get("per_requirement") or [])
             if str(item.get("status", "")).upper() == "FAIL"
         ]
-        passed = bool(semantic.get("pass", True)) and not problems and not missing and not failed_reqs
+        passed = (
+            bool(semantic.get("pass", True))
+            and not problems
+            and not missing
+            and not failed_reqs
+            and not blocked_findings
+        )
 
         summary_bits = []
         if problems:
@@ -861,7 +900,27 @@ class Verifier:
             summary_bits.append(prefix + str(hygiene["summary"])[:240])
         if vision_warnings:
             summary_bits.append("图面提醒: " + "；".join(vision_warnings[:2])[:240])
-        summary = "验收通过" if passed else "验收未通过：" + " | ".join(summary_bits)
+        if compliance.get("checked") and (compliance.get("findings") or compliance.get("problems")):
+            # 阻断项放最前面：它是这次验收最硬的理由；提示级放最后，不扰民
+            if blocked_findings:
+                summary_bits.insert(0, str(compliance.get("summary", ""))[:300])
+            else:
+                summary_bits.append(str(compliance.get("summary", ""))[:300])
+        if passed:
+            # 通过也要把提醒带上（合规警告/卫生提醒/图面提醒）：只报"验收通过"
+            # 等于把非阻断问题吞掉，用户看不到“图能交付但缺什么”。
+            summary = "验收通过" + (f"（{' | '.join(summary_bits)}）" if summary_bits else "")
+        else:
+            summary = "验收未通过：" + " | ".join(summary_bits)
+
+        base_hint = str(semantic.get("repair_hint", "") or "")
+        compliance_hint = " ".join(str(item.get("advice") or "") for item in blocked_findings[:2]).strip()
+        if blocked_findings:
+            repair_hint = (compliance_hint + (" " + base_hint if base_hint else "")).strip() or (
+                "按合规阻断项补齐审图号或未送审水印后再交付"
+            )
+        else:
+            repair_hint = base_hint or ("；".join(problems[:5]) if problems else "")
 
         return {
             "pass": passed,
@@ -869,9 +928,11 @@ class Verifier:
             "structural": structural,
             "semantic": semantic,
             "hygiene": hygiene,
+            "compliance": compliance,
+            #: 合规阻断不许“同一理由重复拒三次就降级放行”（见 loop._handle_finish）：
+            #: 版面问题可以商量，未审图的国界图不行。
+            "hard_block": bool(blocked_findings),
             "missing": missing,
             "problems": problems,
-            "repair_hint": str(semantic.get("repair_hint", "") or "") or (
-                "；".join(problems[:5]) if problems else ""
-            ),
+            "repair_hint": repair_hint,
         }
