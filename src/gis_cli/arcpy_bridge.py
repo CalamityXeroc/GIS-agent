@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from functools import lru_cache
 from pathlib import Path
 from textwrap import dedent
@@ -27,13 +28,51 @@ except ImportError:
 # === Constants ===
 
 DEFAULT_TIMEOUT_SECONDS = 300
+
+#: ``propy.bat`` 兜底探活的超时：真 ``import arcpy`` 冷启动实测 11.9s，给足余量。
+LAUNCHER_PROBE_TIMEOUT_SECONDS = 180
+
 ARCGIS_REGISTRY_PATHS = (
     r"SOFTWARE\ESRI\ArcGISPro",
     r"SOFTWARE\WOW6432Node\ESRI\ArcGISPro",
 )
-ARCGIS_PYTHON_RELATIVE_PATHS = (
-    Path("bin/Python/envs/arcgispro-py3/python.exe"),
-    Path("bin/Python/scripts/propy.bat"),
+#: 版本号文本里的数字串（用于把候选按版本降序排：多版本并存选最高）。
+_VERSION_IN_TEXT = re.compile(r"(\d+(?:\.\d+)*)")
+
+#: 注册表同一个键下的四个值**都要**读：升级安装后 ``InstallDir`` / ``PythonCondaRoot``
+#: 可能仍指向**已被删除**的旧版本，而 ``Version`` / ``PythonCondaEnv`` 是好的
+#: （本机 3.7 实测：``InstallDir=E:\ArcGISPro3.6\``，``Version=3.7.0.1901``）。
+REGISTRY_VALUE_NAMES = ("InstallDir", "PythonCondaRoot", "PythonCondaEnv", "Version")
+
+#: 安装目录 → conda 环境 → 解释器。环境名由注册表 ``PythonCondaEnv`` 给，
+#: **不能写死** ``arcgispro-py3``：用户克隆环境（``arcgispro-py3-clone``）是 Pro 的常规操作。
+ARCGIS_PYTHON_ENV_SUBDIR = Path("bin/Python/envs")
+ARCGIS_PYTHON_EXE_NAME = "python.exe"
+DEFAULT_CONDA_ENV = "arcgispro-py3"
+#: ``propy.bat`` 只当**最后**兜底：实测 3.7 上它会因注册表指向旧版本而落到系统
+#: ``C:\Program Files\python\python.exe``（那里没有 arcpy），所以必须强制探活。
+ARCGIS_PROPy_LAUNCHER = Path("bin/Python/scripts/propy.bat")
+#: 「这个目录真的是 Pro」的判据（Pro 3.x 实测存在），**不启子进程**即可排除伪候选。
+ARCGIS_INSTALL_MARKER = Path("Resources/ArcPy/arcpy/__init__.py")
+#: 目录探测的已知根目录：只扫**一层** glob，禁止递归、禁止全盘扫
+#: （本仓库有 ``find`` 挂死前科，见 AGENTS.md）。
+ARCGIS_PRO_SCAN_ROOTS = (
+    Path("E:/"),
+    Path("D:/"),
+    Path("E:/ArcGIS"),
+    Path("D:/ArcGIS"),
+    Path("C:/Program Files/ArcGIS"),
+    Path("C:/Program Files (x86)/ArcGIS"),
+)
+ARCGIS_PRO_SCAN_PATTERNS = ("ArcGISPro*", "Pro*")
+#: 目录探测只认这种名字（``ArcGISPro3.7`` / ``Pro`` / ``Pro3.7``）。
+#: 盘根下的 ``Pro*`` 会把 ``Program Files`` / ``ProgramData`` 也匹配进来，
+#: 它们显然不是 Pro，不能进候选表污染 doctor 的输出。
+ARCGIS_PRO_DIR_NAME = re.compile(r"^(?:arcgispro|pro)[\d.\-_]*$", re.IGNORECASE)
+#: 老候选表里的默认安装位置：目录探测的 glob 覆盖不到两级布局的个别机器，兜一下。
+ARCGIS_PRO_COMPAT_DIRS = (
+    Path(r"C:\Program Files\ArcGIS\Pro"),
+    Path(r"D:\ArcGIS\Pro"),
 )
 ASIA_NORTH_ALBERS_EQUAL_AREA_CONIC_WKT = (
     'PROJCS["Asia_North_Albers_Equal_Area_Conic",'
@@ -81,135 +120,390 @@ class ArcGISDiscoveryError(RuntimeError):
 
 # === Environment Discovery ===
 
+@dataclass(frozen=True)
+class _InstallHint:
+    """一条「Pro 可能装在哪」的线索（环境变量 / 注册表 / 目录探测各给一条）。"""
+
+    source: str
+    install_dir: str
+    conda_env: str = DEFAULT_CONDA_ENV
+    version: tuple[int, ...] = ()
+    #: 环境变量直指解释器时用（不能拿 ``<install>\envs\<env>`` 拼，路径可能不是标准布局）
+    python_executable: str = ""
+    #: 用户显式指定（环境变量）：永远排在其他候选前面
+    explicit: bool = False
+
+
+@dataclass(frozen=True)
+class _PythonCandidate:
+    """一个解释器候选；``launcher`` 为真表示这是 ``propy.bat``，必须探活。"""
+
+    source: str
+    python_path: str
+    install_dir: str
+    version: tuple[int, ...] = ()
+    explicit: bool = False
+    launcher: bool = False
+
+
 def _normalize_path(value: str | os.PathLike[str]) -> str:
     """标准化路径"""
     return str(Path(value).expanduser().resolve(strict=False))
 
 
+def _version_key(text: str) -> tuple[int, ...]:
+    """把 ``3.7`` / ``3.7.0.1901`` / ``ArcGISPro3.7`` 里的版本号抠成可排序的元组。
+
+    抠不到（如 ``Pro``）返回空元组：排序时自然排在有版本号的后面。
+    """
+    match = _VERSION_IN_TEXT.search(str(text))
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split(".") if part.isdigit())
+
+
 def _guess_install_dir_from_python(python_path: str | os.PathLike[str]) -> str:
-    """从 Python 路径推断 ArcGIS Pro 安装目录"""
+    """从解释器路径推断 ArcGIS Pro 安装目录。
+
+    ``<install>\\bin\\Python\\envs\\<环境名>\\python.exe`` 是 Pro 的固定布局；
+    环境名**不能写死**（用户克隆的 ``arcgispro-py3-clone`` 是常规操作）。
+    """
     normalized_path = Path(_normalize_path(python_path))
     parts = normalized_path.parts
-    marker = ("bin", "Python", "envs", "arcgispro-py3")
-    if len(parts) >= len(marker) + 1 and tuple(parts[-5:-1]) == marker:
-        return _normalize_path(normalized_path.parents[4])
+    lowered = [part.lower() for part in parts]
+    for index in range(len(parts) - 4, 0, -1):
+        if tuple(lowered[index:index + 3]) == ("bin", "python", "envs"):
+            return _normalize_path(Path(*parts[:index]))
     return _normalize_path(normalized_path.parent)
 
 
-def _iter_env_python_candidates() -> list[tuple[str, str, str]]:
-    """从环境变量查找 Python 候选"""
-    candidates: list[tuple[str, str, str]] = []
-    
-    # Check explicit environment variable
+def _iter_env_install_hints() -> list[_InstallHint]:
+    """从环境变量找安装线索。
+
+    ``ARCGIS_PRO_PYTHON`` 是硬覆盖：显式指定的解释器永远排在候选第一位
+    （即使它的安装目录不是标准布局、即使同机还装着别的 Pro）。
+    """
+    hints: list[_InstallHint] = []
+
     explicit_python = os.environ.get("ARCGIS_PRO_PYTHON")
     if explicit_python:
-        python_path = Path(explicit_python).expanduser()
-        normalized = _normalize_path(python_path)
-        candidates.append((
-            "env:ARCGIS_PRO_PYTHON",
-            normalized,
-            _guess_install_dir_from_python(normalized)
+        normalized = _normalize_path(Path(explicit_python).expanduser())
+        hints.append(_InstallHint(
+            source="env:ARCGIS_PRO_PYTHON",
+            install_dir=_guess_install_dir_from_python(normalized),
+            python_executable=normalized,
+            explicit=True,
         ))
-    
-    # Check install dir environment variable
+
     install_dir = os.environ.get("ARCGIS_PRO_INSTALL_DIR")
     if install_dir:
-        install_path = Path(install_dir).expanduser()
-        normalized_install = _normalize_path(install_path)
-        for relative_path in ARCGIS_PYTHON_RELATIVE_PATHS:
-            candidates.append((
-                "env:ARCGIS_PRO_INSTALL_DIR",
-                _normalize_path(install_path / relative_path),
-                normalized_install
-            ))
-    
-    return candidates
+        hints.append(_InstallHint(
+            source="env:ARCGIS_PRO_INSTALL_DIR",
+            install_dir=_normalize_path(Path(install_dir).expanduser()),
+            explicit=True,
+        ))
+
+    return hints
 
 
-def _iter_registry_install_dirs() -> list[tuple[str, str]]:
-    """从 Windows 注册表查找安装目录"""
+def _install_dir_from_install_value(value: str | None) -> str:
+    """注册表 ``InstallDir`` → 安装目录（原样标准化）。"""
+    if not value:
+        return ""
+    return _normalize_path(Path(str(value)).expanduser())
+
+
+def _install_dir_from_conda_root(value: str | None) -> str:
+    r"""``PythonCondaRoot``（``<安装目录>\bin\Python``）→ 安装目录。
+
+    形状不对就返回空串（宁缺毋滥）：宁可少一条候选，也不要拿个半截路径
+    去拼 ``<install>\bin\Python\envs\...``。
+    """
+    if not value:
+        return ""
+    path = Path(_normalize_path(Path(str(value)).expanduser()))
+    if tuple(part.lower() for part in path.parts[-2:]) == ("bin", "python"):
+        return _normalize_path(path.parents[1])
+    return ""
+
+
+def _iter_registry_install_dirs() -> list[_InstallHint]:
+    r"""从 Windows 注册表查找安装线索。
+
+    只信 ``InstallDir`` 是 3.7 适配前的老病根：升级安装后它可能仍指向**已被删除**
+    的旧版本（本机 ``E:\ArcGISPro3.6\``，而 3.7 实际装在 ``E:\ArcGISPro3.7``）。
+    所以同一个键下的 ``PythonCondaRoot`` / ``PythonCondaEnv`` / ``Version`` 一起读：
+    其中任何一个坏了，还有别的线索可用。
+    """
     if winreg is None:
         return []
-    
-    discovered: list[tuple[str, str]] = []
+
+    discovered: list[_InstallHint] = []
+    seen: set[tuple[str, str]] = set()
     registry_views = [0]
     key_read = getattr(winreg, "KEY_READ", 0)
-    
+
     for extra_flag_name in ("KEY_WOW64_64KEY", "KEY_WOW64_32KEY"):
         extra_flag = getattr(winreg, extra_flag_name, 0)
         if extra_flag:
             registry_views.append(extra_flag)
-    
+
     for registry_path in ARCGIS_REGISTRY_PATHS:
         for view_flag in registry_views:
+            values: dict[str, str] = {}
             try:
                 with winreg.OpenKey(
                     winreg.HKEY_LOCAL_MACHINE, registry_path, 0, key_read | view_flag
                 ) as key:
-                    install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
-                    discovered.append((
-                        f"registry:{registry_path}",
-                        _normalize_path(install_dir)
-                    ))
+                    for value_name in REGISTRY_VALUE_NAMES:
+                        try:
+                            values[value_name], _ = winreg.QueryValueEx(key, value_name)
+                        except OSError:
+                            continue
             except OSError:
                 continue
-    
+            if not values:
+                continue
+
+            version = _version_key(values.get("Version", ""))
+            conda_env = str(values.get("PythonCondaEnv") or "").strip() or DEFAULT_CONDA_ENV
+            for value_name, install_dir in (
+                ("InstallDir", _install_dir_from_install_value(values.get("InstallDir"))),
+                ("PythonCondaRoot", _install_dir_from_conda_root(values.get("PythonCondaRoot"))),
+            ):
+                if not install_dir or (value_name, install_dir) in seen:
+                    continue
+                seen.add((value_name, install_dir))
+                discovered.append(_InstallHint(
+                    source=f"registry:{registry_path}:{value_name}",
+                    install_dir=install_dir,
+                    conda_env=conda_env,
+                    version=version,
+                ))
+
     return discovered
 
 
-def _build_python_candidates() -> list[tuple[str, str, str]]:
-    """构建所有 Python 候选路径"""
-    candidates: list[tuple[str, str, str]] = []
+def _iter_filesystem_install_dirs() -> list[_InstallHint]:
+    """目录探测：已知根目录 + **一层** glob。
+
+    禁止递归、禁止全盘扫（本仓库有 ``find`` 挂死前科）。
+    """
+    hints: list[_InstallHint] = []
     seen: set[str] = set()
-    
-    # From environment variables
-    for source, python_path, install_dir in _iter_env_python_candidates():
+
+    for root in ARCGIS_PRO_SCAN_ROOTS:
+        for pattern in ARCGIS_PRO_SCAN_PATTERNS:
+            try:
+                matches = sorted(root.glob(pattern))
+            except OSError:  # pragma: no cover - 盘符不存在 / 无权限
+                continue
+            for match in matches:
+                if not ARCGIS_PRO_DIR_NAME.match(match.name):
+                    continue
+                if not match.is_dir():
+                    continue
+                normalized = _normalize_path(match)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                hints.append(_InstallHint(
+                    source=f"filesystem:scan:{normalized}",
+                    install_dir=normalized,
+                    version=_version_key(match.name),
+                ))
+
+    for compat in ARCGIS_PRO_COMPAT_DIRS:
+        normalized = _normalize_path(compat)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        hints.append(_InstallHint(
+            source="filesystem:compat",
+            install_dir=normalized,
+            version=_version_key(Path(normalized).name),
+        ))
+
+    return hints
+
+
+def _python_paths_for(hint: _InstallHint) -> list[str]:
+    """一条安装线索 → 可能的解释器路径。
+
+    只收 ``python.exe``：``propy.bat`` 是另一个东西（启动器），见
+    ``_iter_python_candidates`` 的 launcher 项。
+    """
+    if hint.python_executable:
+        return [hint.python_executable]
+
+    env_root = Path(hint.install_dir) / ARCGIS_PYTHON_ENV_SUBDIR
+    env_names: list[str] = [hint.conda_env] if hint.conda_env else []
+    try:
+        # 克隆环境（arcgispro-py3-clone）也要收：注册表里的环境名可能早就不用了
+        for child in sorted(env_root.iterdir()):
+            if child.is_dir() and child.name not in env_names:
+                env_names.append(child.name)
+    except OSError:
+        pass
+    return [_normalize_path(env_root / name / ARCGIS_PYTHON_EXE_NAME) for name in env_names]
+
+
+def _iter_python_candidates() -> list[_PythonCandidate]:
+    """所有解释器候选，**按优先级排序**（不检查存在性、不启子进程）。
+
+    顺序：环境变量（硬覆盖）→ 注册表（版本降序，同版本内 ``InstallDir`` 先于
+    ``PythonCondaRoot``）→ 目录探测（版本降序：多版本并存选最高）→ ``propy.bat``
+    最后兜底。适配前的旧候选只增不减，相对顺序不变。
+    """
+    candidates: list[_PythonCandidate] = []
+    seen: set[str] = set()
+
+    def _add(hint: _InstallHint, python_path: str, *, launcher: bool = False) -> None:
         normalized = _normalize_path(python_path)
-        if normalized not in seen:
-            seen.add(normalized)
-            candidates.append((source, normalized, install_dir))
-    
-    # From registry
-    for source, install_dir in _iter_registry_install_dirs():
-        install_path = Path(install_dir)
-        for relative_path in ARCGIS_PYTHON_RELATIVE_PATHS:
-            python_path = _normalize_path(install_path / relative_path)
-            if python_path not in seen:
-                seen.add(python_path)
-                candidates.append((source, python_path, _normalize_path(install_path)))
-    
-    # Filesystem fallback - common locations
-    fallback_paths = [
-        Path(r"C:\Program Files\ArcGIS\Pro"),
-        Path(r"E:\ArcGISPro3.6"),  # 用户的安装路径
-        Path(r"D:\ArcGIS\Pro"),
-    ]
-    
-    for fallback in fallback_paths:
-        for relative_path in ARCGIS_PYTHON_RELATIVE_PATHS:
-            python_path = _normalize_path(fallback / relative_path)
-            if python_path not in seen:
-                seen.add(python_path)
-                candidates.append(("filesystem:fallback", python_path, _normalize_path(fallback)))
-    
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(_PythonCandidate(
+            source=hint.source,
+            python_path=normalized,
+            install_dir=_normalize_path(hint.install_dir),
+            version=hint.version,
+            explicit=hint.explicit,
+            launcher=launcher,
+        ))
+
+    registry_hints = sorted(
+        _iter_registry_install_dirs(), key=lambda hint: hint.version, reverse=True
+    )
+    filesystem_hints = sorted(
+        _iter_filesystem_install_dirs(), key=lambda hint: hint.version, reverse=True
+    )
+
+    for hint in (*_iter_env_install_hints(), *registry_hints, *filesystem_hints):
+        for python_path in _python_paths_for(hint):
+            _add(hint, python_path)
+
+    # 启动器最后兜底（discover 会强制探活，见 _probe_launcher）
+    for hint in (*registry_hints, *filesystem_hints):
+        _add(
+            replace(hint, source=f"launcher:propy.bat:{hint.install_dir}"),
+            str(Path(hint.install_dir) / ARCGIS_PROPy_LAUNCHER),
+            launcher=True,
+        )
+
     return candidates
+
+
+def _build_python_candidates() -> list[tuple[str, str, str]]:
+    """``(来源, 解释器, 安装目录)`` 候选表，按优先级排序。
+
+    只收 ``python.exe``（``propy.bat`` 不算解释器）。doctor 用这份表列
+    「这台机器上还装着哪些 Pro」。
+    """
+    return [
+        (candidate.source, candidate.python_path, candidate.install_dir)
+        for candidate in _iter_python_candidates()
+        if not candidate.launcher
+    ]
+
+
+def _is_pro_install(install_dir: str | os.PathLike[str]) -> bool:
+    """这个目录是不是**真的** Pro 安装（看 arcpy 包本体，不启子进程）。"""
+    return (Path(install_dir) / ARCGIS_INSTALL_MARKER).is_file()
+
+
+def discovery_routes() -> list[str]:
+    r"""「试过哪几条路」的人类可读清单。
+
+    doctor / 持久内核 / 发现失败异常**共用这一份**，避免三处文案各自漂移
+    （历史问题：doctor 那份写死了 ``E:\ArcGISPro3.6``，3.7 升级后就在误导人）。
+    """
+    roots = "、".join(str(root) for root in ARCGIS_PRO_SCAN_ROOTS)
+    return [
+        "环境变量 ARCGIS_PRO_PYTHON / ARCGIS_PRO_INSTALL_DIR",
+        r"注册表 SOFTWARE\ESRI\ArcGISPro 的 InstallDir / PythonCondaRoot / PythonCondaEnv",
+        f"目录探测 {roots} 下的 ArcGISPro* / Pro*（各一层）",
+        r"启动器兜底 <安装目录>\bin\Python\scripts\propy.bat（必须能 import arcpy）",
+    ]
+
+
+def _discovery_error() -> ArcGISDiscoveryError:
+    """发现失败：把试过的路说清（这四个字直接告诉用户下一步改哪里）。"""
+    return ArcGISDiscoveryError(
+        "未找到 ArcGIS Pro Python 解释器。已试过："
+        + "；".join(discovery_routes())
+        + "。装在别处就用环境变量指定："
+        r"set ARCGIS_PRO_PYTHON=<安装目录>\bin\Python\envs\arcgispro-py3\python.exe"
+    )
+
+
+def _probe_launcher(candidate: _PythonCandidate) -> ArcGISPythonInfo | None:
+    r"""``propy.bat`` 兜底：**必须**真能 ``import arcpy`` 才算数。
+
+    实测 3.7 的 ``propy.bat`` 会因注册表指向旧版本而落到系统
+    ``C:\Program Files\python\python.exe``；那里没有 arcpy 却照样能跑完
+    用户代码，``require_arcpy=False`` 时就是**在错误的解释器里静默“成功”**。
+    """
+    code = dedent('''
+        import arcpy
+        info = arcpy.GetInstallInfo()
+        set_result({
+            "install_dir": info.get("InstallDir", ""),
+            "version": info.get("Version", ""),
+        })
+    ''')
+    result = run_arcpy_code(
+        code,
+        python_executable=candidate.python_path,
+        timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+    )
+    if result.status != "success" or not isinstance(result.data, dict):
+        return None
+    return ArcGISPythonInfo(
+        install_dir=_normalize_path(result.data.get("install_dir") or candidate.install_dir),
+        python_executable=candidate.python_path,
+        source=candidate.source,
+    )
 
 
 @lru_cache(maxsize=1)
 def discover_arcgis_pro_python() -> ArcGISPythonInfo:
-    """自动发现 ArcGIS Pro Python 解释器"""
-    for source, python_path, install_dir in _build_python_candidates():
-        if Path(python_path).exists():
-            return ArcGISPythonInfo(
-                install_dir=_normalize_path(install_dir),
-                python_executable=python_path,
-                source=source
-            )
-    
-    raise ArcGISDiscoveryError(
-        "未找到 ArcGIS Pro Python 解释器。请确认已安装 ArcGIS Pro，"
-        "或通过 ARCGIS_PRO_PYTHON / ARCGIS_PRO_INSTALL_DIR 环境变量提供路径。"
-    )
+    r"""自动发现 ArcGIS Pro Python 解释器。
+
+    四级：① 环境变量（``ARCGIS_PRO_PYTHON`` 硬覆盖，永远第一）
+    → ② 注册表（``InstallDir`` / ``PythonCondaRoot`` + ``PythonCondaEnv``，版本降序）
+    → ③ 已知根目录的一层 glob（本机 ``E:\ArcGISPro3.7`` 靠这条命中）
+    → ④ ``propy.bat`` 兜底（强制探活）。
+
+    ①②③ 内部再分两轮：先只认「``Resources\ArcPy\arcpy\__init__.py`` 在」的真 Pro
+    （不启子进程），都不合格才退回「``python.exe`` 存在即可」的老口径 —— 既排除
+    残留目录里的伪候选，又不会在非标准布局的机器上突然找不到 Pro。
+    """
+    all_candidates = _iter_python_candidates()
+    python_candidates = [candidate for candidate in all_candidates if not candidate.launcher]
+    explicit = [candidate for candidate in python_candidates if candidate.explicit]
+    discovered = [candidate for candidate in python_candidates if not candidate.explicit]
+
+    for group in (
+        explicit,
+        [candidate for candidate in discovered if _is_pro_install(candidate.install_dir)],
+        discovered,
+    ):
+        for candidate in group:
+            if Path(candidate.python_path).exists():
+                return ArcGISPythonInfo(
+                    install_dir=candidate.install_dir,
+                    python_executable=candidate.python_path,
+                    source=candidate.source,
+                )
+
+    for candidate in all_candidates:
+        if candidate.launcher and Path(candidate.python_path).exists():
+            info = _probe_launcher(candidate)
+            if info is not None:
+                return info
+
+    raise _discovery_error()
 
 
 def clear_discovery_cache() -> None:
@@ -390,7 +684,10 @@ def run_arcpy_code(
                 stdout="",
                 stderr=str(e),
                 error={"type": "DiscoveryError", "message": str(e)},
-                hint="请安装 ArcGIS Pro 或设置 ARCGIS_PRO_PYTHON 环境变量。"
+                hint=(
+                    "ArcGIS Pro 未安装或装在非默认位置：用 ARCGIS_PRO_PYTHON 指定解释器，"
+                    "或跑 gis-agent doctor 看已试过哪些路径。"
+                )
             )
     
     # 创建临时目录执行

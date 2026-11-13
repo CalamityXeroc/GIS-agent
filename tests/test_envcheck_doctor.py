@@ -116,9 +116,9 @@ def test_multiple_pro_versions_are_listed_and_launcher_ignored(env, monkeypatch,
         doctor,
         "_build_python_candidates",
         lambda: [
-            (r"registry:SOFTWARE\ESRI\ArcGISPro", FAKE_PYTHON, r"E:\FakePro"),
-            ("filesystem:fallback", str(other_python), str(tmp_path / "Pro3.4")),
-            ("filesystem:fallback", str(launcher), str(tmp_path / "Pro3.4")),
+            (r"registry:SOFTWARE\ESRI\ArcGISPro:InstallDir", FAKE_PYTHON, r"E:\FakePro"),
+            (f"filesystem:scan:{tmp_path / 'Pro3.4'}", str(other_python), str(tmp_path / "Pro3.4")),
+            (f"filesystem:scan:{tmp_path / 'Pro3.4'}", str(launcher), str(tmp_path / "Pro3.4")),
         ],
     )
 

@@ -43,6 +43,7 @@ from ..arcpy_bridge import (
     ArcPyExecutionResult,
     _build_python_candidates,
     discover_arcgis_pro_python,
+    discovery_routes,
     run_arcpy_code,
 )
 
@@ -272,20 +273,19 @@ def _discover() -> tuple[ArcGISPythonInfo | None, str]:
 # === 单项检查 ===
 
 def _tried_routes() -> str:
-    """没找到 Pro 时，把"试过哪几条路"说清楚，用户才知道下一步改哪里。"""
-    routes = [
-        "环境变量 ARCGIS_PRO_PYTHON / ARCGIS_PRO_INSTALL_DIR",
-        r"注册表 SOFTWARE\ESRI\ArcGISPro 的 InstallDir",
-        r"默认路径 C:\Program Files\ArcGIS\Pro（另有 D:\ArcGIS\Pro、E:\ArcGISPro3.6）",
-    ]
-    return "；".join(routes)
+    r"""没找到 Pro 时，把"试过哪几条路"说清楚，用户才知道下一步改哪里。
+
+    与 ``arcpy_bridge.discovery_routes()`` **同源**，不再手抄一份路径文案：
+    旧文案写死了 ``E:\ArcGISPro3.6``，升级到 3.7 后就在指错路。
+    """
+    return "；".join(discovery_routes())
 
 
 def _existing_candidates() -> list[tuple[str, str]]:
     """所有**存在**的解释器候选（多版本 Pro 并存时用来全列出来）。
 
-    只看 ``python.exe``：候选里还有 ``propy.bat``（同一个环境的启动器），
-    把它当"另一个解释器"报给用户是误导。
+    候选表已经只收 ``python.exe``（``propy.bat`` 是启动器，不是解释器），
+    这里的后缀过滤是防御：别把启动器报成「另一个 Pro」。
     """
     try:
         candidates = _build_python_candidates()

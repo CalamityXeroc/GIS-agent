@@ -227,8 +227,14 @@ class ArcpyKernel:
 
             return discover_arcgis_pro_python().python_executable
         except Exception as exc:
+            # 发现失败的原因和候选链都在 arcpy_bridge，这里只排版、不另写一份：
+            # 只留一句英文 "not found" 时用户得自己猜是注册表坏了还是装到别处了。
+            from ..arcpy_bridge import discovery_routes
+
             raise KernelError(
-                "ArcGIS Pro Python not found. Set ARCGIS_PRO_PYTHON or install ArcGIS Pro."
+                "未找到 ArcGIS Pro Python，持久内核无法启动。已试过："
+                + "；".join(discovery_routes())
+                + "。修好后重试；找不到 Pro 期间每步会退回一次性子进程（重新导入 arcpy，约 15s）。"
             ) from exc
 
     def _ensure_kernelspec(self) -> None:
