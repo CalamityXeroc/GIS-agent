@@ -128,8 +128,10 @@ def test_create_map_selfcheck_is_quiet_for_a_clean_public_map(tmp_path: Path):
         catalog_rows=[],
         intent={"approval_number": "GS(2023)1234号"},
     )
-    assert result["compliance"]["level"] == "pass"
-    assert result["compliance"]["findings"] == []
+    # 断言里带上 findings：CI 上这条曾经在无 ArcGIS 的机器上返回 warn，
+    # 只报 "warn != pass" 看不出是哪条规则命中（诊断信息就留在这里，别再删）。
+    assert result["compliance"]["level"] == "pass", result["compliance"]
+    assert result["compliance"]["findings"] == [], result["compliance"]
 
 
 def test_create_map_selfcheck_never_breaks_rendering(tmp_path: Path, monkeypatch):
