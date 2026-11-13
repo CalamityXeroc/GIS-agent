@@ -1,0 +1,107 @@
+{
+  "arcpy_python": "E:\\ArcGISPro3.7\\bin\\Python\\envs\\arcgispro-py3\\python.exe",
+  "gis_cli_file": "E:\\BST_lab\\GIS_CLI\\src\\gis_cli\\__init__.py",
+  "zone_path": "E:\\BST_lab\\GIS_CLI\\benchmark\\reports\\p0-1c_dual_backend_20261102\\work\\county4508.shp",
+  "raster_path": "E:\\BST_lab\\GIS_CLI\\benchmark\\reports\\p0-1c_dual_backend_20261102\\work\\rasterA_4508.tif",
+  "errors": [],
+  "env_start": {
+    "extent": null,
+    "snapRaster": null,
+    "outputCoordinateSystem": null,
+    "cellSize": null,
+    "mask": null,
+    "overwriteOutput": false
+  },
+  "env_preset": {
+    "extent": [
+      0.0,
+      0.0,
+      1000.0,
+      1000.0
+    ],
+    "snapRaster": null,
+    "outputCoordinateSystem": 4326,
+    "cellSize": null,
+    "mask": null,
+    "overwriteOutput": false
+  },
+  "run_poisoned": {
+    "ok": true,
+    "summary": "配方 zone_raster_sum 执行成功，断言 3/3 通过",
+    "result": {
+      "output": "C:\\Users\\cheng\\AppData\\Local\\Temp\\dair289_env_guard\\work\\out\\chain.gdb\\zrs_poisoned",
+      "zone_count": 382,
+      "total_value": 29601147.237510424,
+      "cell_size": 1000.0,
+      "zones_with_data": 382
+    },
+    "wall_s": 20.1
+  },
+  "env_after_poisoned_run": {
+    "extent": [
+      0.0,
+      0.0,
+      1000.0,
+      1000.0
+    ],
+    "snapRaster": null,
+    "outputCoordinateSystem": 4326,
+    "cellSize": null,
+    "mask": null,
+    "overwriteOutput": false
+  },
+  "env_clean": {
+    "extent": null,
+    "snapRaster": null,
+    "outputCoordinateSystem": null,
+    "cellSize": null,
+    "mask": null,
+    "overwriteOutput": false
+  },
+  "run_clean": {
+    "ok": true,
+    "summary": "配方 zone_raster_sum 执行成功，断言 3/3 通过",
+    "result": {
+      "output": "C:\\Users\\cheng\\AppData\\Local\\Temp\\dair289_env_guard\\work\\out\\chain.gdb\\zrs_clean",
+      "zone_count": 382,
+      "total_value": 29601147.237510424,
+      "cell_size": 1000.0,
+      "zones_with_data": 382
+    }
+  },
+  "compare": {
+    "zone_count": [
+      382,
+      382
+    ],
+    "total_value": [
+      29601147.237510424,
+      29601147.237510424
+    ],
+    "cell_size": [
+      1000.0,
+      1000.0
+    ]
+  },
+  "env_after_clean_run": {
+    "extent": null,
+    "snapRaster": null,
+    "outputCoordinateSystem": null,
+    "cellSize": null,
+    "mask": null,
+    "overwriteOutput": false
+  },
+  "zonal_after": {
+    "ok": true,
+    "summary": "配方 zonal_statistics 执行成功，断言 2/2 通过",
+    "result": {
+      "output": "C:\\Users\\cheng\\AppData\\Local\\Temp\\dair289_env_guard\\work\\out\\chain.gdb\\zonal_after_zrs",
+      "record_count": 385,
+      "statistics": "SUM;MEAN",
+      "zone_field": "zid",
+      "casted_from": null
+    }
+  },
+  "zonal_record_count": 385,
+  "ok": true
+}

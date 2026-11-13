@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import env_guard
+
 logger = logging.getLogger(__name__)
 
 _RESULT_VAR = "__arcpy_engine_result__"
@@ -465,6 +467,10 @@ class ArcpyKernel:
         做法：在用户代码后面拼一段“把结果打成一行哨兵文本”，从同一条
         stdout 里剖出来；剖不到就退回旧的 ``_fetch_result()``（兼容
         用户代码自己 print 干扰、或结果非 JSON 可序列化的情况）。
+
+        ``arcpy.env`` 在这一层做按次隔离（见 ``env_guard``，DAIR-289）：跑前快照、
+        期间盖成干净基线、跑后（含异常）还原。配方级别的 ``finally`` 只能守住
+        自己 ``try`` 之后的代码，守不住各自第 1 步的 ``CopyFeatures``。
         """
         ws = workspace or self.workspace
         prefix = ""
@@ -474,8 +480,11 @@ class ArcpyKernel:
             # 再进本次工作区。用户代码抛异常会让 cell 中断，cwd 可能留在
             # 上一个工作区，所以下一次 execute 仍从 _cwd_launch 起步。
             prefix = "import os as _os\n" + _cwd_prefix_statements(safe)
+        # 快照要早于下面那两行改写（workspace / overwriteOutput），记的才是
+        # “这次执行之前”的外部态。
+        prefix += "import arcpy\n" + env_guard.snapshot_code()
+        if ws:
             prefix += (
-                "import arcpy\n"
                 f"arcpy.env.workspace = r'{safe}'\n"
                 "arcpy.env.overwriteOutput = True\n"
             )
@@ -493,17 +502,14 @@ class ArcpyKernel:
         try:
             if not self.is_alive():
                 self.start()
-            combined = prefix + _RESULT_HEAD + code + _RESULT_TAIL
+            combined = prefix + _RESULT_HEAD + code + _RESULT_TAIL + env_guard.restore_code()
             outcome = self._execute_raw(combined, timeout=timeout)
             outcome.duration_ms = int((time.time() - started) * 1000)
-            if ws and not outcome.ok:
-                # 用户代码抛异常会让整个 cell 中断，cwd 可能停在工作区里。
-                # 错误路径补一趟轻量归位（成功路径不需要：prefix 每次都先回
-                # _cwd_launch 再进工作区，本来就是自愈的）。
-                try:
-                    self._execute_raw("import os as _os\n" + _chdir_back_stmt(), timeout=30)
-                except Exception as exc:  # pragma: no cover - 归位失败不掩盖原始错误
-                    logger.warning("cwd 归位失败: %s", exc)
+            if not outcome.ok:
+                # 用户代码抛异常会让整个 cell 中断：cwd 可能停在工作区里，接在
+                # 结果尾巴后面的 env 还原也没跑到 —— 错误路径补一趟把两件都归位
+                # （成功路径不需要：cwd 由 prefix 自愈，env 由尾巴还原）。
+                self._repair_after_failure(ws)
             if outcome.ok:
                 result, stdout = _split_result(outcome.stdout or "")
                 outcome.stdout = stdout
@@ -516,6 +522,20 @@ class ArcpyKernel:
         finally:
             self._exec_lock.release()
         return outcome
+
+    def _repair_after_failure(self, ws: str | None) -> None:
+        """失败补丁趟：cwd 回启动目录 + ``arcpy.env`` 还原到快照（DAIR-13 / DAIR-289）。
+
+        失败不能掩盖原始错误：这一趟出错只记日志。
+        """
+        repair = ""
+        if ws:
+            repair += "import os as _os\n" + _chdir_back_stmt()
+        repair += "import arcpy\n" + env_guard.restore_code()
+        try:
+            self._execute_raw(repair, timeout=30)
+        except Exception as exc:  # pragma: no cover - 归位失败不掩盖原始错误
+            logger.warning("失败后归位（cwd/env）没走成: %s", exc)
 
     def _execute_raw(self, code: str, *, timeout: float) -> ExecResult:
         """Execute code and collect iopub output until idle."""

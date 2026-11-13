@@ -92,14 +92,16 @@ def test_execute_falls_back_when_marker_missing():
 
 
 def test_execute_does_not_fetch_result_on_error():
-    """执行失败时不该再去取结果（旧行为也不取）。"""
+    """执行失败时不该再去取结果（旧行为也不取）；但要多一趟 git 归位。"""
     kernel, calls = _fake_kernel(
         lambda code: ExecResult(ok=False, stdout="", error={"type": "E", "message": "boom"})
     )
     outcome = kernel.execute("raise ValueError('boom')")
     assert outcome.ok is False
     assert outcome.result is None
-    assert len(calls) == 1
+    # 1 趟用户代码（cell 中断，尾巴没跑到）+ 1 趟归位（arcpy.env 还原，DAIR-289）
+    assert len(calls) == 2, f"失败路径要补一趟归位，实际 {len(calls)} 趟"
+    assert "arcpy.env" in calls[1]
 
 
 def test_execute_preserves_workspace_prefix():
