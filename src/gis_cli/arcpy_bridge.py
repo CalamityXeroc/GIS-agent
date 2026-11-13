@@ -330,8 +330,9 @@ def _iter_filesystem_install_dirs() -> list[_InstallHint]:
 def _python_paths_for(hint: _InstallHint) -> list[str]:
     """一条安装线索 → 可能的解释器路径。
 
-    只收 ``python.exe``：``propy.bat`` 是另一个东西（启动器），见
-    ``_iter_python_candidates`` 的 launcher 项。
+    标准布局只收 ``python.exe``：``propy.bat`` 是另一个东西（启动器），见
+    ``_iter_python_candidates`` 的 launcher 项。环境变量直指解释器时原样返回，
+    里面可能就是个 ``.bat``——由 ``_is_launcher_path`` 判定，不能当解释器用。
     """
     if hint.python_executable:
         return [hint.python_executable]
@@ -346,6 +347,26 @@ def _python_paths_for(hint: _InstallHint) -> list[str]:
     except OSError:
         pass
     return [_normalize_path(env_root / name / ARCGIS_PYTHON_EXE_NAME) for name in env_names]
+
+
+def _is_launcher_path(python_path: str | os.PathLike[str]) -> bool:
+    """``.bat`` / ``.cmd`` 是启动器而不是解释器：交给 ``subprocess`` 前必须探活。
+
+    不只是候选表里的 ``propy.bat``：``ARCGIS_PRO_PYTHON`` 直接指到 ``propy.bat``
+    时同样走这条判据，否则会绕过探活、原样当解释器返回（实测 3.7 的 propy 会落到
+    系统 Python，``require_arcpy=False`` 时就是在错误的解释器里静默“成功”）。
+    """
+    return Path(str(python_path)).suffix.lower() in (".bat", ".cmd")
+
+
+def _registry_sort_key(hint: _InstallHint) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    r"""注册表线索排序键：**安装目录名里的版本**优先，``Version`` 值只作次级键。
+
+    升级安装后 ``Version`` 可能是新的、``InstallDir`` 却还指着旧版本残留
+    （``Version=3.7`` + ``InstallDir=...\ArcGISPro3.6``）：只按 ``Version`` 排，
+    坏路径会排在真实 3.7 前面（存在性/判据文件仍会把它筛掉，只是候选表看着别扭）。
+    """
+    return (_version_key(Path(hint.install_dir).name), hint.version)
 
 
 def _iter_python_candidates() -> list[_PythonCandidate]:
@@ -373,7 +394,7 @@ def _iter_python_candidates() -> list[_PythonCandidate]:
         ))
 
     registry_hints = sorted(
-        _iter_registry_install_dirs(), key=lambda hint: hint.version, reverse=True
+        _iter_registry_install_dirs(), key=_registry_sort_key, reverse=True
     )
     filesystem_hints = sorted(
         _iter_filesystem_install_dirs(), key=lambda hint: hint.version, reverse=True
@@ -381,7 +402,8 @@ def _iter_python_candidates() -> list[_PythonCandidate]:
 
     for hint in (*_iter_env_install_hints(), *registry_hints, *filesystem_hints):
         for python_path in _python_paths_for(hint):
-            _add(hint, python_path)
+            # 环境变量可能直指 propy.bat：启动器语义，discover 里强制探活
+            _add(hint, python_path, launcher=_is_launcher_path(python_path))
 
     # 启动器最后兜底（discover 会强制探活，见 _probe_launcher）
     for hint in (*registry_hints, *filesystem_hints):
@@ -478,11 +500,17 @@ def discover_arcgis_pro_python() -> ArcGISPythonInfo:
     ①②③ 内部再分两轮：先只认「``Resources\ArcPy\arcpy\__init__.py`` 在」的真 Pro
     （不启子进程），都不合格才退回「``python.exe`` 存在即可」的老口径 —— 既排除
     残留目录里的伪候选，又不会在非标准布局的机器上突然找不到 Pro。
+
+    ``ARCGIS_PRO_PYTHON`` 指到 ``.bat`` 时按启动器处理：仍然第一个试（硬覆盖），
+    但**必须先过 ``_probe_launcher``**，探活不过就丢弃、继续往下找。
     """
     all_candidates = _iter_python_candidates()
-    python_candidates = [candidate for candidate in all_candidates if not candidate.launcher]
-    explicit = [candidate for candidate in python_candidates if candidate.explicit]
-    discovered = [candidate for candidate in python_candidates if not candidate.explicit]
+    explicit = [candidate for candidate in all_candidates if candidate.explicit]
+    discovered = [
+        candidate
+        for candidate in all_candidates
+        if not candidate.explicit and not candidate.launcher
+    ]
 
     for group in (
         explicit,
@@ -490,15 +518,25 @@ def discover_arcgis_pro_python() -> ArcGISPythonInfo:
         discovered,
     ):
         for candidate in group:
-            if Path(candidate.python_path).exists():
-                return ArcGISPythonInfo(
-                    install_dir=candidate.install_dir,
-                    python_executable=candidate.python_path,
-                    source=candidate.source,
-                )
+            if not Path(candidate.python_path).exists():
+                continue
+            if candidate.launcher:
+                info = _probe_launcher(candidate)
+                if info is None:
+                    continue
+                return info
+            return ArcGISPythonInfo(
+                install_dir=candidate.install_dir,
+                python_executable=candidate.python_path,
+                source=candidate.source,
+            )
 
     for candidate in all_candidates:
-        if candidate.launcher and Path(candidate.python_path).exists():
+        if (
+            candidate.launcher
+            and not candidate.explicit  # 显式候选已在上面的循环里探过
+            and Path(candidate.python_path).exists()
+        ):
             info = _probe_launcher(candidate)
             if info is not None:
                 return info

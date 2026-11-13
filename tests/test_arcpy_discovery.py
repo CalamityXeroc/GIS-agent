@@ -252,6 +252,99 @@ def test_explicit_env_python_beats_a_real_install(monkeypatch, tmp_path):
     assert info.install_dir == _norm(custom.parent)
 
 
+def _make_bare_launcher(root: Path) -> Path:
+    """一个不在 Pro 标准布局里的启动器（目录名故意不命中目录探测）。"""
+    launcher = root / "custom" / "propy.bat"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("@echo off\n", encoding="utf-8")
+    return launcher
+
+
+def test_env_hint_bat_is_rejected_when_it_cannot_import_arcpy(monkeypatch, tmp_path):
+    """``ARCGIS_PRO_PYTHON`` 指到 ``.bat`` 不能绕过探活（DAIR-283 非阻塞项）。"""
+    launcher = _make_bare_launcher(tmp_path)
+    probed: list[str] = []
+
+    def fake_run(_code, **kwargs):
+        probed.append(kwargs["python_executable"])
+        return _probe_result("error", stderr="No environment named ... exists")
+
+    monkeypatch.setenv("ARCGIS_PRO_PYTHON", str(launcher))
+    monkeypatch.setattr(arcpy_bridge, "run_arcpy_code", fake_run)
+
+    with pytest.raises(ArcGISDiscoveryError):
+        arcpy_bridge.discover_arcgis_pro_python()
+    # 必须真的拿它去探活，而不是原样当解释器返回
+    assert probed == [_norm(launcher)]
+
+
+def test_env_hint_bat_is_probed_before_being_accepted(monkeypatch, tmp_path):
+    launcher = _make_bare_launcher(tmp_path)
+    install = tmp_path / "ArcGISPro3.7"
+    probed: list[str] = []
+
+    def fake_run(_code, **kwargs):
+        probed.append(kwargs["python_executable"])
+        return _probe_result(
+            "success", data={"install_dir": str(install), "version": "3.7.0.1901"}
+        )
+
+    monkeypatch.setenv("ARCGIS_PRO_PYTHON", str(launcher))
+    monkeypatch.setattr(arcpy_bridge, "run_arcpy_code", fake_run)
+
+    info = arcpy_bridge.discover_arcgis_pro_python()
+
+    assert probed == [_norm(launcher)]
+    assert info.python_executable == _norm(launcher)
+    assert info.install_dir == _norm(install)
+    # 显式指定仍是硬覆盖：优先级不变，只是多了一道探活
+    assert info.source == "env:ARCGIS_PRO_PYTHON"
+
+
+def test_rejected_env_hint_bat_falls_back_to_a_real_install(monkeypatch, tmp_path):
+    """探活不过就丢弃这个候选，不能因为它坏了就整条链报错。"""
+    install = tmp_path / "ArcGISPro3.7"
+    python = _make_pro_install(install)
+    launcher = _make_bare_launcher(tmp_path)
+
+    monkeypatch.setenv("ARCGIS_PRO_PYTHON", str(launcher))
+    monkeypatch.setattr(
+        arcpy_bridge, "run_arcpy_code", lambda _code, **_kw: _probe_result("error")
+    )
+
+    info = arcpy_bridge.discover_arcgis_pro_python()
+
+    assert info.python_executable == _norm(python)
+    # 候选表（doctor 用）里也不该出现这个 .bat
+    assert all(
+        not path.lower().endswith(".bat")
+        for _source, path, _install in arcpy_bridge._build_python_candidates()
+    )
+
+
+# === 注册表线索排序：路径名里的版本优先于 Version 值 ===
+
+def test_registry_hints_sort_by_install_path_version(monkeypatch, tmp_path):
+    """``Version=3.7`` + ``InstallDir`` 指向 3.6 残留：坏路径不能排到真 3.7 前面。"""
+    install = tmp_path / "ArcGISPro3.7"
+    _make_pro_install(install)
+    _install_registry(
+        monkeypatch,
+        InstallDir=str(tmp_path / "ArcGISPro3.6") + "\\",
+        PythonCondaRoot=str(install / "bin" / "Python"),
+        PythonCondaEnv="arcgispro-py3",
+        Version="3.7.0.1901",
+    )
+
+    sources = [
+        source for source, _path, _install in arcpy_bridge._build_python_candidates()
+    ]
+
+    assert sources.index(f"registry:{REGISTRY_KEY}:PythonCondaRoot") < sources.index(
+        f"registry:{REGISTRY_KEY}:InstallDir"
+    )
+
+
 # === propy.bat：最后兜底，且必须探活 ===
 
 def _make_launcher_only(root: Path) -> Path:
