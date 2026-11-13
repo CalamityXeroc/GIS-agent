@@ -194,9 +194,33 @@ def _join_names(items: Iterable[str], limit: int = TEXT_LIMIT) -> str:
     return _clip("、".join(seen), limit)
 
 
+#: 关键词 → 编译好的正则（模块级缓存：规则库是常量，重复编译没意义）。
+_PATTERN_RE: dict[str, re.Pattern[str]] = {}
+
+
+def _pattern_regex(pattern: str) -> re.Pattern[str]:
+    """把关键词编译成匹配器。
+
+    ASCII 关键词要求**左右不是字母/数字**，否则会误命中无关的路径片段：
+    实测 CI 跑在 GitHub Actions 上，临时目录是
+    ``C:/Users/runneradmin/AppData/...``，里面的 ``runneradmin`` 含子串
+    ``admin``，于是任何图层都被判成"边界类图层"（2026-11-13 CI 红）。
+    中文关键词仍按子串匹配（中文没有词边界概念）。
+    """
+    cached = _PATTERN_RE.get(pattern)
+    if cached is not None:
+        return cached
+    if re.fullmatch(r"[a-z0-9_]+", pattern):
+        compiled = re.compile(rf"(?<![a-z0-9]){re.escape(pattern)}(?![a-z0-9])")
+    else:
+        compiled = re.compile(re.escape(pattern))
+    _PATTERN_RE[pattern] = compiled
+    return compiled
+
+
 def _matches(layer: LayerRef, patterns: Iterable[str]) -> bool:
     text = layer.match_text
-    return any(pattern in text for pattern in patterns)
+    return any(_pattern_regex(pattern).search(text) for pattern in patterns)
 
 
 def normalize_audience(value: Any) -> str:

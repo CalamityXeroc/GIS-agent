@@ -366,6 +366,14 @@ def test_missing_rule_file_is_reported_not_swallowed(tmp_path: Path):
         ((_layer("军事设施"),), (1, 1)),
         ((_layer("national_boundary"),), (1, 1)),
         ((_layer("study_area"),), (0, 0)),
+        # 回归：GitHub Actions 的临时目录是 C:/Users/runneradmin/...，
+        # 里面的 "runneradmin" 含子串 "admin"，曾把普通图层判成边界类（2026-11-13 CI 红）
+        (
+            (LayerRef(name="街道", path="C:/Users/runneradmin/AppData/Local/Temp/input/街道.shp"),),
+            (0, 0),
+        ),
+        # 反过来：真叫 admin_boundary 的图层仍要被认出来（"_" 不是字母数字，词边界成立）
+        ((_layer("admin_boundary"),), (0, 1)),
     ],
 )
 def test_sensitive_and_boundary_layer_detection(layers, expected):
