@@ -12,25 +12,29 @@ from pathlib import Path
 
 
 def find_arcgis_python():
-    """查找 ArcGIS Pro Python 环境"""
+    """查找 ArcGIS Pro Python 环境
+
+    直接用 ``gis_cli.arcpy_bridge`` 的发现链：这里以前自己抄了一份候选表
+    （第一条是 ``E:\ArcGISPro3.6``），升级 Pro 之后安装脚本找不到环境、
+    CLI 却找得到 —— 两套路径逻辑不该同时存在。
+    """
     print("🔍 查找 ArcGIS Pro Python 环境...")
-    
-    # 常见的 ArcGIS Pro 安装路径
-    possible_paths = [
-        r"E:\ArcGISPro3.6\bin\Python\envs\arcgispro-py3\python.exe",  # 你的路径
-        r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe",
-        r"C:\Program Files (x86)\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe",
-        r"D:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe",
-        r"E:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe",
-    ]
-    
-    for path in possible_paths:
-        if Path(path).exists():
-            print(f"✅ 找到: {path}")
-            return path
-    
-    print("⚠️  未找到 ArcGIS Pro Python")
-    return None
+
+    # 通常在仓库根目录直接跑，包可能还没 pip install：先把源码目录挂进 sys.path
+    src_dir = Path(__file__).resolve().parent / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+    try:
+        from gis_cli.arcpy_bridge import discover_arcgis_pro_python
+
+        info = discover_arcgis_pro_python()
+    except Exception as exc:  # 没装 Pro / 源码缺文件都不该让安装脚本崩在 import 上
+        print(f"⚠️  未找到 ArcGIS Pro Python：{exc}")
+        return None
+
+    print(f"✅ 找到: {info.python_executable}（{info.source}）")
+    return info.python_executable
 
 
 def check_python_version(python_exe):

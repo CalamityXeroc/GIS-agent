@@ -251,7 +251,7 @@ def test_extract_outputs_drops_paths_outside_workspace(tmp_path):
     outside = tmp_path.parent / (tmp_path.name + "_elsewhere")
     payload = {
         "junk": [
-            r"E:\ArcGISPro3.6\Resources\ArcToolBox\Services\routingservices\data\Blank.aprx",
+            r"E:\ArcGISPro3.7\Resources\ArcToolBox\Services\routingservices\data\Blank.aprx",
             r"C:\Users\<user>\Documents\ArcGIS\Projects\MyProject\MyProject.aprx",
             str(outside / "other.gdb" / "feature"),
         ],

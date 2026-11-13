@@ -330,7 +330,7 @@ def extract_outputs(value: Any, workspace: str | Path, *, limit: int = 30) -> li
     1. 模型习惯把读过的输入也写进 set_result，若当成产物登记，验收会报
        “产出不在 output 目录内”而判定失败（benchmark 的 4b 就栽在这）。
     2. 模型会把工具回参里的**外部**工程当成产物，例如
-       ``E:\\ArcGISPro3.6\\...\\Blank.aprx``、用户 Documents 下的 MyProject.aprx。
+       ``E:\\ArcGISPro3.7\\...\\Blank.aprx``、用户 Documents 下的 MyProject.aprx。
        这些是 ArcGIS 自带的模板工程，一登记就让验收永远报“产出不在 output 目录内”，
        把 agent 逼到 130 轮上限（14 届 4a-1 实测：断言 7/7 全过却 status=max_turns）。
        产物必须在 workspace 内，所以这里直接以 workspace 为界拒掉外部路径。

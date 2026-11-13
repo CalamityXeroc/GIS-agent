@@ -31,7 +31,21 @@ KINDS = ("NORTH_ARROW", "SCALE_BAR", "LEGEND")
 DEFAULT_KEYWORDS: dict[str, list[str]] = {
     "NORTH_ARROW": ["指北针 13", "罗盘北", "正北", "罗盘", "compass", "north arrow", "指北针"],
     "SCALE_BAR": ["公制黑白相间比例尺 1", "公制黑白相间", "黑白相间", "alternating", "公制比例线", "比例线"],
-    "LEGEND": ["图例 1", "legend 1", "图例 2", "legend"],
+    "LEGEND": [
+        # 3.6 的预设名（旧机器原样保留：3.6 还在跑，不能按版本删关键字）
+        "图例 1",
+        "legend 1",
+        "图例 2",
+        "legend",
+        # 3.7 把 LEGEND 预设全改名了（12 项：中心标题图例 / 手动列图例 / 透明背景图例…）。
+        # 优先透明背景 + 手动列：不加底色、不动标题位置，与 3.6「图例 1」观感最接近。
+        "透明背景图例",
+        "手动列图例",
+        "标题和文本对齐图例",
+        "中心标题图例",
+        # 兜底：中文版任意 LEGEND 预设名都含「图例」（含 3.7 剩下那几项）
+        "图例",
+    ],
 }
 
 #: 大比例尺/局部图更适合简单箭头；这里给出"按图型换样式"的备选关键字
@@ -67,7 +81,7 @@ def pick_style_name(
     kind: str,
     keywords: list[str] | None = None,
     *,
-    fallback_index: int | None = 0,
+    fallback_index: int | None = None,
 ) -> str:
     """按关键字优先级挑样式名（纯函数，便于单测）。
 
