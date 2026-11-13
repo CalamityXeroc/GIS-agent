@@ -68,6 +68,19 @@ stopped / refused / error`。**非 completed 也返回已产出的部分**，父
 - **`context` 必须 `replace()` 复制**：`run()` 会写 `context.state`，共享的话子跑完
   父的 `execute_code` 会把产物记到子任务上。
 
+## 复核子代理（W5 / P1-5）
+
+`SubAgentRunner.run_review(claim, facts, assertions?)` 复用同一套子代理设施，
+但**任务描述由系统现拼**：只有任务目标 + 主代理结论（claim）+ 数据量测摘要（facts）
++ 断言库，**没有任何主代理消息/trace/methodology**。工具表收窄为
+`assertion_check / catalog_query / read_file / execute_code / finish`，
+子代理配置里 `review_enabled=False`（防止复核者的 finish 再触发复核）。
+
+判定由复核者 `finish` 的严格 JSON 给出（`verdict/findings/checked/notes`），
+解析失败记 `unparsed`（不当通过，但默认不阻断）。开关默认关：
+`engine.review_enabled`，或 benchmark 任务 YAML 的 `review: true`（顶层 / `requirements` 里任一条均可）。
+细节、断言清单与注入基准见 `docs/review.md`。
+
 ## 配置（`config/llm_config.json` → `engine`）
 
 ```json
@@ -76,7 +89,14 @@ stopped / refused / error`。**非 completed 也返回已产出的部分**，父
 "subagent_max_turns": 30,
 "subagent_timeout_seconds": 900,
 "subagent_exec_timeout_seconds": 300,
-"subagent_result_max_chars": 4000
+"subagent_result_max_chars": 4000,
+"review_enabled": false,
+"review_max_per_run": 1,
+"review_max_turns": 20,
+"review_timeout_seconds": 600,
+"review_exec_timeout_seconds": 300,
+"review_block_on_fail": false,
+"review_require_before_finish": true
 ```
 
 `subagent_exec_timeout_seconds` 比父的 `kernel_exec_timeout_seconds`（默认 600）短一档：
@@ -98,8 +118,9 @@ stopped / refused / error`。**非 completed 也返回已产出的部分**，父
 
 ## 实测：组合任务 A/B（2026-10-22）
 
-任务：一个双交付的组合任务（4 期核密度 + 迁移图 ｜ 土地覆盖云区修补 + 面积统计，
-共 20 条断言，两个交付互不依赖）。同一模型、同一份输入，各跑一次。
+任务：`benchmark/tasks/gis14_am_combo_density_landcover.yaml`（两个互不依赖的交付：
+4 期核密度 + 迁移图 ｜ 土地覆盖云区修补 + 面积统计，共 20 条断言）。同一模型
+`glm-5.3-flash`，`--no-carry`，各跑一次。
 
 | 指标 | 关（off） | 开（on） |
 |---|---|---|
@@ -121,13 +142,13 @@ stopped / refused / error`。**非 completed 也返回已产出的部分**，父
    但要让子代理的 `execute_code` 超时比父更短（`kernel_exec_timeout_seconds` 是全局的，
    后续可给子代理单独设一档），否则一次卡死会同时惩罚父子两边。
 
-另外：**不给提示，模型不会主动拆**。一个 25 轮的纯 GDB 交付任务与这次组合任务，只在工具描述里写
+另外：**不给提示，模型不会主动拆**。4a（25 轮）与这次组合任务，只在工具描述里写
 「何时该拆」时，两次都是 0 次 delegate；在 system prompt 里加一条带门槛的指引
 （`loop.py::_delegate_hint`，仅在 `delegate` 注册时出现）之后，第一个回合就派了 2 个。
 
 ## 瘦身 + 收窄超时之后（2026-10-22 晚复跑）
 
-同一任务、同一模型再跑一次：18 轮 / 737,801 token / 1250.8s /
+同一任务、同一模型（`glm-5.3-flash`）再跑一次：18 轮 / 737,801 token / 1250.8s /
 父 prompt 峰值 63,289 / **0 个子代理** / 19-20 断言。
 
 **这次没有派子代理，所以它不是瘦身的 A/B。** trace 里模型明确权衡过一次：
@@ -161,13 +182,12 @@ token 差（−46%）不能归因于瘦身；能确定的只有确定性部分�
 
 ```bash
 # 跑任务（A/B 用 engine.subagent_enabled 切换）
-gis-agent loop "<你的任务>"
+PYTHONPATH=src .venv/Scripts/python.exe benchmark/runner.py --task gis14_am_task4a_density_migration
 
 # 看指标：轮次 / 总 token / 单次 prompt 峰值 / 压缩次数 / 派了几个子代理
-# （trace 在 workspace/.gis_agent/traces/<run_id>.jsonl）
 python - <<'PY'
 import json, io, glob, sys
-p = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob("workspace/.gis_agent/traces/*.jsonl"))[-1]
+p = sys.argv[1] if len(sys.argv) > 1 else sorted(glob.glob("benchmark/runs/*/gis14_am_task4a_density_migration/workspace/.gis_agent/traces/*.jsonl"))[-1]
 calls, peak, comps, delegates = 0, 0, 0, 0
 for line in io.open(p, encoding="utf-8"):
     d = json.loads(line)

@@ -70,6 +70,7 @@ IMPORT_TO_DIST = {
     "chromadb": "chromadb",
     "fastapi": "fastapi",
     "uvicorn": "uvicorn",
+    "starlette": "starlette",
     "streamlit": "streamlit",
     "pytest": "pytest",
 }

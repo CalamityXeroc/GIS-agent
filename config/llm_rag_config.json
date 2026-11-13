@@ -1,0 +1,35 @@
+{
+  "enabled": false,
+  "llm": {
+    "model": "Pro/zai-org/GLM-5",
+    "api_key": "sk-ypgpeqwnrktjskdeibsjtkmibfhhljbhdhmrthcvabkhklsm",
+    "api_base": "https://cloud.siliconflow.cn/"
+  },
+  "rag": {
+    "backend": "native",
+    "knowledge_paths": [
+      "README.md",
+      "config/intents.json",
+      "config/recovery_strategies.json"
+    ],
+    "top_k": 3,
+    "chunk_size": 1200,
+    "chunk_overlap": 120,
+    "use_contextual_compression": false,
+    "compression_similarity_threshold": 0.3,
+    "use_unstructured_loader": false,
+    "embeddings": {
+      "model": "text-embedding-3-small"
+    },
+    "auto_include_outputs": true,
+    "output_root": "outputs",
+    "max_output_files": 30,
+    "output_globs": [
+      "**/checklist.json",
+      "**/arcpy_report.txt",
+      "**/quality_report.json",
+      "**/execution_report.txt",
+      "**/export_summary.txt"
+    ]
+  }
+}

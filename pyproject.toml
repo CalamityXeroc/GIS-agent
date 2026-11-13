@@ -41,6 +41,14 @@ dev = [
   # Python 3.10 没有 tomllib（3.11+ 才进标准库），测试要读 pyproject 就得靠它
   "tomli>=2.0; python_version < '3.11'",
 ]
+#: Web 控制台后端（P2-S1）。**可选**：不装 [web] 时 ``gis-agent`` 其余命令
+#: 照常工作，只有 ``gis-agent web`` 会提示缺依赖。
+web = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  # app.py 直接 import starlette.exceptions 做 SPA 回落，显式声明，不靠 fastapi 传递
+  "starlette>=0.40",
+]
 #: GDAL 后端（P0-1b 的 GDAL 配方要它）。**必须可选**：
 #:
 #: - 缺了只降级：[gdal] 配方报"需 GDAL 后端"，引擎与 47 个 arcpy 配方照常工作。
@@ -53,7 +61,7 @@ dev = [
 #: **必然失败**。真正能装的是下面这组自带 GDAL 二进制的 wheel：pyogrio/rasterio
 #: 各自打包了一份 libgdal（实测 3.12.4 / 3.12.2，互不干扰），pyproj 带 PROJ。
 #: 代价是没有 `osgeo` 模块，GDAL 配方只能用 pyogrio/rasterio 的 API。
-#: 版本号是 Windows 上实测装通的组合（GDAL 二进制由这些 wheel 自带）。
+#: 版本号见 docs/p0-1b-env.md（在 .venv-gdal 里实测装通的组合）。
 gdal = [
   "geopandas>=1.0",
   "shapely>=2.0",
@@ -109,6 +117,9 @@ package-dir = {"" = "src"}
 # 合规规则库是 YAML 数据文件：不声明就不会进 wheel，装好的用户会直接撞
 # “读不到规则库”。内置那份必须随包走（用户覆盖走 config/compliance_rules.yaml）。
 "gis_cli.compliance" = ["*.yaml"]
+# 控制台占位页/构建产物：不声明就不会进 wheel，装好的用户 ``gis-agent web``
+# 只能看到 404。S2 起这里会换成 Vite 构建产物（仍在 static/ 下）。
+"gis_cli.web" = ["static/*"]
 
 [tool.pytest.ini_options]
 # CI 只跑不需要 ArcGIS 的部分（``pytest -m "not arcpy"``）。

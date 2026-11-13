@@ -95,8 +95,8 @@ report.ok, report.to_dict()["findings"]
 `TaskState.requirements`），不是某个叫 `requirements` 的配置段。所以开关落在两处，都默认关：
 
 1. **任务侧（交付级）**：benchmark YAML 顶层 `review: true`，或 `requirements` 里任一条
-   带 `review: true`（只对某条交付要求开）。运行器在 `build_engine()` **之前**把这个
-   开关定下来，因此关着的时候复核工具压根不进工具表。
+   带 `review: true`（只对某条交付要求开）。`benchmark/runner.py:review_switch()` 在
+   `build_engine()` **之前**把它定下来，因此关着的时候复核工具压根不进工具表。
 2. **引擎侧**：`config/llm_config.json` 的 `engine` 段（与 `subagent_enabled` 同层），
    适合生产环境统一打开：
 
@@ -145,7 +145,7 @@ report.ok, report.to_dict()["findings"]
   conservation: 10/10   topology: 7/7   dimension: 9/9
 ```
 
-- **32 个任务**取真实交付场景的既有形态（投影/拓扑/连接/汇总/密度/插值/栅格/
+- **32 个任务**取 `benchmark/tasks/` 的既有形态（投影/拓扑/连接/汇总/密度/插值/栅格/
   适老化/绿地/服务区…），每个都有一份干净样本；
 - **26 个注入错误**：前 20 个是断言清单与注入同源设计的老样本；后 5 个（`w5x_*`）是审查侧
   另造的**非同源**形态，专测“没见过的错误”（见下节「同源偏倚」）；另 1 个是整数人口声明

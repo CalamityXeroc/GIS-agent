@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -70,11 +71,13 @@ def chat(
     refresh_catalog: bool = typer.Option(False, "--refresh-catalog/--no-refresh-catalog", help="启动时同步扫全数据目录（默认不扫：改由首个任务后台扫描，启动更快）"),
     continue_last: bool = typer.Option(False, "--continue/--no-continue", help="接续上一次会话"),
     resume: str = typer.Option("", "--resume", help="接续指定会话 id"),
+    no_web: bool = typer.Option(False, "--no-web", help="不自动启动 Web 控制台（等价 GIS_NO_WEB=1）"),
 ):
     """交互式对话（新引擎）：工具动作/结果实时呈现，运行中可纠偏，Esc 中断。"""
     from .interactive import InteractiveChat
 
     _startup_envcheck(workspace)
+    _autostart_web(workspace, disabled=no_web)
     chat_session = InteractiveChat(
         workspace=workspace,
         config=config,
@@ -634,6 +637,106 @@ def doctor_cmd(
         console.print(_render_doctor(report))
         _print_doctor_summary(report)
     raise typer.Exit(code=report.exit_code)
+
+
+def _autostart_web(workspace: Optional[Path], disabled: bool = False) -> None:
+    """chat 启动时顺手把 Web 控制台拉起来（无窗口、单实例）。
+
+    失败只 warning：控制台是附加能力，端口/依赖/权限任何一项出问题都不能
+    把对话拦下来。URL 里已经带 token，别再单独打印 key。
+    """
+    if disabled or os.environ.get("GIS_NO_WEB", "").strip() not in {"", "0"}:
+        return
+    try:
+        from ..web.autostart import ensure_panel
+
+        status = ensure_panel(Path(workspace or Path.cwd()), open_browser=True)
+    except Exception as exc:  # noqa: BLE001 - 自动启动绝不能让 chat 起不来
+        console.print(Text(f"Web 控制台未启动：{exc}", style="yellow"))
+        return
+    if status.ok:
+        # soft_wrap：URL 带 64 位 token，被终端宽度折断就没法复制了
+        console.print(f"控制台: {status.url}", soft_wrap=True)
+    else:
+        console.print(Text(f"Web 控制台未启动：{status.error}", style="yellow"))
+
+
+def _default_web_workspace() -> Path:
+    """没给 ``--workspace`` 时选一个「有 run 记录」的根目录。
+
+    仓库约定是 cwd 为工作空间根、数据放 ``./workspace``（README 的
+    ``gis-agent chat --workspace .\\workspace``）。控制台只读，所以先看
+    cwd 自己有没有 traces，没有再看 ``cwd/workspace``，都没有才退回 cwd——
+    否则在本仓根目录直接 ``gis-agent web`` 会打开一个空控制台。
+
+    面板状态（``web.pid``）优先于 traces：``web --stop`` 要能找到正在跑的那个
+    面板，而刚起的 workspace 可能还没有任何 run 记录。
+    """
+    cwd = Path.cwd()
+    candidates = (cwd, cwd / "workspace")
+    for candidate in candidates:
+        if (candidate / ".gis_agent" / "web.pid").exists():
+            return candidate
+    for candidate in candidates:
+        if (candidate / ".gis_agent" / "traces").is_dir():
+            return candidate
+    return cwd
+
+
+@app.command("web")
+def web_cmd(
+    host: str = typer.Option("127.0.0.1", "--host", help="监听地址（默认只绑本机）"),
+    port: int = typer.Option(8760, "--port", help="监听端口"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="不自动打开浏览器"),
+    stop: bool = typer.Option(False, "--stop", help="停止后台运行的控制台后退出"),
+    token: str = typer.Option("", "--token", help="指定访问 token（默认读取/生成 .gis_agent/web_token）"),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="工作空间目录"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="llm_config.json 路径"),
+):
+    """启动只读 Web 控制台（trace / 数据目录 / 配置）；``--stop`` 停掉后台实例。"""
+    if stop:
+        from ..web.autostart import stop_panel
+
+        # 不需要 uvicorn：停进程只读 workspace 的 pid 文件
+        console.print(stop_panel(Path(workspace or _default_web_workspace())))
+        raise typer.Exit(code=0)
+
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("缺少 Web 依赖：pip install -e .[web]")
+        raise typer.Exit(code=1)
+
+    from ..web.app import create_app
+    from ..web.autostart import read_panel_state, restore_panel_state, write_panel_state
+    from ..web.security import load_or_create_token
+
+    ws = (workspace or _default_web_workspace()).resolve()
+    resolved_token = token or load_or_create_token(ws)
+    browse_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    url = f"http://{browse_host}:{port}/?token={resolved_token}"
+    console.print(f"工作空间: {ws}")
+    console.print(f"控制台: {url}")
+    if not no_browser:
+        import threading
+        import webbrowser
+
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    # 落 pid/port：自启路径（autostart._start）本来就写，手动起的实例也得写，
+    # 否则 ``web --stop`` 找不到它而端口还在听（DAIR-270）。
+    # uvicorn 是「先跑 lifespan startup、再 bind」，所以只能在这一步写；端口被占
+    # 启动失败时由 restore_panel_state 把上一个活着的实例的记录写回去（DAIR-271 P1）。
+    previous = read_panel_state(ws)
+    write_panel_state(ws, os.getpid(), port)
+    try:
+        uvicorn.run(
+            create_app(ws, token=resolved_token, config_path=config),
+            host=host,
+            port=port,
+        )
+    finally:
+        restore_panel_state(ws, os.getpid(), previous)
 
 
 def main():

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..trace.recorder import RunRecorder, new_run_id
+from .llm_client import LLMError
 from .repair import CodeRepairer
 from .state import Observation, Requirement, TaskState
 from .tool_codec import Action, AutoCodec, Protocol
@@ -198,7 +199,23 @@ class AgentLoop:
             # 先给可见反馈再调模型：这一步是一次完整的 LLM 往返（数秒到二十几秒），
             # 静默时用户会以为提交没成功而重复输入（实测反馈）。
             self._emit("note", {"text": "正在分析需求…"})
-            extracted = self._extract_requirements(goal, doc_paths)
+            try:
+                extracted = self._extract_requirements(goal, doc_paths)
+            except LLMError as exc:
+                # 模型层整体不可用（坏 api_base / key）：后面每一轮都会一样失败，
+                # 现在就收尾。再跑下去只会把 8×N 次重试和内核预热全白烧一遍，
+                # 界面却一直停在“正在分析需求…”（DAIR-257 实测 692s）。
+                self._persist_state = persist_state
+                self._emit("run_start", {"goal": goal, "run_id": run_id})
+                self.recorder.record(
+                    "run_start", {"goal": goal, "workspace": str(self.workspace)}
+                )
+                self.state.status = "llm_unavailable"
+                self.state.error = f"LLM 不可用: {exc}"
+                self.recorder.record("llm_error", {"error": str(exc)[:500]})
+                self._emit("llm_error", {"error": str(exc)[:300]})
+                self._finalize()
+                return self.state
             if extracted:
                 self.state.requirements.extend(extracted)
                 self.recorder.record(
@@ -510,6 +527,15 @@ class AgentLoop:
         total = len(actions)
         while index < total:
             action = actions[index]
+            # 用户已请求停止（request_stop / web 停止按钮）：本轮剩余动作一个都不再发起。
+            # 检查必须放在 _handle_action 之前 —— 那里做的第一件事就是记 tool_call，
+            # 晚了就会留下“停止之后还在开新工具”的轨迹（B4 实测：停止后仍继续
+            # execute_code，run 要等当前工具返回才变 stopped）。
+            if self._stop_pending():
+                skipped = total - index
+                base = str(self.state.error or "用户中断").strip()
+                self.state.error = f"用户停止（跳过后续工具 {skipped} 个）：{base}"
+                break
             # 参数解析失败：不执行，直接给一条失败观察
             if action.parse_error:
                 results.append(
@@ -969,7 +995,11 @@ class AgentLoop:
         return tuple(sorted(paths))
 
     def _extract_requirements(self, goal: str, doc_paths: list[str] | None) -> list[Requirement]:
-        """Best-effort requirement extraction from the goal and documents."""
+        """Best-effort requirement extraction from the goal and documents.
+
+        模型层整体不可用时向上抛（``provider_wide``）：让 ``run()`` 立刻收尾，
+        而不是带着默认需求再白跑一轮必然失败的调用。
+        """
         try:
             from ..requirements.extractor import RequirementExtractor
 
@@ -979,6 +1009,8 @@ class AgentLoop:
                 doc_paths=doc_paths,
                 catalog_digest=self._catalog_digest(),
             )
+        except LLMError:
+            raise
         except Exception as exc:
             logger.warning("requirement extraction error: %s", exc)
             return []
@@ -1426,10 +1458,20 @@ class AgentLoop:
         self._emit("user_injection", {"text": content[:400]})
         return True
 
+    def _stop_pending(self) -> bool:
+        """用户已请求停止、而循环还没走到收尾（``request_stop()`` 置的 stopped）。
+
+        只认 ``stopped``：``completed`` / ``failed`` / ``awaiting_user`` 分别由
+        finish / ask_user 自己收尾，走的是 ``_stopped_on``。
+        """
+        return self.state is not None and self.state.status == "stopped"
+
     def request_stop(self, reason: str = "用户中断") -> bool:
         """请求尽快停止：把状态从 running 改掉，工作线程在下一个检查点退出。
 
-        引擎每轮开头都会判断 ``status == "running"``，所以不需要信号/异步机制。
+        引擎每轮开头判断 ``status == "running"``，``_run_actions`` 在**每个动作
+        之前**也查一次 —— 已请求停止时本轮剩下的工具一个都不再发起（正在跑的
+        那个照常返回，不做硬杀）。所以不需要信号/异步机制。
         """
         if self.state.status != "running":
             return False
@@ -1735,6 +1777,9 @@ class AgentLoop:
                     "goal": self.state.goal,
                     "artifacts": self.state.artifacts,
                     "turns": self.state.turn,
+                    # 停止原因（“用户停止（跳过后续工具 N 个）”）要进 trace 的 run_end，
+                    # 否则事后只能看到 status=stopped，不知道为什么停。
+                    "error": self.state.error,
                     # token 用量与缓存命中率：以前只在日志后缀里一闪而过，
                     # 跑完就无法回答“这次花了多少 / 缓存命中率如何”。
                     "usage": self._usage_summary(),

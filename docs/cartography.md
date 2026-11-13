@@ -17,6 +17,10 @@ facts（采集数据事实） → design（规则引擎出 LayoutSpec） → ren
 
 对外入口：`gis_cli.cartography.design_only()`（只出设计说明）与 `create_map()`（一条龙出图）。
 
+出图后还会跑一次**合规闸门**（`src/gis_cli/compliance/`，只做提示 + 阻断、不做合规判定）：
+国界/敏感要素缺审图号、边界数据来源未登记、未送审水印缺失、审图号缺失。
+规则是 YAML（可扩充、可单条开关），详见 [compliance.md](compliance.md)。
+
 ## 一、规则表（引擎自动决定，附理由）
 
 | 项目 | 规则 | 依据 |

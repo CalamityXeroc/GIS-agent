@@ -1,0 +1,51 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import '@fontsource-variable/public-sans';
+@import './theme.css';
+
+@layer base {
+  html {
+    background: var(--background);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    min-height: 100dvh;
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-ui-sans);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* 边框颜色统一走 token：组件只写 border 宽度，不再逐个写颜色。 */
+  *,
+  ::before,
+  ::after {
+    border-color: var(--border);
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 24%, transparent);
+  }
+
+  /* 滚动条跟随主题，深色下不漏白条。 */
+  * {
+    scrollbar-color: color-mix(in oklab, var(--foreground) 18%, transparent)
+      transparent;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* 表格数字、KPI 数字统一等宽，避免切页时数字抖动。 */
+  .numeric {
+    font-variant-numeric: tabular-nums;
+  }
+}

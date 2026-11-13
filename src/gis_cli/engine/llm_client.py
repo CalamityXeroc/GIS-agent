@@ -28,12 +28,25 @@ logger = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
-    """Raised when an LLM call fails after all retries."""
+    """Raised when an LLM call fails after all retries.
 
-    def __init__(self, message: str, *, status_code: int | None = None, body: str = ""):
+    ``provider_wide`` 表示失败是**整条链路**的问题（api_base 连不上 / api_key 被拒），
+    换候选模型必然重蹈覆辙 —— 调用方据此直接放弃，而不是把 8 次重试 × N 个模型
+    全烧完（DAIR-257 实测：坏配置起 run 要 11m32s 才报错）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        body: str = "",
+        provider_wide: bool = False,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.provider_wide = provider_wide
 
 
 @dataclass
@@ -95,6 +108,9 @@ class EngineLLMConfig:
     model: str = ""
     api_key: str = ""
     api_base: str = ""
+    #: 供应商标识（``llm_config.json`` 的 ``provider`` 字段）。
+    #: ``anthropic`` 走 Messages API 适配层，其余一律按 OpenAI 兼容协议。
+    provider: str = ""
     temperature: float = 0.2
     max_tokens: int = 16000
     timeout: float = 900.0
@@ -159,6 +175,7 @@ class EngineLLMConfig:
             model=str(data.get("model", cls.model)),
             api_key=str(data.get("api_key", "") or ""),
             api_base=str(data.get("api_base", "") or ""),
+            provider=str(data.get("provider", "") or "").strip().lower(),
             temperature=float(data.get("temperature", cls.temperature)),
             max_tokens=int(data.get("max_tokens", cls.max_tokens)),
             timeout=float(data.get("timeout", cls.timeout)),
@@ -219,6 +236,18 @@ class EngineLLMConfig:
 
 
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+#: 鉴权类状态：同一个 api_key / api_base 对所有候选模型都一样，换模型没有意义。
+_AUTH_STATUS = {401, 403}
+
+#: 网关级 5xx（502/503/504）单模型尝试上限。
+#: 配置里 ``request_retry`` 常是 8，坏网关时 8 次指数退避会把一次 run 拖到十几分钟；
+#: 但只试 2 次也太敏感（一次 10s 量级的抖动就判死），取 3 次（退避 3s、6s）。
+_GATEWAY_MAX_ATTEMPTS = 3
+
+#: 5xx 抖动窗口（秒）：首次 5xx 之后至少还试这么久，才把整个网关判死。
+#: 候选模型多时就是这个窗口的上限；候选全试完（单模型配置也包含）也提前给结论。
+_GATEWAY_WINDOW_SECONDS = 20.0
 
 
 class _StreamUnsupported(RuntimeError):
@@ -323,6 +352,8 @@ class EngineLLMClient:
         self._failures: dict[str, int] = {}
         self._cooldown_until: dict[str, float] = {}
         self._cooldown_strikes: dict[str, int] = {}
+        #: Anthropic 适配器（懒加载；只有 provider=anthropic 时才会被用到）
+        self._anthropic_adapter: Any = None
 
     # ------------------------------------------------------------------ setup
     @property
@@ -389,6 +420,10 @@ class EngineLLMClient:
         candidates = self._order_by_health(candidates)
 
         last_error: Exception | None = None
+        gateway_failures = 0
+        gateway_since: float | None = None
+        gateway_down = False
+        stopped_early = False
         for candidate in candidates:
             try:
                 response = self._chat_once(
@@ -410,8 +445,37 @@ class EngineLLMClient:
                 last_error = exc
                 self._record_failure(candidate, exc)
                 logger.warning("model %s failed: %s", candidate, exc)
+                if exc.provider_wide:
+                    # 地址连不上 / 鉴权失败：候选模型共用同一个 base_url + key，
+                    # 继续换模型只是把同一份等待重复 N 遍。
+                    stopped_early = True
+                    break
+                if exc.status_code is not None and 500 <= exc.status_code < 600:
+                    gateway_failures += 1
+                    gateway_since = gateway_since or time.monotonic()
+                    # 网关抖动窗口：5xx（尤其反代 502/504）成串出现，刚试一个模型就判死
+                    # 会把 10~20s 的抖动升级成整个 run 的 llm_unavailable。
+                    if time.monotonic() - gateway_since >= _GATEWAY_WINDOW_SECONDS:
+                        gateway_down = True
+                        stopped_early = True
+                        logger.warning(
+                            "网关持续 %s 已超过 %.0fs，停止试其他模型",
+                            exc.status_code,
+                            _GATEWAY_WINDOW_SECONDS,
+                        )
+                        break
                 continue
-        raise LLMError(f"All models failed. Last error: {last_error}")
+        if not stopped_early and candidates and gateway_failures >= len(candidates):
+            # 每个候选都撞上 5xx：不是某个模型坏了，是整条链路（单模型配置也算）。
+            gateway_down = True
+        raise LLMError(
+            f"All models failed. Last error: {last_error}",
+            status_code=_status_code(last_error),
+            body=_error_body(last_error),
+            # 网关整体 5xx 或链路级错误才值得让上层首轮收尾；
+            # 单模型超时/协议错仍应该换候选模型。
+            provider_wide=gateway_down or bool(getattr(last_error, "provider_wide", False)),
+        )
 
     # -------------------------------------------------------------- 模型熔断
     def _order_by_health(self, candidates: list[str]) -> list[str]:
@@ -545,15 +609,30 @@ class EngineLLMClient:
         deadline = time.monotonic() + budget
         budget_exhausted = False
         vision_stripped = False
+        attempts_made = 0
         for attempt in range(1, self.config.retry_count + 1):
             remaining_budget = deadline - time.monotonic()
             if remaining_budget <= 0:
                 budget_exhausted = True
                 break
+            attempts_made = attempt
             with self._semaphore:
                 try:
                     started = time.perf_counter()
-                    if self.config.stream and not self._stream_unsupported:
+                    if self._use_anthropic():
+                        # Anthropic 官方是 Messages API，与 OpenAI 形状不同：
+                        # 交给适配层做消息/工具/流式转换，重试仍由本方法负责。
+                        response = self._anthropic_once(
+                            messages,
+                            model=model,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            temperature=payload["temperature"],
+                            max_tokens=payload["max_tokens"],
+                            on_delta=on_delta,
+                            timeout=max(30.0, remaining_budget),
+                        )
+                    elif self.config.stream and not self._stream_unsupported:
                         try:
                             response = self._stream_once(
                                 payload, model, deadline=deadline, on_delta=on_delta
@@ -588,6 +667,17 @@ class EngineLLMClient:
                 except Exception as exc:  # provider-specific exception types
                     status = _status_code(exc)
                     body = _error_body(exc)
+                    # Anthropic：max_tokens 超过模型上限直接 400（claude-3-5 上限 8192，
+                    # 而本地配置常写 16000）。压到 8192 重试一次，别让整轮 run 判死。
+                    if (
+                        self._use_anthropic()
+                        and status == 400
+                        and "max_tokens" in (body or "").lower()
+                        and int(payload.get("max_tokens") or 0) > 8192
+                    ):
+                        payload["max_tokens"] = 8192
+                        logger.warning("Anthropic 拒绝 max_tokens，已降到 8192 重试")
+                        continue
                     retryable = status is None or status in _RETRYABLE_STATUS
                     if not retryable:
                         # 识图是**可选增强**，不能让附图把整个任务拖死。实测上游会拒图：
@@ -606,8 +696,12 @@ class EngineLLMClient:
                             continue
                         # 网关直接拒 stream 参数（400/422）时不能让任务死：
                         # 关掉流式并用同一个模型重试一次（非流式语义完全一样，
-                        # 只是拿不到逐字输出）。
-                        if self.config.stream and not self._stream_unsupported:
+                        # 只是拿不到逐字输出）。鉴权失败跟流式无关，不白花这一次。
+                        if (
+                            self.config.stream
+                            and not self._stream_unsupported
+                            and status not in _AUTH_STATUS
+                        ):
                             self._stream_unsupported = True
                             logger.warning(
                                 "上游拒绝流式（%s），改用非流式重试：%s", status, (body or "")[:160]
@@ -617,6 +711,7 @@ class EngineLLMClient:
                             f"Non-retryable LLM error ({status}): {body or exc}",
                             status_code=status,
                             body=body,
+                            provider_wide=status in _AUTH_STATUS,
                         ) from exc
                     last_error = exc
                     delay = self._backoff_delay(attempt, status)
@@ -635,15 +730,101 @@ class EngineLLMClient:
                     )
                     if conn_failures >= 2:
                         break
+                    if (
+                        status is not None
+                        and 500 <= status < 600
+                        and attempt >= _GATEWAY_MAX_ATTEMPTS
+                    ):
+                        # 网关级 5xx：别在同一个模型上把 8 次退避全烧完
+                        break
                     time.sleep(delay)
         reason = (
             f"超过全局超时 {budget:.0f}s" if budget_exhausted
-            else f"{self.config.retry_count} 次尝试"
+            else f"{attempts_made or self.config.retry_count} 次尝试"
         )
         raise LLMError(
             f"LLM call failed after {reason}: {last_error}",
             status_code=_status_code(last_error),
             body=_error_body(last_error),
+            # 只有**真的连不上地址**（ConnectError/ConnectTimeout/DNS）才是链路问题；
+            # 读超时/连接被重置/协议错/看门狗超时都是单个模型的事，仍要换候选模型
+            # （DAIR-271 P3：以前只看 status is None，把快失败的单模型问题升级成链路问题）。
+            provider_wide=bool(
+                not budget_exhausted and conn_failures and _is_link_failure(last_error)
+            ),
+        )
+
+    # ------------------------------------------------------------- Anthropic
+    def _use_anthropic(self) -> bool:
+        """要不要走 Messages API 适配层。
+
+        两个判据：``provider`` 显式声明（配置页选 Anthropic 预设），或地址本身
+        指向 Anthropic（用户手填了官方地址但没改 provider）。
+        """
+        provider = str(getattr(self.config, "provider", "") or "").strip().lower()
+        if provider in ("anthropic", "claude"):
+            return True
+        from .anthropic_adapter import is_anthropic_base
+
+        return is_anthropic_base(self.config.api_base)
+
+    @property
+    def anthropic(self) -> Any:
+        """懒加载的适配器（复用同一个 httpx 连接池）。"""
+        if self._anthropic_adapter is None:
+            from .anthropic_adapter import AnthropicAdapter
+
+            self._anthropic_adapter = AnthropicAdapter(
+                api_key=self.config.api_key,
+                base_url=self.config.api_base,
+                timeout=self.config.timeout,
+            )
+        return self._anthropic_adapter
+
+    def _anthropic_once(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | dict[str, Any] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        on_delta: Any = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        """单次 Anthropic 调用，结果包成与 OpenAI 路径等价的 ``LLMResponse``。"""
+        data = self.anthropic.complete(
+            messages=messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=bool(self.config.stream and not self._stream_unsupported),
+            on_delta=on_delta,
+            timeout=timeout,
+        )
+        tool_calls: list[ToolCall] = []
+        for raw in data.get("tool_calls") or []:
+            args = raw.get("arguments")
+            if not isinstance(args, dict):
+                args = {"value": args} if args not in (None, "") else {}
+            tool_calls.append(
+                ToolCall(
+                    id=str(raw.get("id") or f"call_{len(tool_calls)}"),
+                    name=str(raw.get("name") or ""),
+                    arguments=args,
+                    raw_arguments=json.dumps(args, ensure_ascii=False),
+                )
+            )
+        return LLMResponse(
+            content=str(data.get("content") or ""),
+            reasoning=str(data.get("reasoning") or ""),
+            tool_calls=tool_calls,
+            finish_reason=str(data.get("finish_reason") or "stop"),
+            usage=dict(data.get("usage") or {}),
+            model=str(data.get("model") or model),
         )
 
     # ------------------------------------------------------------------ 流式
@@ -914,6 +1095,37 @@ def _error_body(exc: Exception | None) -> str:
         if text:
             return str(text)
     return str(exc)
+
+
+def _is_link_failure(exc: Exception | None) -> bool:
+    """是不是「地址连不上」这类链路级失败（而不是单个模型的一次失败）。
+
+    只看 httpx 的 ``ConnectError`` / ``ConnectTimeout``（它们会包住
+    ``ConnectionRefusedError`` / ``socket.gaierror`` 等）；SDK 把真正的底层异常放在
+    ``__cause__`` 里，所以沿 cause/context 链走一遍。
+
+    刻意**不**算链路失败：读超时（``ReadTimeout``）、连接被重置
+    （``RemoteProtocolError``/``ReadError``）、TLS 握手错、看门狗抛的 ``TimeoutError``
+    —— 这些只能说明这个模型/这条长连接有问题，换候选模型完全可能成功（DAIR-271 P3）。
+    """
+    try:
+        import socket
+
+        import httpx
+    except Exception:  # pragma: no cover - 没装 httpx 时退回保守判断
+        return False
+    #: 真的连不上：拒连 / DNS / 建连超时。**不含** ConnectionResetError（连接被重置）
+    #: —— 那是已建立的长连接碰到坏后端，换候选模型应该能好。
+    link_types = (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError, socket.gaierror)
+    current = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, link_types):
+            return True
+        cause = current.__cause__
+        current = cause if cause is not None else current.__context__
+    return False
 
 
 def default_config_path(workspace: str | Path | None = None) -> Path:

@@ -2,6 +2,8 @@
 """Unit tests for engine LLM client backoff/routing (no network)."""
 from __future__ import annotations
 
+import pytest
+
 from gis_cli.engine.llm_client import EngineLLMClient, EngineLLMConfig
 
 
@@ -891,3 +893,184 @@ def test_vision_mode_auto_uses_model_capability():
 
         path.write_text(json.dumps({"model": "glm-5.3-flash", "vision": True}), encoding="utf-8")
         assert EngineLLMConfig.from_file(path).vision_mode == "on"
+
+
+# ---------------------------------------------- 坏配置 fail-fast（DAIR-270）
+
+
+class _ApiError(Exception):
+    """形如 openai.APIStatusError：带 status_code + 响应体。"""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status
+
+
+def _failing_client(exc: Exception):
+    class _Completions:
+        calls = 0
+
+        def create(self, **kwargs):
+            type(self).calls += 1
+            raise exc
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    return _Client()
+
+
+def _fast_client(cfg: "EngineLLMConfig", exc: Exception):
+    """把退避压到 0：只验尝试次数与「不再换模型」，不真等 3/6/12s。"""
+    client = EngineLLMClient(cfg)
+    client._client = _failing_client(exc)
+    client._backoff_delay = lambda attempt, status: 0.01
+    return client
+
+
+def test_gateway_5xx_tries_every_candidate_inside_window(monkeypatch):
+    """网关 5xx：单模型 3 次，但**不在第 2 个模型就判死**（20s 抖动窗口）。
+
+    反代 502/504 实测成串出现；只给 ~6s 窗口会把 10s 量级的抖动升级成整个 run 的
+    llm_unavailable（DAIR-271 建议 1）。
+    """
+    from gis_cli.engine import llm_client as mod
+    from gis_cli.engine.llm_client import LLMError
+
+    monkeypatch.setattr(mod, "_GATEWAY_WINDOW_SECONDS", 20.0)
+    cfg = EngineLLMConfig(model="m1", fallback_models=["m2", "m3", "m4"], api_key="x", retry_count=8)
+    client = _fast_client(cfg, _ApiError(502, "bad gateway"))
+    with pytest.raises(LLMError) as info:
+        client.chat([{"role": "user", "content": "hi"}])
+    # 4 个候选全部试过，每个 3 次；不是「2 个模型就停」
+    assert client._client.chat.completions.calls == 12, client._client.chat.completions.calls
+    assert "3 次尝试" in str(info.value), "错误文案要按实际尝试次数报"
+    assert info.value.provider_wide is True, "所有候选都 5xx → 整条链路的问题"
+
+
+def test_gateway_5xx_window_caps_candidate_sweep(monkeypatch):
+    """抖动窗口到了就停：候选再多也不该无限试下去。"""
+    from gis_cli.engine import llm_client as mod
+    from gis_cli.engine.llm_client import LLMError
+
+    monkeypatch.setattr(mod, "_GATEWAY_WINDOW_SECONDS", 0.0)
+    cfg = EngineLLMConfig(
+        model="m1", fallback_models=["m2", "m3", "m4", "m5"], api_key="x", retry_count=8
+    )
+    client = _fast_client(cfg, _ApiError(503, "gateway down"))
+    with pytest.raises(LLMError) as info:
+        client.chat([{"role": "user", "content": "hi"}])
+    assert client._client.chat.completions.calls == 3, "窗口到点后只保留当前模型的 3 次"
+    assert info.value.provider_wide is True
+
+
+def test_single_candidate_5xx_is_gateway_down():
+    """只有一个候选模型（web 配置页常见）时也要认「网关整体挂了」（DAIR-271 建议 2）。"""
+    from gis_cli.engine.llm_client import LLMError
+
+    cfg = EngineLLMConfig(model="only-model", api_key="x", retry_count=8)
+    client = _fast_client(cfg, _ApiError(503, "gateway down"))
+    with pytest.raises(LLMError) as info:
+        client.chat([{"role": "user", "content": "hi"}])
+    assert client._client.chat.completions.calls == 3
+    assert info.value.provider_wide is True, "单候选 5xx 仍要在抽取阶段收尾"
+
+
+def _sdk_connection_error(message: str = "Connection error.") -> Exception:
+    """模拟 openai 的 APIConnectionError：底层 ConnectError 挂在 __cause__ 上。"""
+    import httpx
+
+    exc = ConnectionError(message)
+    exc.__cause__ = httpx.ConnectError("[WinError 10061] 目标计算机积极拒绝")
+    return exc
+
+
+def test_connection_error_aborts_all_models():
+    """连不上 api_base（ConnectError）：候选模型共用同一个地址，换模型毫无意义。"""
+    from gis_cli.engine.llm_client import LLMError
+
+    cfg = EngineLLMConfig(model="m1", fallback_models=["m2", "m3"], api_key="x", retry_count=8)
+    client = _fast_client(cfg, _sdk_connection_error())
+    with pytest.raises(LLMError) as info:
+        client.chat([{"role": "user", "content": "hi"}])
+    assert client._client.chat.completions.calls == 2, "连接失败只重试 1 次就换链路，不换模型"
+    assert info.value.provider_wide is True
+
+
+def test_statusless_fast_failure_is_not_provider_wide():
+    """status 为空的**单模型**快失败不得升级成链路问题（DAIR-271 P3）。
+
+    读超时/连接被重置/协议错都没有 status；以前只看 `status is None`，两个候选各试
+    2 次就判 provider_wide，备用模型一次都不试。
+    """
+    from gis_cli.engine.llm_client import LLMError
+
+    cfg = EngineLLMConfig(
+        model="m1",
+        fallback_models=["m2", "m3", "m4", "m5", "m6", "m7", "m8"],
+        api_key="x",
+        retry_count=8,
+    )
+    client = _fast_client(cfg, TimeoutError("Request timed out."))
+    with pytest.raises(LLMError) as info:
+        client.chat([{"role": "user", "content": "hi"}])
+    assert client._client.chat.completions.calls == 16, "8 个候选各 2 次，备用模型都要试到"
+    assert info.value.provider_wide is False, "超时只是这个模型不行，不能首轮收尾整个 run"
+
+
+def test_reset_connection_is_not_provider_wide():
+    """连接被重置（RemoteProtocolError）同样只算单模型问题，继续换候选。"""
+    from gis_cli.engine.llm_client import LLMError
+
+    cfg = EngineLLMConfig(model="m1", fallback_models=["m2"], api_key="x", retry_count=8)
+    client = _fast_client(cfg, ConnectionResetError("connection reset by peer"))
+    with pytest.raises(LLMError) as info:
+        client.chat([{"role": "user", "content": "hi"}])
+    assert info.value.provider_wide is False
+    assert client._client.chat.completions.calls == 4, "两个候选各试 2 次"
+
+
+def test_auth_error_fails_fast_without_other_models():
+    """401/403：同一个 key 对所有模型都一样，一次都不多试。"""
+    from gis_cli.engine.llm_client import LLMError
+
+    cfg = EngineLLMConfig(model="m1", fallback_models=["m2"], api_key="bad", retry_count=8)
+    client = _fast_client(cfg, _ApiError(401, "invalid api key"))
+    with pytest.raises(LLMError) as info:
+        client.chat([{"role": "user", "content": "hi"}])
+    assert client._client.chat.completions.calls == 1
+    assert info.value.provider_wide is True
+    assert info.value.status_code == 401
+
+
+def test_model_level_error_still_falls_back():
+    """404（模型名不存在）是单模型问题：仍要换候选模型，别被 fail-fast 误伤。"""
+    from types import SimpleNamespace
+
+    from gis_cli.engine.llm_client import EngineLLMConfig
+
+    cfg = EngineLLMConfig(model="missing-model", fallback_models=["good-model"], api_key="x")
+
+    class _Completions:
+        def create(self, **kwargs):
+            if kwargs["model"] == "missing-model":
+                raise _ApiError(404, "model not found")
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok", reasoning_content=None, tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    client = EngineLLMClient(cfg)
+    client._client = _Client()
+    response = client.chat([{"role": "user", "content": "hi"}])
+    assert (response.content, response.model) == ("ok", "good-model")

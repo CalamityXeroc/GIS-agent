@@ -134,6 +134,53 @@ def test_loop_ask_user_pauses(tmp_path: Path):
     assert state.status == "awaiting_user"
 
 
+def test_request_stop_skips_remaining_tools_in_turn(tmp_path: Path):
+    """B4：停止后**同一轮内**的剩余动作也不再发起（不再产生 tool_call）。
+
+    以前只在下一轮开头看 status：模型一轮里发了两个工具，点了停止照样逐个执行
+    （实测：停止后仍继续 execute_code，run 要等当前工具返回才变 stopped）。
+    """
+    first = {"items": [{"id": "t1", "title": "第一步", "status": "running"}]}
+    second = {"items": [{"id": "t2", "title": "停止后不该跑", "status": "running"}]}
+    loop, llm = _make_loop(
+        tmp_path,
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(id="c_1", name="update_tasklist", arguments=first, raw_arguments=json.dumps(first)),
+                    ToolCall(id="c_2", name="update_tasklist", arguments=second, raw_arguments=json.dumps(second)),
+                ],
+                model="mock",
+            )
+        ],
+    )
+    ran: list[str] = []
+
+    def _on_event(event: str, payload: dict) -> None:
+        if event == "tool_result":
+            ran.append(str(payload.get("tool")))
+            loop.request_stop("用户中断")  # 模拟 web 停止按钮（另一个线程调）
+
+    loop.on_event = _on_event
+    state = loop.run("测试停止语义")
+
+    assert state.status == "stopped"
+    assert "用户停止（跳过后续工具" in state.error
+    assert ran == ["update_tasklist"], "停止后仍执行了同一轮的剩余动作"
+    assert llm.calls == 1, "停止后不该再请求模型"
+
+    events = [
+        json.loads(line)
+        for line in loop.recorder.jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    names = [item["event"] for item in events]
+    assert names.count("tool_call") == 1
+    assert names[-2:] == ["stop_requested", "run_end"], names[-4:]
+    assert events[-1]["payload"]["status"] == "stopped"
+    assert "用户停止（跳过后续工具" in events[-1]["payload"]["error"]
+
+
 def test_loop_stops_gracefully_when_llm_unavailable(tmp_path: Path):
     """Gateway outage must not crash the runner; status becomes llm_unavailable."""
     class DownLLM:
@@ -479,3 +526,45 @@ def test_tool_result_trace_carries_quality(tmp_path: Path):
     assert quality["deductions"] == ["aprx_map_check"]      # 只留名字，不带 reason
     assert quality["unmeasured"] == []                      # 没有“读不到量”的项
     assert "布局缺少" not in json.dumps(quality, ensure_ascii=False)
+
+
+def test_provider_wide_error_aborts_before_main_loop(tmp_path: Path):
+    """坏配置（连接失败/鉴权）：需求抽取就判不可用，不再进主循环白烧内核预热。
+
+    DAIR-257：坏 api_base 起 run 要 692s 才报错，其中包含 8×N 次重试 + 一整台
+    内核预热（16.5s）等一个必然失败的 run 收尾。首轮就确认链路不可用时必须直接收尾。
+    """
+    from gis_cli.engine.llm_client import LLMError
+
+    class DownLLM:
+        class _Cfg:
+            model = "mock"
+
+        config = _Cfg()
+        calls = 0
+
+        def chat(self, messages, **kwargs):
+            type(self).calls += 1
+            raise LLMError(
+                "All models failed. Last error: Error code: 502",
+                status_code=502,
+                provider_wide=True,
+            )
+
+    loop, _ = _make_loop(tmp_path, [])
+    loop.llm = DownLLM()
+    loop.codec.client = DownLLM()
+    loop.auto_extract_requirements = True
+
+    state = loop.run("坏配置任务")
+
+    assert state.status == "llm_unavailable"
+    assert "不可用" in state.error
+    assert DownLLM.calls == 1, "确认链路不可用后不该再发起第二轮调用"
+    trace = next((tmp_path / "traces").glob("*.jsonl"))
+    names = [
+        json.loads(line)["event"]
+        for line in trace.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert names == ["run_start", "llm_error", "run_end"], names

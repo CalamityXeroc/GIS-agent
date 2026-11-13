@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>GIS Agent 控制台</title>
+    <script>
+      // 首屏前定主题：避免深色模式下闪一帧白底。
+      ;(function () {
+        try {
+          var saved = localStorage.getItem('gis-agent-theme')
+          var dark =
+            saved === 'dark' ||
+            (saved !== 'light' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.classList.toggle('dark', dark)
+        } catch (e) {
+          /* localStorage 被禁用时退回浅色，不阻塞渲染 */
+        }
+      })()
+    </script>
+    <script type="module" crossorigin src="/assets/index-D8JXF4Ic.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-f4nAxiB3.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

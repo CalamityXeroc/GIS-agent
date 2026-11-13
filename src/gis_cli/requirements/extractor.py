@@ -87,6 +87,10 @@ class RequirementExtractor:
                 temperature=0.1,
             )
         except Exception as exc:
+            if getattr(exc, "provider_wide", False):
+                # 模型层整体不可用（连不上 / 鉴权失败）：吞掉只会让主循环再原样失败一遍，
+                # 交给上层立刻收尾（DAIR-270：坏配置不得让用户干等）。
+                raise
             logger.warning("requirement extraction failed: %s", exc)
             return []
 

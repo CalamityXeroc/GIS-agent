@@ -109,17 +109,17 @@ run_template(
 
 ## 第二批业务模板（W4 第 3 批）
 
-四个模板都从**已有任务链反推**，步骤顺序照 `run_recipe` 的建议顺序，
+四个模板都从**已有的真题任务链反推**（源任务 YAML 见下），步骤顺序照 `run_recipe` 的建议顺序，
 不额外发明配方。它们全部是 `backend: [arcpy]` 且**如实声明**：不是懒省事，而是链上确实有
 arcpy-only 的配方（转点、排名筛选、Gi*、`.aprx` 工程、普查加权、相似度排序）。
 把 `backend` 写成 `[arcpy, gdal]` 会让 GDAL-only 机器跑到一半才炸——这正是本批要避免的。
 
-| 模板 | 业务问题 |
-|---|---|
-| `public_service_value_rank` | 社区的绿地服务价值（服务人口 / 绿地面积）谁高谁低，前后 N 名是谁 |
-| `map_quality_eval` | 评价结果直接能交付成图吗（分类设色 JPG + 可编辑工程） |
-| `city_hotspot_aggregate` | 区县人口汇总到地市后，逐年人口热点/冷点在哪 |
-| `census_indicator_similarity` | 普查三项指标的空间格局，哪个地市与参照城市最像 |
+| 模板 | 源任务 | 业务问题 |
+|---|---|---|
+| `public_service_value_rank` | `benchmark/tasks/pm_task2b_service_value_rank.yaml` | 社区的绿地服务价值（服务人口 / 绿地面积）谁高谁低，前后 N 名是谁 |
+| `map_quality_eval` | `benchmark/tasks/pm_task2c_map_eval_communities.yaml` | 评价结果直接能交付成图吗（分类设色 JPG + 可编辑工程） |
+| `city_hotspot_aggregate` | `benchmark/tasks/am_task3a_city_aggregate_hotspot.yaml` | 区县人口汇总到地市后，2011–2013 年人口热点/冷点在哪 |
+| `census_indicator_similarity` | `benchmark/tasks/am_task3b_census_indicators_similarity.yaml` | 普查三项指标的空间格局，哪个地市与参照城市最像 |
 
 ### `public_service_value_rank` —— 服务价值排序
 

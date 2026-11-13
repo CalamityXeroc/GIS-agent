@@ -1,77 +1,198 @@
-# Python
-__pycache__/
-*.egg-info/
-*.py[cod]
-*.pyo
-*.pyd
+# ======================
+# GIS CLI .gitignore
+# ======================
 
-# Virtual environments
-.venv/
-venv/
-env/
-
-# Runtime outputs
-outputs/
-workspace/**
-!workspace/
-!workspace/input/
-!workspace/output/
-!workspace/temp/
-!workspace/skills/
-!workspace/skills/**
-!workspace/**/.gitkeep
-.gis_agent_state/
-.gis_agent_memory/
-
-# Engine runtime state (data catalog / traces / kernels / backups)
-.gis_agent/
-**/.gis_agent/
-arcpy_engine/
-
-# GIS data & outputs (never publish user data)
-*.shp
-*.shx
-*.dbf
-*.prj
-*.cpg
-*.sbn
-*.sbx
-*.gdb/
-*.gpkg
-*.mdb
-*.tif
-*.tiff
-*.img
-*.lyrx
-*.aprx
-*.jpg
-*.jpeg
-!docs/images/*.jpg
-!docs/images/*.jpeg
-
-# Logs / temp
-*.log
-*.tmp
-*.bak
-
-# Benchmark runtime artifacts & third-party task extracts
-benchmark/runs/
-benchmark/specs/
-benchmark/reports/
-
-# Local planning/temp
-.planning/
-
-# Local config secrets
+# ----------------------
+# 敏感信息（重要！）
+# ----------------------
+# API 配置文件（包含密钥）
 config/llm_config.json
+# 同一份配置的本地备份/变体（同样含密钥，绝不能入库）
+config/llm_config.*.json
+# 配置页每次保存前的自动备份（S5）：文件里有真实 api_key，必须挡在版本库外
+config/backups/
+!config/llm_config.example.json
+!config/llm_config.json.example
+# 旧版 execution_adapter 的运行时日志（每次运行都追加，不入库）
+config/execution_adapter_history.json
+config/execution_adapter_metrics.json
 config/*.secret.json
+*.secret
+*.secret.json
+# 环境变量文件
 .env
 .env.*
 !.env.example
 
-# OS/editor
-.DS_Store
-Thumbs.db
+# API 密钥文件
+*_api_key*
+*_apikey*
+*.key
+!requirements*.txt
+
+# ----------------------
+# 参考文件和数据（不需要上传）
+# ----------------------
+claude-code-sourcemap-main
+数据/
+A上午试题.pdf
+ArcGIS-Pro-Bridge-MCP-Server-main
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ----------------------
+# 虚拟环境
+# ----------------------
+.venv/
+# GDAL 栈单独一个 venv（pandas/rasterio 装不进开发 venv，也不该装进去）
+.venv-gdal/
+venv/
+ENV/
+env/
+.env/
+
+# ----------------------
+# 前端（web/）：源码与 package-lock 入库，依赖与本地构建产物不入库；
+# 构建产物落到 src/gis_cli/web/static/，那份**要**入库。
+# ----------------------
+web/node_modules/
+web/dist/
+# 上面 Python 段的 `lib/` 会把 web/src/lib/ 整目录忽略（新增文件 add 不进去）
+!web/src/lib/
+
+# ----------------------
+# IDE / 编辑器
+# ----------------------
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ----------------------
+# 测试 / 覆盖率
+# ----------------------
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# ----------------------
+# 临时文件
+# ----------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.old
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# 输出文件
+# ----------------------
+outputs/
+output/
+*.pdf
+*.png
+!docs/*.png
+
+# ----------------------
+# 数据文件（可能较大）
+# ----------------------
+数据/
+data/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.gdb/
+*.mdb
+*.gpkg
+
+# 工作区数据（用户数据，不上传）
+workspace/input/*
+workspace/output/*
+workspace/temp/*
+# 成果展示：只保留轻量成品图与说明；基准运行的过程库/结果库（GDB，可达数百 MB）不入库
+workspace/成果展示/基准产出/
+workspace/成果展示/第14届真题实测/*/result_data.gdb/
+workspace/成果展示/第14届真题实测/*/temp_data.gdb/
+workspace/.gis_agent/
+# ArcGIS 打开工程/数据时自动生成的噪声（缩略图索引、辅助元数据、默认工具箱）
+workspace/成果展示/**/Index/
+workspace/成果展示/**/*.aux.xml
+workspace/成果展示/**/Blank.atbx
+!workspace/成果展示/**/*.png
+# 保留工作区结构
+!workspace/input/.gitkeep
+!workspace/output/.gitkeep
+!workspace/temp/.gitkeep
+!workspace/README.md
+
+# ----------------------
+# 测试输出
+# ----------------------
+test_output*.txt
+response_*.txt
+
+# ----------------------
+# 本地配置
+# ----------------------
+.gis-cli/
+*.local.json
+*.local.yaml
+
+# ----------------------
+# 其他
+# ----------------------
+*.pdf
+!docs/*.pdf
+
+# benchmark runtime artifacts
+benchmark/runs/
+*.log.tmp
+
+# local tooling & third-party copyrighted extracts (do not publish)
+.codegraph/
+.codex/
+.claude/
+benchmark/specs/
+glm_*.json
+ds_*.json
+
+# 引擎运行态（数据目录/轨迹/内核/备份）与临时工作区
+.gis_agent/
+.gis_agent_state/
+.gis_agent_memory/
 .tmp_distill*/
