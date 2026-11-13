@@ -68,6 +68,8 @@ MANIFEST
 .venv/
 # GDAL 栈单独一个 venv（pandas/rasterio 装不进开发 venv，也不该装进去）
 .venv-gdal/
+# 本地跑 CI 自检用的干净 venv（scripts/ci_local.ps1）
+.ci_venv/
 venv/
 ENV/
 env/
