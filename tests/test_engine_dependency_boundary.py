@@ -136,7 +136,7 @@ def test_ci_workflow_exists_and_excludes_arcpy():
     # 依赖必须从 pyproject 装（`-e .`），不能手工维护一份清单：
     # 以前 CI 手写过 `pip install typer pydantic rich ...`，删掉 langchain 后
     # pyyaml 变成显式依赖却没人更新它，CI 直接 ModuleNotFoundError（实测）。
-    assert "-e ." in text or '-e ".[dev]"' in text, "CI 必须从 pyproject 装依赖"
+    assert "-e ." in text or '-e ".[dev' in text, "CI 必须从 pyproject 装依赖"
     # 只看真正的命令行（注释里提到旧清单不算）
     install_lines = [
         l.strip() for l in text.splitlines()

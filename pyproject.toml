@@ -29,6 +29,12 @@ dependencies = [
   # 装上；而当前开发 venv 里其实根本没装 langchain —— 等于一直在赌。
   # 删掉重包后会直接 ImportError，新引擎起不来。
   "pyyaml>=6.0.1",
+  # httpx 是**直接** import 的，不能赌 openai 的传递依赖：
+  # web 配置页的「测试连接」(`config_api._probe_models`) 和
+  # `llm_client._is_link_failure` 都 `import httpx`。实测 openai 3.50 的
+  # 依赖里已经不含 httpx，干净环境装完 [dev] 后 8 个 /api/config/test 用例
+  # 全红（2026-11-13 CI 实测）。
+  "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
