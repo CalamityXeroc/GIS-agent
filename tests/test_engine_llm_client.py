@@ -314,7 +314,10 @@ def test_model_cooldown_escalates_on_repeat_failures():
     for _ in range(10):
         client._record_failure("m", LLMError("conn", status_code=None))
     cap = client._cooldown_until["m"] - _t.monotonic()
-    assert cap <= 1000.0, cap
+    # 容差：cooldown 存的是 "monotonic() + seconds"，减回来必然有 float 舍入
+    # （CI 上实测 1000.0000000000001，本机偶尔是 999.999...）。断言的是"封顶值"，
+    # 不该被 1e-13 的舍入搞红。
+    assert cap <= 1000.0 + 1e-6, cap
     client._record_success("m")
     assert client._cooldown_until == {} and client._cooldown_strikes == {}
 
