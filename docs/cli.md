@@ -251,7 +251,7 @@ workspace/skills/docx/
 PYTHONPATH=src python -m pytest tests/test_ui_render.py tests/test_ui_session.py tests/test_ui_session_store.py -q
 
 # 输入框与交互全流程（需要 prompt_toolkit，用 ArcGIS 解释器）
-PYTHONPATH=src "E:\ArcGISPro3.6\bin\Python\envs\arcgispro-py3\python.exe" -m pytest tests/test_ui_prompt.py tests/test_ui_chat_flow.py -q
+PYTHONPATH=src "E:\ArcGISPro3.7\bin\Python\envs\arcgispro-py3\python.exe" -m pytest tests/test_ui_prompt.py tests/test_ui_chat_flow.py -q
 
 # 只看样式效果
 PYTHONPATH=src python scripts/preview_ui.py --no-color --width 96

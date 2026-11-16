@@ -2,6 +2,8 @@
 
 面向 ArcGIS Pro 工作流的通用 GIS 任务求解平台脚手架。
 
+已适配 **ArcGIS Pro 3.7**（Pro 3.7.0.1901 / Python 3.13，真机实测通过），并保留 **3.6** 兼容；解释器与制图样式目录都按实际安装自动发现，不写死安装路径。
+
 ## 架构概览
 
 单一引擎：**有界观察-决策-执行循环** + 原生 tool calling + 代码自修复 + 强制验收。
@@ -329,6 +331,13 @@ gis-agent web --stop       # 停掉后台面板
 ## 直接出图 / 自动化 ArcGIS Pro（推荐）
 
 如果你希望输出真实 GIS 成果（如 `.gdb`、地图导出 JPG/PNG），请使用 ArcGIS Pro Python 环境。
+
+> **版本说明（3.7 / 3.6）**
+>
+> - Pro **3.7** 已真机实测通过：`gis-agent doctor --deep` 7 项全过，全量 `pytest -m "not arcpy"` 0 failed，`CalculateField` / 持久内核 / 制图导出均正常（Pro 3.7 自带 Python 3.13）。
+> - 解释器发现是多级回退：注册表四值 → 已知安装目录一层扫描 → `ARCGIS_PRO_PYTHON` 覆盖；`ARCGIS_PRO_PYTHON` 指到 `propy.bat` 时也会先探活再采用，不会把 `.bat` 直接丢给子进程。多版本并存时按版本降序取最高版。
+> - 3.7 把图例样式改了名（3.6 的 `图例 1..6` → 3.7 的 `中心标题图例` / `手动列图例` / `透明背景图例` 等），`config/cartography_styles.json` 已按 3.7 重生成，同时**保留 3.6 关键字**，两个版本都能出图。
+> - 换机器或重装 Pro 后若遇到 `ERROR 000574: 未安装 Python`，那是 Pro 自身的 Python 运行时注册没跟上（`HKLM\SOFTWARE\ESRI\ArcGISPro` 的 `PythonCondaRoot` 仍指向已删除的旧目录），不是本项目的代码问题：改注册表这两项，或用 `ARCGIS_PRO_PYTHON` 指向 `...\ArcGISPro3.7\bin\Python\envs\arcgispro-py3\python.exe`。
 
 1. 先检查 ArcPy 环境：
 
