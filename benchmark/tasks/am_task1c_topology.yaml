@@ -1,0 +1,38 @@
+id: am_task1c_topology
+name: AM 任务一(c) · 拓扑重叠修复并保留属性（子任务，分钟级）
+source: B上午
+prompt: |
+  完成拓扑检查与修复，不要做其他事（所有产出必须放在 workspace/output/ 下）：
+  1. 将 county.shp 真实投影到 CGCS2000 6 度带高斯-克吕格 CM 111E（EPSG:4508），
+     结果写入 workspace/output/result_data.gdb/county。
+  2. 对该 county 做拓扑检查，找出重叠/重复的面要素。注意：应聚焦“同一关键字段
+     （code）下的重复记录”，从每组重复中保留面积最大的一个、其余删除；
+     不要做全局传递性合并（A 与 B 重叠、B 与 C 重叠就把 A/C 也连成一组），那会误删大量
+     正常要素。结果写入 workspace/output/result_data.gdb/county_1。
+  3. 必须完整保留原始属性字段（至少 name、code），不允许只留几何。
+  完成后说明你用了什么判定方法、删除了几个要素。
+inputs:
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/county.shp"
+requirements:
+  - id: r1
+    text: county 投影到 EPSG:4508 入库
+    acceptance: WKID=4508，要素数 385
+  - id: r2
+    text: 找出重叠面并删除冗余，结果 county_1
+    acceptance: 要素数应在 380-384 之间（参考解 382），且无残余重叠
+  - id: r3
+    text: 修复结果必须保留原始属性字段
+    acceptance: county_1 含 name、code 字段
+assertions:
+  - type: vector_exists
+    path: "output/result_data.gdb/county_1"
+  - type: crs_wkid
+    path: "output/result_data.gdb/county_1"
+    value: 4508
+  - type: fields_present
+    path: "output/result_data.gdb/county_1"
+    value: ["name", "code"]
+  - type: feature_count_between
+    path: "output/result_data.gdb/county_1"
+    value: [380, 384]
+timeout_seconds: 1500

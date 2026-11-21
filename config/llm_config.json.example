@@ -1,0 +1,71 @@
+{
+  "_comment": "这是配置文件示例，复制为 llm_config.json 并填入你的 API 信息",
+  "model": "Pro/zai-org/GLM-5",
+  "api_key": "YOUR_API_KEY_HERE",
+  "api_base": "https://api.siliconflow.cn/v1",
+  "temperature": 0.5,
+  "max_tokens": 2048,
+  "timeout": 60,
+  "provider": "siliconflow",
+  "enable_prompt_optimizer": true,
+  "enable_baml_standardizer": true,
+  "provider_models": {
+    "siliconflow": ["Qwen/Qwen2.5-7B-Instruct", "Pro/zai-org/GLM-5"],
+    "openai": ["gpt-4o-mini"]
+  },
+  "routing_rules": {
+    "planning": ["Qwen/Qwen2.5-7B-Instruct"],
+    "intent": ["gpt-4o-mini"]
+  },
+  "baml_functions": {
+    "planning": ["generate_gis_plan"],
+    "intent": ["infer_gis_intent"],
+    "task_refine": ["refine_gis_task"],
+    "recovery": ["suggest_gis_recovery"]
+  },
+  "enable_baml_preflight": true,
+  "baml_preflight_strict": false,
+  "baml_required_capabilities": ["intent", "task_refine", "planning", "recovery"],
+  "enable_baml_builtin_fallback": true,
+  
+  "_providers": {
+    "siliconflow": {
+      "api_base": "https://api.siliconflow.cn/v1",
+      "models": [
+        "Pro/zai-org/GLM-5",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "deepseek-ai/DeepSeek-V3"
+      ]
+    },
+    "openai": {
+      "api_base": "https://api.openai.com/v1",
+      "models": ["gpt-4", "gpt-3.5-turbo"]
+    },
+    "local": {
+      "api_base": "http://localhost:11434",
+      "models": ["llama2", "qwen"]
+    }
+  },
+
+  "engine": {
+    "subagent_enabled": false,
+    "subagent_max_per_run": 3,
+    "subagent_max_turns": 30,
+    "subagent_timeout_seconds": 900,
+    "subagent_exec_timeout_seconds": 300,
+    "subagent_result_max_chars": 4000,
+    "review_enabled": false,
+    "review_max_per_run": 1,
+    "review_max_turns": 20,
+    "review_timeout_seconds": 600,
+    "review_exec_timeout_seconds": 300,
+    "review_block_on_fail": false,
+    "review_require_before_finish": true,
+    "_comment_review": "分析正确性双复核（P1-5 / W5）：复核 subagent 只看数据+结论、不看主轨迹，配守恒/拓扑/量纲断言。默认关——W5 的 token 会翻倍，只在交付级任务开。交付级 benchmark 任务可用 YAML 的 review: true 按任务打开；review_block_on_fail=true 才会阻断 finish。见 docs/review.md。",
+    "_comment_subagent": "子代理（delegate）：把自包含子任务放进独立对话，只回结构化结论。默认关——每个子代理多一份 system prompt（约 1.5~2 万 token/轮），拆 3 步的小活儿反而更贵。见 docs/subagent.md。",
+    "vision_mode": "auto",
+    "_comment_vision": "识图：auto（按模型名判断，默认，看不见图就不附图）/ on（强制附）/ off（强制不附）。上游对看不见图的模型通常不报错（实测 glm-5.3-flash 静默收下图片），只会白烧 token 并让模型分心解释“我看不到图”。图面质检开关是另一个键 vision_check（warn|block|off）。",
+    "reasoning_effort": "",
+    "_comment_reasoning_effort": "思考档位（minimal/low/medium/high/xhigh/max），部分推理模型不传就没有思考内容。留空则不传该字段；换到不认此参数的网关时必须留空。"
+  }
+}

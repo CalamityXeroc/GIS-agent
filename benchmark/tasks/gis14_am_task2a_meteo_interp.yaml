@@ -1,0 +1,120 @@
+id: gis14_am_task2a_meteo_interp
+name: 第14届（2025）上午 任务二a · 气象站清洗与温降栅格插值（含精度检验）
+source: A上午
+carry_from: gis14_am_task1_animal_points
+prompt: |
+  继续本工作区的工作。上一步已经把野生动物观测点清洗、投影到 UTM 10N，并在
+  output/result_data.gdb/study_area 里给出了研究区矩形（包络矩形外扩 2 km，投影坐标系）。
+  若该图层不在（例如单独重跑本任务），用 input/study_area.shp（同一坐标系、单个矩形面）
+  导入后再继续——本任务必须能独立跑通，不能只依赖上一步的残留。
+  若工作区有 .gis_agent/PROJECT_LOG.md，先读它了解口径，不要重复劳动。
+
+  本步处理气象数据：input/ 下有 Meteorological_sampling.csv（GBK 编码）。注意该文件
+  经 Excel 转存过，结构有坑：用标准 csv.reader（逗号分隔）读取，坐标里的逗号会把
+  一行拆成 2 个元素——先把整行用 ','.join(row) 拼回，再按制表符 '\t' 拆成 3 列
+  （pre_mm / tmp_k / 坐标）。坐标是度分秒文本，形如 124° 31' 50.5200″ W, 41° 30' 8.4800″ N
+  （经度在前、逗号后是纬度），解析前先去掉残留的双引号字符。
+  实测 1549 条记录这样全部可解析。
+
+  请完成任务（所有产出写到 workspace/output）：
+
+  1. 气象站数据清洗，得到点图层 output/result_data.gdb/meteo_points，字段：
+     - PRE_MM（双精度，年均降雨量 mm）
+     - TMP_C（双精度，年均温度，摄氏度——原始数据是开尔文，需按 K = ℃ + 273.15 换算）
+     - LON、LAT（双精度，十进制度）
+     清洗要求：完全重复的记录去重；温度明显不合理（开尔文不在 200~330 K 区间，例如出现负值或
+     五六百 K）的记录剔除；与动物点位一样，纬度在南半球 / 经度在 85°W 附近的整块错误记录剔除；
+     经度半球符号写成 E 但量级与主体群一致（约 124.x°）的纠正为西经。
+     并把清洗结果（原始多少条、去重多少条、温度超界多少条、错误区域多少条、最终多少条）
+     写进 output/清洗报告.md（若文件已存在则追加一节，不要覆盖原有内容）。
+     最后把点图层投影到与分析一致的平面坐标系（UTM 10N，与前一步相同）。
+
+  2. 用清洗后的站点插值生成研究区范围内的年平均温度栅格与年均降雨栅格：
+     - 输出 output/result_data.gdb/tmp_raster（单位 ℃）与 output/result_data.gdb/pre_raster（单位 mm）
+     - 插值方法自行选择（可用工具的 interpolate_surface 配方，IDW / Kriging / Spline 均可）
+     - 栅格必须裁切到研究区范围内（用 study_area 做掩膜）
+     - **自行选择并说明栅格分辨率**（说明为什么选这个分辨率）
+     - 温度插值**必须做精度检验**：随机保留 10% 的站点不参与插值（作为检核点），
+       用其余站点插值后，在检核点上计算中误差 m = ±sqrt(ΣΔ²/n)（Δ = 插值值 − 实测值），
+       要求温度中误差不超过 0.5 ℃；把中误差数值、检核点数、以及你所选的插值方法与参数
+       写进 output/插值精度.md。若中误差超过 0.5，请调整参数（如幂次/搜索邻域）重做，直到达标，
+       并把最终采用的参数与结果写进报告。
+
+  完成后请说明：清洗后多少个站点、温度（℃）与降雨（mm）的取值范围、所选插值方法与分辨率、
+  温度插值中误差是多少、两个栅格的路径。
+inputs:
+  - source: "E:/GIS_documents/小火的竞赛资料/14第十四届全国大学生GIS应用技能大赛/14第十四届全国大学生GIS应用技能大赛/A上午/A上午/data/气象数据/Meteorological_sampling.csv"
+  # 自洽兜底：单独重跑本任务时 study_area 不存在，用它顶上（与 task2b 同一做法）
+  - source: "workspace/input/第14届真题数据/study_area.shp"
+requirements:
+  - id: r1
+    text: 气象站清洗（去重/温度超界剔除/错误区域剔除/半球纠正）+ 单位换算
+    acceptance: meteo_points 存在，TMP_C 在 -15~0 ℃ 之间，站点数约 1500
+  - id: r2
+    text: 温度与降雨插值栅格（裁切到研究区）
+    acceptance: tmp_raster / pre_raster 存在且非常量，范围落在研究区内
+  - id: r3
+    text: 温度插值精度检验（10% 检核点，中误差 ≤ 0.5 ℃）
+    acceptance: output/插值精度.md 存在且记录了中误差
+assertions:
+  - type: vector_exists
+    path: "output/result_data.gdb/meteo_points"
+  - type: fields_present
+    path: "output/result_data.gdb/meteo_points"
+    value: ["PRE_MM", "TMP_C", "LON", "LAT"]
+  - type: crs_wkid_in
+    path: "output/result_data.gdb/meteo_points"
+    value: [32610, 26910]
+  - type: feature_count_between
+    path: "output/result_data.gdb/meteo_points"
+    value: [1380, 1530]
+  - type: field_stats_between
+    path: "output/result_data.gdb/meteo_points"
+    field: "TMP_C"
+    stat: "min"
+    value: [-15.0, -8.0]
+  - type: field_stats_between
+    path: "output/result_data.gdb/meteo_points"
+    field: "TMP_C"
+    stat: "max"
+    value: [-6.6, -6.45]
+  - type: field_stats_between
+    path: "output/result_data.gdb/meteo_points"
+    field: "PRE_MM"
+    stat: "mean"
+    value: [70.0, 100.0]
+  - type: raster_not_constant
+    path: "output/result_data.gdb/tmp_raster"
+  - type: raster_stat_between
+    path: "output/result_data.gdb/tmp_raster"
+    stat: "min"
+    value: [-16.0, -7.0]
+  - type: raster_stat_between
+    path: "output/result_data.gdb/tmp_raster"
+    stat: "max"
+    value: [-10.0, -7.0]
+  - type: raster_not_constant
+    path: "output/result_data.gdb/pre_raster"
+  - type: raster_stat_between
+    path: "output/result_data.gdb/pre_raster"
+    stat: "min"
+    value: [40.0, 80.0]
+  - type: bbox_between
+    path: "output/result_data.gdb/tmp_raster"
+    value:
+      xmin: [323000, 340000]
+      ymin: [4531000, 4545000]
+      xmax: [345000, 363000]
+      ymax: [4585000, 4600000]
+  - type: deliverable_hygiene_ok
+    path: "output"
+    value:
+      max_duplicate_families: 0
+      forbid_suffixes: [".pkl", ".tmp", ".bak"]
+      warn_temp_result_ratio: 5
+  - type: file_exists
+    path: "output/插值精度.md"
+  - type: file_contains
+    path: "output/插值精度.md"
+    value: "中误差"
+timeout_seconds: 3000

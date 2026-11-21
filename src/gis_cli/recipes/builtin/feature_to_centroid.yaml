@@ -1,0 +1,66 @@
+id: feature_to_centroid
+name: 要素转点（几何中心）
+description: 把面要素转成几何中心点（可保留原属性），用于制作社区/街区中心点、后续缓冲或点采样。
+domain: geometry
+category: geometry
+triggers: [要素转点, 中心点, centroid, 几何中心, 面转点]
+preconditions:
+  - 输入为面要素
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入面要素
+  output_path:
+    type: string
+    required: true
+    description: 输出点要素
+  location:
+    type: string
+    default: "CENTROID"
+    description: 点位位置，CENTROID（几何中心）/ INSIDE（保证落在面内）
+steps:
+  - 校验面要素
+  - FeatureToPoint
+  - 返回点数
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  location = {{location}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  if arcpy.Describe(input_path).shapeType != "Polygon":
+      raise ValueError("要素转点需要面要素输入")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.management.FeatureToPoint(input_path, output_path, location)
+  count = int(arcpy.management.GetCount(output_path)[0])
+  in_count = int(arcpy.management.GetCount(input_path)[0])
+  if count == 0:
+      raise ValueError("转换结果为空，请检查输入几何是否有效")
+  set_result({"output": output_path, "feature_count": count, "input_count": in_count, "location": location})
+  print(f"FeatureToPoint done: {count} points (from {in_count} polygons)")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - CENTROID 对凹形面可能落在面外；需要点必在面内时用 INSIDE。
+  - 点数应等于输入面数（多部件面会按面计），不等时要说明原因。
+examples:
+  - "社区面转中心点，用于做 500 米缓冲区服务范围"
+  - "街道中心点标注"

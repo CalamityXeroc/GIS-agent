@@ -1,0 +1,77 @@
+id: terrain_derivatives
+name: 地形派生（坡度/坡向/山体阴影）
+description: 由 DEM 生成坡度、坡向或山体阴影栅格，用于地形分析、选址与制图底图。
+domain: raster
+category: raster
+triggers: [坡度, 坡向, 山体阴影, hillshade, slope, aspect, 地形]
+preconditions:
+  - DEM 为投影坐标系（平面单位与高程单位一致）
+params:
+  dem_path:
+    type: string
+    required: true
+    description: DEM 栅格
+  output_path:
+    type: string
+    required: true
+    description: 输出栅格
+  kind:
+    type: string
+    default: "SLOPE"
+    description: SLOPE 坡度(度) / ASPECT 坡向(度) / HILLSHADE 山体阴影
+  z_factor:
+    type: number
+    default: 1
+    description: 高程缩放因子
+steps:
+  - 校验 DEM
+  - 生成派生栅格
+  - 返回值域
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  dem_path = {{dem_path}}
+  output_path = {{output_path}}
+  kind = str({{kind}}).upper()
+  z_factor = float({{z_factor}})
+
+  if not arcpy.Exists(dem_path):
+      raise ValueError(f"DEM 不存在: {dem_path}")
+  sr = arcpy.Describe(dem_path).spatialReference
+  if sr.type == "Geographic":
+      raise ValueError("地形分析需要投影坐标系（平面单位与高程单位一致），请先投影 DEM")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  if kind == "SLOPE":
+      out = arcpy.sa.Slope(dem_path, "DEGREE", z_factor)
+  elif kind == "ASPECT":
+      out = arcpy.sa.Aspect(dem_path)
+  elif kind == "HILLSHADE":
+      out = arcpy.sa.Hillshade(dem_path, 315, 45, "NO_SHADOWS", z_factor)
+  else:
+      raise ValueError(f"kind 只支持 SLOPE/ASPECT/HILLSHADE，收到 {kind}")
+  out.save(output_path)
+
+  r = arcpy.Raster(output_path)
+  set_result({"output": output_path, "kind": kind, "min": r.minimum, "max": r.maximum,
+              "cell_size": r.meanCellWidth})
+  print(f"Terrain {kind} done: range={r.minimum}~{r.maximum}")
+validation:
+  - type: raster_exists
+    path: "{{output_path}}"
+  - type: raster_not_constant
+    path: "{{output_path}}"
+pitfalls:
+  - DEM 为地理坐标系时坡度会按度计算，结果错误。
+  - 坡度单位默认度（0-90），坡向为 0-360 度。
+examples:
+  - "由 DEM 生成坡度图"

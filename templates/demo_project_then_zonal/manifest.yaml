@@ -1,0 +1,46 @@
+id: demo_project_then_zonal
+name: 演示：先投影，再分区统计
+description: >-
+  玩具模板：把分区面投影到目标坐标系，再用栅格做分区统计。只用来验证模板机制
+  （配方链、参数绑定、断言集），不含任何业务口径，也不是可直接交付的分析。
+version: "1.0"
+# 只声明 arcpy：分区统计的表格版两端输出格式不通用（arcpy 写 .dbf/.gdb 表，
+# GDAL 只写 .csv/.gpkg），同一条链没有两边都能用的输出格式。GDAL-only 机器上
+# 这个模板会在预检阶段明确报「需 ArcGIS」，不会跑到第二步才炸。
+backend: [arcpy]
+
+data:
+  zones:
+    type: vector
+    required: true
+    purpose: 分区面（行政区/社区边界）
+  population_raster:
+    type: raster
+    required: true
+    purpose: 数值栅格（如人口栅格）
+  target_srid:
+    type: integer
+    required: false
+    default: 4527
+    purpose: 目标投影 EPSG/WKID（默认 4527）
+
+pipeline:
+  - id: project
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.zones
+      output_path: $out/zones_projected.shp
+      target_srid: $data.target_srid
+  - id: zonal
+    recipe_id: zonal_statistics
+    params:
+      zone_path: $steps.project.output
+      raster_path: $data.population_raster
+      output_table: $out/zonal.dbf
+      statistics: SUM
+
+assertions:
+  - type: file_exists
+    path: $out/zones_projected.shp
+  - type: file_exists
+    path: $steps.zonal.output

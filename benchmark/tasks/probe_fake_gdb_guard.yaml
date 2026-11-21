@@ -1,0 +1,77 @@
+id: probe_fake_gdb_guard
+name: 探针 · 假 .gdb 拦截守卫（正/反斜杠双路 + 清理豁免）
+source: DAIR-12 探针（复审四断言 a-d 的活 agent 回归）
+prompt: |
+  这是一个针对"假 .gdb 拦截守卫"的回归探针任务，不需要任何输入数据。
+  请严格按步骤用 execute_code 逐步执行——**每一步单独一段代码，不要把多个步骤合并进
+  同一段代码**，并如实记录每步的实际结果（被拦就是被拦，不要跳过或绕过步骤）。
+  所有路径都用工作区相对路径，全程只在 output/ 下操作。
+
+  ## 第一步：用 os.makedirs 建两个假库（先建，后面才可能触发拦截）
+  - os.makedirs("output/fake_a.gdb", exist_ok=True)（正斜杠写法）
+  - os.makedirs(r"output\fake_b.gdb", exist_ok=True)（反斜杠原始字符串写法）
+
+  ## 第二步：分别往两个"已存在的假库"里写要素类（预期被守卫拦截）
+  - 一段代码：往 "output/fake_a.gdb/probe_pts" 写一个点要素类（arcpy，正斜杠路径）
+  - 另一段代码：往 r"output\fake_b.gdb\probe_pts" 写一个点要素类（arcpy，反斜杠路径）
+  - 预期：两段都会在执行前被拦（FakeGdbPath，提示它是普通目录假 .gdb）。
+    被拦后不要自行改用别的写法硬写，按收到的 hint 走第三步。
+
+  ## 第三步：按 hint 清理假库并建真库（清理意图必须放行、不被拦）
+  - 一段代码：shutil.rmtree("output/fake_a.gdb")，然后
+    arcpy.management.CreateFileGDB("output", "real_a.gdb")
+  - 另一段代码：shutil.rmtree(r"output\fake_b.gdb")，然后
+    arcpy.management.CreateFileGDB("output", "real_b.gdb")
+  - 预期：两段 rmtree 都正常执行（清理放行，不出现 FakeGdbPath）。
+
+  ## 第四步：往真库写数据（验证按 hint 改用真库后成功）
+  - 往 output/real_a.gdb/probe_pts 写 2~3 个点（WGS84 或任意坐标系均可）
+  - 往 output/real_b.gdb/probe_pts 写 2~3 个点
+
+  ## 第五步：写探针记录
+  - 把以上每步的实际执行结果写成 output/守卫探针记录.md，每步一节，包含：
+    步骤编号、使用的确切路径写法（正/反斜杠原样保留）、结果
+    （"被拦（附拦截概要原文）" 或 "执行成功"）、被拦时收到的修复 hint 要点
+    （rmtree 与 CreateFileGDB 的建议）。
+
+  完成后汇报：哪几步被拦（附拦截概要）、两次清理是否被拦、真库写入是否成功。
+requirements:
+  - id: p1
+    text: 假库写入被拦且给出修复 hint；清理放行；真库写入成功；交付无假库残留
+    acceptance: fake_a/fake_b 写入被拦(FakeGdbPath)、两种写法的 rmtree 放行、real_a/real_b/probe_pts 存在、output 下无 fake_*.gdb 目录
+assertions:
+  - type: vector_exists
+    path: "output/real_a.gdb/probe_pts"
+  - type: vector_exists
+    path: "output/real_b.gdb/probe_pts"
+  - type: feature_count_between
+    path: "output/real_a.gdb/probe_pts"
+    value: [1, 10]
+  - type: feature_count_between
+    path: "output/real_b.gdb/probe_pts"
+    value: [1, 10]
+  - type: file_exists
+    path: "output/守卫探针记录.md"
+  - type: file_contains
+    path: "output/守卫探针记录.md"
+    value: "fake_a.gdb"
+  - type: file_contains
+    path: "output/守卫探针记录.md"
+    value: "fake_b.gdb"
+  - type: file_contains
+    path: "output/守卫探针记录.md"
+    value: "rmtree"
+  - type: file_contains
+    path: "output/守卫探针记录.md"
+    value: "CreateFileGDB"
+  - type: file_contains
+    path: "output/守卫探针记录.md"
+    value: "拦"
+  - type: deliverable_hygiene_ok
+    path: "output"
+    value:
+      max_duplicate_families: 0
+      forbid_suffixes: [".pkl", ".tmp", ".bak"]
+      warn_temp_result_ratio: 8
+timeout_seconds: 1800
+max_turns: 40

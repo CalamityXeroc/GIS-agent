@@ -1,0 +1,145 @@
+id: neighbor_sum_filter
+name: 邻接汇总与阈值筛选
+description: 基于面邻接关系，把邻接要素的数值字段求和回填到自身（如"相邻社区老年人口总和"），并按阈值条件导出目标要素（如"自身>300 且邻接>2000"）。
+domain: analysis
+category: analysis
+triggers: [邻接, 相邻, 面邻域, 邻接汇总, 相邻人口, 选址筛选, polygon neighbors]
+preconditions:
+  - 输入为面要素，已投影坐标系
+  - 已确认自身字段与邻接求和字段的真实名称
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入面要素
+  output_path:
+    type: string
+    required: true
+    description: 输出要素（含邻接汇总字段）
+  value_field:
+    type: string
+    required: true
+    description: 参与邻接求和的字段（数值）
+  sum_field:
+    type: string
+    default: "NB_SUM"
+    description: 邻接求和结果字段名
+  keep_self:
+    type: boolean
+    default: false
+    description: 求和是否包含自身
+  where_clause:
+    type: string
+    default: ""
+    description: 可选筛选条件，如 "POP > 300 AND NB_SUM > 2000"；空则只输出汇总不筛选
+  selected_path:
+    type: string
+    default: ""
+    description: 筛选结果输出路径（where_clause 非空时必填）
+steps:
+  - 两两几何判定邻接（共享边界/重叠/包含）
+  - 邻接求和回填
+  - 可选阈值筛选导出
+  - 返回邻居对与筛选结果数
+code_template: |
+  import arcpy, os
+  from collections import defaultdict
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  value_field = {{value_field}}
+  sum_field = {{sum_field}}
+  keep_self = bool({{keep_self}})
+  where_clause = str({{where_clause}})
+  selected_path = str({{selected_path}})
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  d = arcpy.Describe(input_path)
+  if d.shapeType != "Polygon":
+      raise ValueError("邻接汇总需要面要素")
+  if d.spatialReference.type == "Geographic":
+      raise ValueError("建议先投影到投影坐标系（邻接判定虽与坐标系无关，但后续距离/面积分析需要）")
+  have = {f.name for f in arcpy.ListFields(input_path)}
+  if value_field not in have:
+      raise ValueError(f"字段不存在: {value_field}；可用: {sorted(have)}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+
+  # 1) 准备输出：复制输入并去重字段（可重复运行）
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.management.CopyFeatures(input_path, output_path)
+  if sum_field in {f.name for f in arcpy.ListFields(output_path)}:
+      arcpy.management.DeleteField(output_path, sum_field)
+  arcpy.management.AddField(output_path, sum_field, "DOUBLE")
+
+  # 2) 邻接关系：几何两两判定（共享边界/重叠/包含）
+  rows = [(oid, shp, val) for oid, shp, val in
+          arcpy.da.SearchCursor(output_path, ["OID@", "SHAPE@", value_field])]
+  adj = defaultdict(set)
+  for i in range(len(rows)):
+      gi = rows[i][1]
+      for j in range(i + 1, len(rows)):
+          gj = rows[j][1]
+          if gi.touches(gj) or gi.overlaps(gj) or gi.contains(gj) or gi.within(gj):
+              adj[rows[i][0]].add(rows[j][0])
+              adj[rows[j][0]].add(rows[i][0])
+  pairs = sum(len(v) for v in adj.values()) // 2
+
+  value_by_oid = {oid: val for oid, _, val in rows}
+  with arcpy.da.UpdateCursor(output_path, ["OID@", value_field, sum_field]) as cur:
+      for oid, val, _ in cur:
+          total = sum((value_by_oid.get(n) or 0) for n in adj.get(oid, ()))
+          if keep_self:
+              total += (val or 0)
+          cur.updateRow([oid, val, total])
+
+  # 3) 可选筛选
+  selected_count = 0
+  if where_clause.strip():
+      if not selected_path:
+          raise ValueError("使用 where_clause 时必须提供 selected_path")
+      sp_folder = os.path.dirname(selected_path)
+      if str(sp_folder).lower().endswith(".gdb") and not arcpy.Exists(sp_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(sp_folder), os.path.basename(sp_folder)[:-4])
+      if arcpy.Exists(selected_path):
+          arcpy.management.Delete(selected_path)
+      try:
+          arcpy.analysis.Select(output_path, selected_path, where_clause)
+      except Exception as exc:
+          fields = [f.name for f in arcpy.ListFields(output_path) if f.type not in ("Geometry", "OID")]
+          raise ValueError(f"筛选失败（{str(exc)[:80]}）；可用字段: {fields}")
+      selected_count = int(arcpy.management.GetCount(selected_path)[0])
+
+  total_count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({"output": output_path, "feature_count": total_count, "neighbor_pairs": pairs,
+              "sum_field": sum_field, "keep_self": keep_self,
+              "selected": selected_path or None, "selected_count": selected_count})
+  print(f"Neighbor sum done: {total_count} features, {pairs} neighbor pairs, selected={selected_count}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["{{sum_field}}"]
+  - type: field_sum_gt
+    path: "{{output_path}}"
+    field: "{{sum_field}}"
+    value: 0
+pitfalls:
+  - 邻接判定基于共享边界/相交；若数据存在缝隙（未拓扑清理），会出现"应该相邻却不相邻"，需先做拓扑修复。
+  - 阈值条件里的字段名必须是本配方产出的真实字段（自身字段 + 邻接汇总字段）。
+  - 因几何两两判定，超万级要素会较慢，必要时先按范围筛选。
+examples:
+  - "统计每个社区相邻社区的老年人口总和"
+  - "选址：自身老年人口 > 300 且邻接社区老年人口总和 > 2000"

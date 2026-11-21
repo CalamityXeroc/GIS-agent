@@ -1,0 +1,82 @@
+id: gis14_am_task2b_dem_landcover
+name: 第14届（2025）上午 任务二b/三a · DEM 拼接裁切与土地覆盖裁切
+source: A上午
+carry_from: gis14_am_task1_animal_points
+prompt: |
+  继续本工作区的工作。野生动物观测点已清洗并投影到 UTM 10N（EPSG:32610），
+  研究区矩形（约 X 325821~359476 / Y 4533394~4596655）在 output/result_data.gdb/study_area；
+  若该图层不在（例如单独重跑本任务），用 input/study_area.shp（同一坐标系、单个矩形面）导入后再继续。
+  若工作区有 .gis_agent/PROJECT_LOG.md，先读它了解口径，不要重复劳动。
+
+  本步处理两份栅格数据（都在 workspace/input/ 下；注意它们都是 WGS84 地理坐标系，
+  而分析必须在 UTM 10N 平面坐标系下进行）：
+
+  1. DEM 拼接与裁切：
+     - 输入是 4 幅分幅高程数据：input/demA.tif、demB.tif、demC.tif、demD.tif（分辨率约 30 m）
+     - 请把 4 幅拼接成一整幅，再裁切到研究区范围，输出 output/result_data.gdb/dem_clip
+     - 要求：输出为 UTM 10N 投影坐标系、30 m 分辨率、高程值单位不变（米）
+     - 完成后说明拼接后与裁切后的高程范围（最小/最大/平均，米）
+
+  2. 土地覆盖裁切：
+     - 输入 input/landcover.tif（分辨率约 10 m，类别编码 1~11，其中 10 是云 Clouds）
+       土地覆盖类别编码表（赛题表 2，必须按此命名，不要自己起名）：
+         1 水域 WaterAreas ｜ 2 林地 Trees ｜ 4 淹没植被区 FloodedVegetationArea ｜
+         5 耕地 Crops ｜ 7 建筑区 BuiltAreas ｜ 8 裸地 BareGroundAreas ｜
+         9 雪/冰 SnoworIce ｜ 10 云 Clouds ｜ 11 牧场 RangelandsAreas
+     - 裁切到研究区范围并投影到 UTM 10N，输出 output/result_data.gdb/landcover_clip
+     - 保持 10 m 分辨率与类别编码不变（最近邻重采样）
+     - 完成后统计并说明：研究区内每个土地覆盖类别的像元数与面积（km²，按 10 m 像元计），
+       特别要给出云（编码 10）目前的像元数——下一步任务要把它修补掉
+
+  注意：
+  - 栅格数据是外部输入（只读），任何中间产物都写到 output/ 或 temp_data.gdb，不要改动 input/
+  - 投影变换选择合适的重采样方法：高程用双线性或三次卷积，类别用最近邻
+inputs:
+  - source: "E:/GIS_documents/小火的竞赛资料/14第十四届全国大学生GIS应用技能大赛/14第十四届全国大学生GIS应用技能大赛/A上午/A上午/data/dem"
+  - source: "E:/GIS_documents/小火的竞赛资料/14第十四届全国大学生GIS应用技能大赛/14第十四届全国大学生GIS应用技能大赛/A上午/A上午/data/土地覆盖/landcover.tif"
+  - source: "workspace/input/第14届真题数据/study_area.shp"
+requirements:
+  - id: r1
+    text: 4 幅 DEM 拼接为一幅并裁切到研究区
+    acceptance: dem_clip 存在，UTM 10N、30 m、高程值合理（米量级）
+  - id: r2
+    text: 土地覆盖裁切到研究区（保持 10 m 与类别编码）
+    acceptance: landcover_clip 存在，UTM 10N、10 m、类别值仍在 1~11
+  - id: r3
+    text: 分类面积统计（含云像元数）
+    acceptance: 报告各类别像元数与面积（km²）
+assertions:
+  - type: raster_not_constant
+    path: "output/result_data.gdb/dem_clip"
+  - type: raster_stat_between
+    path: "output/result_data.gdb/dem_clip"
+    stat: "min"
+    value: [1190, 1215]
+  - type: raster_stat_between
+    path: "output/result_data.gdb/dem_clip"
+    stat: "max"
+    value: [2995, 3045]
+  - type: bbox_between
+    path: "output/result_data.gdb/dem_clip"
+    value:
+      xmin: [323000, 329000]
+      ymin: [4531000, 4536000]
+      xmax: [357000, 363000]
+      ymax: [4594000, 4600000]
+  - type: raster_not_constant
+    path: "output/result_data.gdb/landcover_clip"
+  - type: raster_stat_between
+    path: "output/result_data.gdb/landcover_clip"
+    stat: "min"
+    value: [1, 2]
+  - type: raster_stat_between
+    path: "output/result_data.gdb/landcover_clip"
+    stat: "max"
+    value: [10, 11]
+  - type: deliverable_hygiene_ok
+    path: "output"
+    value:
+      max_duplicate_families: 0
+      forbid_suffixes: [".pkl", ".tmp", ".bak"]
+      warn_temp_result_ratio: 5
+timeout_seconds: 3000

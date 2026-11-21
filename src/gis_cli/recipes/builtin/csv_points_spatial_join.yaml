@@ -1,0 +1,147 @@
+id: csv_points_spatial_join
+name: CSV坐标点转要素并空间挂接
+description: 当 CSV 只有经纬度、没有公共键时，用 XY 转点 → 投影到面图层坐标系 → 空间连接把表属性挂到面上。适用于“人口点数据挂接到区县”这类场景。
+domain: data_management
+triggers: [坐标点, xy转点, 经纬度, 空间连接挂接, 只有坐标, 点挂接面, csv转点]
+preconditions:
+  - CSV 含经度/纬度字段（如 CenterLon/CenterLat）
+  - 面图层坐标系已知（建议投影坐标系）
+params:
+  csv_path:
+    type: string
+    required: true
+    description: CSV 路径（可含中文表头）
+  lon_field:
+    type: string
+    required: true
+    description: 经度字段名
+  lat_field:
+    type: string
+    required: true
+    description: 纬度字段名
+  target_path:
+    type: string
+    required: true
+    description: 被挂接的面要素路径
+  output_path:
+    type: string
+    required: true
+    description: 输出面要素路径（workspace/output 下）
+  source_srid:
+    type: integer
+    default: 4326
+    description: CSV 坐标的坐标系 EPSG（经纬度默认 4326）
+  target_srid:
+    type: integer
+    default: 4508
+    description: 输出坐标系 EPSG；0 表示沿用面图层坐标系
+  points_name:
+    type: string
+    default: "points_tmp"
+    description: 中间点要素名称（写入输出 GDB）
+steps:
+  - XYTableToPoint 把 CSV 转成点（WGS84）
+  - 投影点要素到面图层坐标系
+  - SpatialJoin（面为目标、点为连接）把人口字段挂到面
+  - 返回挂接命中数与结果要素数
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  csv_path = {{csv_path}}
+  lon_field = {{lon_field}}
+  lat_field = {{lat_field}}
+  target_path = {{target_path}}
+  output_path = {{output_path}}
+  source_srid = {{source_srid}}
+  target_srid = {{target_srid}}
+  points_name = {{points_name}}
+
+  if not os.path.exists(csv_path):
+      raise ValueError(f"CSV 不存在: {csv_path}")
+  if not arcpy.Exists(target_path):
+      raise ValueError(f"目标面要素不存在: {target_path}")
+
+  out_parent = os.path.dirname(output_path)
+  # 确定输出 GDB：注意不要用 makedirs 造出假 .gdb 目录，必须用 CreateFileGDB
+  if str(out_parent).lower().endswith(".gdb"):
+      out_gdb = out_parent
+  else:
+      out_gdb = os.path.join(out_parent, "result_data.gdb")
+  gdb_folder = os.path.dirname(out_gdb)
+  if gdb_folder and not os.path.isdir(gdb_folder):
+      os.makedirs(gdb_folder, exist_ok=True)
+  if not arcpy.Exists(out_gdb):
+      arcpy.management.CreateFileGDB(gdb_folder, os.path.basename(out_gdb)[:-4])
+
+  xy = os.path.join(out_gdb, points_name)
+  if arcpy.Exists(xy):
+      arcpy.management.Delete(xy)
+  # 注意：带 BOM 的 CSV 用 XYTableToPoint 会报 000840（找不到字段），
+  # 改用 MakeXYEventLayer + CopyFeatures，兼容性更好。
+  _lyr = "xy_events_tmp"
+  arcpy.management.MakeXYEventLayer(
+      csv_path,
+      lon_field,
+      lat_field,
+      _lyr,
+      arcpy.SpatialReference(int(source_srid)),
+  )
+  arcpy.management.CopyFeatures(_lyr, xy)
+  arcpy.management.Delete(_lyr)
+
+  poly_sr = arcpy.Describe(target_path).spatialReference
+  pts = os.path.join(out_gdb, points_name + "_prj")
+  if arcpy.Exists(pts):
+      arcpy.management.Delete(pts)
+  arcpy.management.Project(xy, pts, poly_sr)
+
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.analysis.SpatialJoin(
+      target_features=target_path,
+      join_features=pts,
+      out_feature_class=output_path,
+      join_operation="JOIN_ONE_TO_ONE",
+      join_type="KEEP_ALL",
+      match_option="INTERSECT",
+  )
+
+  # 需要时把结果投影到目标坐标系（默认 4508）
+  if int(target_srid) > 0 and poly_sr.factoryCode != int(target_srid):
+      _tmp = output_path + "_prj"
+      if arcpy.Exists(_tmp):
+          arcpy.management.Delete(_tmp)
+      arcpy.management.Project(output_path, _tmp, arcpy.SpatialReference(int(target_srid)))
+      arcpy.management.Delete(output_path)
+      arcpy.management.Rename(_tmp, os.path.basename(output_path))
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  matched = 0
+  if "Join_Count" in [f.name for f in arcpy.ListFields(output_path)]:
+      with arcpy.da.SearchCursor(output_path, ["Join_Count"]) as cur:
+          for row in cur:
+              if (row[0] or 0) > 0:
+                  matched += 1
+  fields = [f.name for f in arcpy.ListFields(output_path)]
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "matched_count": matched,
+      "points": pts,
+      "fields": fields,
+  })
+  print(f"CSV points spatial join done: {count} polygons, {matched} matched")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 带 BOM 的 CSV 用 XYTableToPoint 会报 000840（找不到字段），本配方用 MakeXYEventLayer + CopyFeatures。
+  - 必须先把 CSV 转成点并投影到面图层坐标系，否则空间连接匹配不上（度 vs 米）。
+  - 点落在面边界上时 INTERSECT 也能匹配；若有多点落入同一面，JOIN_ONE_TO_ONE 只取第一条。
+  - CSV 表头可能是 UTF-8 BOM（\ufeff），必要时先用 UTF-8-SIG 重写一份。
+examples:
+  - "population.csv 只有 CenterLon/CenterLat，挂接到 county"

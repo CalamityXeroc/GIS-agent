@@ -1,0 +1,119 @@
+id: similarity_ranking
+name: 相似城市排序（多指标距离）
+description: 对分区要素的多个数值指标做标准化（z-score），计算每个要素与参考要素的欧氏距离，输出最相似的前 N 个并写成 JSON。
+domain: spatial_statistics
+triggers: [相似, 最相似, 相似度, 找出与, 指标对比, 距离排序, 与…最相似]
+preconditions:
+  - 输入要素含全部指标字段且无空值
+params:
+  input_path:
+    type: string
+    required: true
+    description: 含指标字段的要素类（如 city_census）
+  fields:
+    type: string
+    required: true
+    description: 逗号分隔的指标字段，如 "OLD_PCT,FERT_PCT,SEX_RATIO"
+  reference_name:
+    type: string
+    required: true
+    description: 参考要素名称（如 郑州市）
+  output_json:
+    type: string
+    required: true
+    description: 结果 JSON 路径（workspace/output 下）
+  name_field:
+    type: string
+    default: "name"
+    description: 名称字段
+  top_n:
+    type: integer
+    default: 3
+    description: 输出前 N 个最相似
+steps:
+  - 读取全部要素的指标值
+  - 对每个指标做 z-score 标准化
+  - 计算与参考要素的欧氏距离并排序
+  - 写 JSON（含 reference / ranking）
+code_template: |
+  import arcpy, json, os, statistics
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  fields = [f.strip() for f in str({{fields}}).split(",") if f.strip()]
+  reference_name = {{reference_name}}
+  output_json = {{output_json}}
+  name_field = {{name_field}}
+  top_n = int({{top_n}})
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  have = {f.name for f in arcpy.ListFields(input_path)}
+  missing = [f for f in fields + [name_field] if f not in have]
+  if missing:
+      raise ValueError(f"缺少字段: {missing}；可用: {sorted(have)}")
+
+  rows = []
+  with arcpy.da.SearchCursor(input_path, [name_field] + fields) as cur:
+      for row in cur:
+          name = row[0]
+          vals = row[1:]
+          if name is None or any(v is None for v in vals):
+              continue
+          rows.append((str(name), [float(v) for v in vals]))
+  if len(rows) < 2:
+      raise ValueError("有效要素不足，无法比较相似度")
+  ref = [item for item in rows if item[0] == reference_name]
+  if not ref:
+      raise ValueError(f"参考要素不存在: {reference_name}；可用: {[r[0] for r in rows][:10]}")
+
+  # z-score 标准化
+  means = [statistics.fmean(r[1][i] for r in rows) for i in range(len(fields))]
+  stds = []
+  for i in range(len(fields)):
+      s = statistics.pstdev([r[1][i] for r in rows])
+      stds.append(s if s else 1.0)
+  def norm(vals):
+      return [(v - means[i]) / stds[i] for i, v in enumerate(vals)]
+
+  ref_vec = norm(ref[0][1])
+  ranking = []
+  for name, vals in rows:
+      if name == reference_name:
+          continue
+      vec = norm(vals)
+      dist = sum((a - b) ** 2 for a, b in zip(vec, ref_vec)) ** 0.5
+      ranking.append({"name": name, "distance": round(dist, 6), "values": dict(zip(fields, vals))})
+  ranking.sort(key=lambda x: x["distance"])
+  top = ranking[:top_n]
+
+  payload = {
+      "reference": reference_name,
+      "fields": fields,
+      "most_similar": top[0]["name"] if top else None,
+      "ranking": top,
+      "all_distances": [{"name": r["name"], "distance": r["distance"]} for r in ranking],
+  }
+  os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
+  with open(output_json, "w", encoding="utf-8") as fh:
+      json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+  set_result({
+      "output": output_json,
+      "reference": reference_name,
+      "most_similar": payload["most_similar"],
+      "ranking": top,
+  })
+  print(f"Similarity done: most similar to {reference_name} = {payload['most_similar']}")
+validation:
+  - type: file_exists
+    path: "{{output_json}}"
+  - type: file_contains
+    path: "{{output_json}}"
+    value: "most_similar"
+pitfalls:
+  - 指标量纲差异大时必须标准化（z-score），否则大数值指标会主导距离。
+  - 参考要素名称必须与名称字段完全一致（含“市”）。
+examples:
+  - "找出与郑州市在老年占比、育龄女性占比、性别比上最相似的地市"
+  - "与省会城市最相似的地区"

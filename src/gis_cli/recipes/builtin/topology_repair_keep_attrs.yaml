@@ -1,0 +1,142 @@
+id: topology_repair_keep_attrs
+name: 拓扑修复：按关键字段去重（保留属性）
+description: 找出同一关键字段（如 code）下的重复/重叠面要素，每组只保留一个（默认面积最大），删除冗余。完整保留原始属性字段。不做传递性分组，避免误删正常相邻要素。
+domain: data_quality
+triggers: [拓扑, 重叠, 冗余, 重复面, 拓扑检查, 修复, 删除重复, overlap, duplicate]
+preconditions:
+  - 输入已投影到投影坐标系（面积才有意义）
+  - 已确认用于判定重复的关键字段（如 code）；无关键字段时退化为几何完全相等判定
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入面要素路径（建议已投影）
+  output_path:
+    type: string
+    required: true
+    description: 输出要素类路径（workspace/output 下），属性会完整保留
+  key_field:
+    type: string
+    default: "code"
+    description: 判定重复的关键字段（如 code）；字段不存在或为空时按几何完全相等判定
+  keep:
+    type: string
+    default: "LARGEST_AREA"
+    description: 保留策略：LARGEST_AREA 或 FIRST（最小 OID）
+steps:
+  - CopyFeatures 复制（保留属性）
+  - 按 key_field 分组；组内两两几何判定 equals/overlaps/contains/within
+  - 每组保留一个、删除其余（不做跨组传递性合并）
+  - 返回删除数与重复组数
+code_template: |
+  import arcpy, os
+  from collections import defaultdict
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  key_field = {{key_field}}
+  keep = {{keep}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  out_parent = os.path.dirname(output_path)
+  # 注意：不要用 makedirs 造出假 .gdb 目录，必须用 CreateFileGDB
+  if str(out_parent).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_parent):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_parent), os.path.basename(out_parent)[:-4])
+  elif out_parent and not os.path.isdir(out_parent):
+      os.makedirs(out_parent, exist_ok=True)
+
+  # 1) 复制，完整保留属性
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.management.CopyFeatures(input_path, output_path)
+
+  field_names = [f.name for f in arcpy.ListFields(output_path)]
+  use_key = key_field in field_names
+
+  # 2) 读取几何 + 关键字段
+  rows = []
+  fields = ["OID@", "SHAPE@"] + ([key_field] if use_key else [])
+  with arcpy.da.SearchCursor(output_path, fields) as cur:
+      for row in cur:
+          oid, shp = row[0], row[1]
+          kv = row[2] if use_key else None
+          rows.append((oid, shp, shp.area, kv))
+
+  # 3) 分组：有关键字段按字段分组，否则全归一组（仅做几何相等判定）
+  groups = defaultdict(list)
+  for oid, shp, area, kv in rows:
+      groups[kv if use_key else "__ALL__"].append((oid, shp, area))
+
+  def _same(g1, g2):
+      return g1.equals(g2) or g1.overlaps(g2) or g1.contains(g2) or g1.within(g2)
+
+  # 4) 组内去重（不做跨组传递性合并，避免误删正常要素）
+  remove = set()
+  dup_groups = 0
+  for members in groups.values():
+      if len(members) <= 1:
+          continue
+      # 组内并查集仅限本组
+      parent = {m[0]: m[0] for m in members}
+      def find(x):
+          while parent[x] != x:
+              parent[x] = parent[parent[x]]
+              x = parent[x]
+          return x
+      def union(a, b):
+          ra, rb = find(a), find(b)
+          if ra != rb:
+              parent[rb] = ra
+      for i in range(len(members)):
+          for j in range(i + 1, len(members)):
+              if _same(members[i][1], members[j][1]):
+                  union(members[i][0], members[j][0])
+      comps = defaultdict(list)
+      for oid, shp, area in members:
+          comps[find(oid)].append((oid, area))
+      for comp in comps.values():
+          if len(comp) <= 1:
+              continue
+          dup_groups += 1
+          if keep == "FIRST":
+              survivor = min(c[0] for c in comp)
+          else:
+              survivor = max(comp, key=lambda c: c[1])[0]
+          for oid, _ in comp:
+              if oid != survivor:
+                  remove.add(oid)
+
+  # 5) 删除冗余面
+  removed = 0
+  with arcpy.da.UpdateCursor(output_path, ["OID@"]) as cur:
+      for row in cur:
+          if row[0] in remove:
+              cur.deleteRow()
+              removed += 1
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "removed": removed,
+      "duplicate_groups": dup_groups,
+      "key_field": key_field if use_key else None,
+      "fields": [f.name for f in arcpy.ListFields(output_path)],
+  })
+  print(f"Topology repair: {count} kept, {removed} redundant removed, {dup_groups} duplicate groups")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 不要用全局传递性分组：A-B 重叠、B-C 重叠会把 A/C 也连成一组，误删大量正常要素。
+  - 必须用 CopyFeatures 而非重建几何，否则属性会丢（本配方保留 name/code 等字段）。
+  - 无关键字段时的几何相等判定无法处理“近重复”，可先用 field_calculate 生成归一化键。
+  - 不同 key 的飞地/包含类重叠属于另一类问题，本配方不处理（任务断言可用 overlap_pairs_max 容差）。
+examples:
+  - "county 按 code 去重，删除重叠冗余，结果叫 county_1，保留 name/code 字段"

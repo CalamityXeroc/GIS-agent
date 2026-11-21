@@ -1,0 +1,75 @@
+id: union_layers
+name: 联合（Union）
+description: 把两个面图层的几何合并（保留所有区域与双方属性），用于叠加两套区划/分类。
+domain: overlay
+category: overlay
+triggers: [联合, union, 合并图层, 叠加, 融合两图层]
+preconditions:
+  - 两图层均为面且坐标系一致
+params:
+  input_path:
+    type: string
+    required: true
+    description: 第一个面图层
+  overlay_path:
+    type: string
+    required: true
+    description: 第二个面图层
+  output_path:
+    type: string
+    required: true
+    description: 输出图层
+steps:
+  - 校验存在、几何类型与坐标系
+  - Union
+  - 返回要素数与字段
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  overlay_path = {{overlay_path}}
+  output_path = {{output_path}}
+
+  for p in (input_path, overlay_path):
+      if not arcpy.Exists(p):
+          raise ValueError(f"输入不存在: {p}")
+      shp = arcpy.Describe(p).shapeType
+      if shp != "Polygon":
+          raise ValueError(f"Union 需要面要素，{p} 是 {shp}")
+  sr1 = arcpy.Describe(input_path).spatialReference.name
+  sr2 = arcpy.Describe(overlay_path).spatialReference.name
+  if sr1 != sr2:
+      raise ValueError(f"坐标系不一致（{sr1} vs {sr2}），请先统一投影")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.analysis.Union([input_path, overlay_path], output_path, "ALL", None, "GAPS")
+  count = int(arcpy.management.GetCount(output_path)[0])
+  in_count = int(arcpy.management.GetCount(input_path)[0])
+  ov_count = int(arcpy.management.GetCount(overlay_path)[0])
+  if count < max(in_count, ov_count):
+      raise ValueError(f"联合结果要素数异常（{count} < max({in_count},{ov_count})），请检查数据")
+  fields = [f.name for f in arcpy.ListFields(output_path) if f.type not in ("Geometry", "OID")]
+  set_result({"output": output_path, "feature_count": count,
+              "input_count": in_count, "overlay_count": ov_count, "fields": fields})
+  print(f"Union done: {count} features (in={in_count}, overlay={ov_count})")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 联合结果字段会翻倍（同名字段加 _1 后缀），取值前先确认字段名。
+  - 两套区划边界不一致时要素数会显著增加，这是正常现象。
+examples:
+  - "把两个时期的行政区划叠加，看边界变化"
+  - "叠加两套分类图层做交叉统计"

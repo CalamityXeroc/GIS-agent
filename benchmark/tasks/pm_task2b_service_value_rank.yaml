@@ -1,0 +1,94 @@
+id: pm_task2b_service_value_rank
+name: PM 任务二b · 绿地服务价值与前后500名评价（链式：承接任务二a）
+source: B下午
+carry_from: pm_task2a_green_area_index
+prompt: |
+  继续本工作区的工作。output/result_data.gdb 里已有：
+  - 任务一产物：community_elder（社区老年人口字段 ELDER_COMM）、elder_fill（5 米老年人口栅格）
+  - 任务二a产物：community_green（含 GREEN_AREA 绿地面积、PER_CAPITA 人均绿地面积、GREEN_IDX 人均绿地指数）
+  若工作区有 .gis_agent/PROJECT_LOG.md，先读它了解前两步的口径，不要重复劳动。
+
+  本步目标：评估绿地服务价值并对社区做前后 500 名评价（新产出放 workspace/output/result_data.gdb）。
+  1. 用【要素转点】取 community_green 的中心点 → comm_centroid（保留 BSM 等属性）。
+  2. 以中心点做 500 米【缓冲区】→ comm_buffer_500（一个社区一个缓冲区，用 BSM 作为唯一标识字段；
+     不要融合掉 BSM，否则后面无法回连）。
+  3. 统计每个缓冲区内的老年人口 → buffer_elder_tbl（字段 BSM / SUM_VALUE），
+     即"社区 500 米范围内可服务的老年人口数"。
+     注意：这些缓冲区彼此大量重叠，**不能用面转栅格类做法**（一个像元只能归属一个分区，重叠区会丢数），
+     也不要用 ZonalStatisticsAsTable（几千个重叠分区要跑十几分钟，还可能让内核崩溃）。
+     直接用 run_recipe recipe_id=point_buffer_raster_sum（points_path=comm_centroid、id_field=BSM、
+     raster_path=elder_fill、radius=500），圆形缓冲区按距离逐像元解析求和，秒级完成且支持重叠。
+  4. 把 buffer_elder_tbl 按 BSM 挂回 community_green，服务人数字段命名 SERVICE_POP；
+     再算绿地服务价值 SERVICE_VALUE = SERVICE_POP / GREEN_AREA（无绿地的社区为空值，不要填 0）。
+     输出 workspace/output/result_data.gdb/community_service。
+  5. 做前后 500 名评价（在 community_service 上新增 4 个字段，满足条件置 1，否则 0）：
+     - 前500名_人均绿地指数（TOP_PER）：按 PER_CAPITA 降序取前 500 名
+     - 前500名_绿地服务价值（TOP_SVC）：按 SERVICE_VALUE 降序取前 500 名
+     - 后500名_人均绿地指数（BOT_PER）：没有绿地的社区（PER_CAPITA 为空）按 ELDER_COMM 降序取前 500 名
+       （即按整改迫切性排序）
+     - 后500名_绿地服务价值（BOT_SVC）：SERVICE_VALUE 为空的社区按 ELDER_COMM 降序取前 500 名
+     建议直接使用配方：run_recipe recipe_id=rank_top_bottom_flag（top_n=500、bottom_n=500、
+     bottom_include_null=true、second_field 用第二个排序字段）。
+  6. 导出两个名单（都用【属性筛选】或按标记字段导出）：
+     - workspace/output/result_data.gdb/标杆社区：TOP_PER=1 且 TOP_SVC=1
+     - workspace/output/result_data.gdb/需整改社区：BOT_PER=1 且 BOT_SVC=1
+  完成后说明：缓冲区数量与单个面积、服务人口统计口径、SERVICE_VALUE 为空值的社区数、
+  标杆社区数与需整改社区数，以及两个名单分别代表什么。
+inputs: []
+requirements:
+  - id: r1
+    text: 社区中心点 500 米缓冲区与缓冲区老年人口统计
+    acceptance: comm_buffer_500 的缓冲区数=社区数、单个面积≈785000 m²；buffer_elder_tbl 含每社区服务人口
+  - id: r2
+    text: 绿地服务价值入库
+    acceptance: community_service 含 SERVICE_POP/SERVICE_VALUE；SERVICE_VALUE 空值≈814（无绿地社区）
+  - id: r3
+    text: 前后 500 名评价与两个名单
+    acceptance: 四个标记字段各 500 个置 1；标杆社区与需整改社区要素类存在且非空
+assertions:
+  - type: vector_exists
+    path: "output/result_data.gdb/comm_buffer_500"
+  - type: feature_count_between
+    path: "output/result_data.gdb/comm_buffer_500"
+    value: [2300, 2400]
+  - type: field_stats_between
+    path: "output/result_data.gdb/comm_buffer_500"
+    field: "Shape_Area"
+    stat: "mean"
+    value: [770000, 800000]
+  - type: vector_exists
+    path: "output/result_data.gdb/community_service"
+  - type: fields_present
+    path: "output/result_data.gdb/community_service"
+    value: ["SERVICE_POP", "SERVICE_VALUE", "TOP_PER", "TOP_SVC", "BOT_PER", "BOT_SVC"]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_service"
+    field: "TOP_PER"
+    stat: "sum"
+    value: [480, 520]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_service"
+    field: "BOT_PER"
+    stat: "sum"
+    value: [480, 520]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_service"
+    field: "SERVICE_VALUE"
+    stat: "null"
+    value: [780, 850]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_service"
+    field: "SERVICE_POP"
+    stat: "max"
+    value: [1, 200000]
+  - type: vector_exists
+    path: "output/result_data.gdb/标杆社区"
+  - type: feature_count_between
+    path: "output/result_data.gdb/标杆社区"
+    value: [15, 80]
+  - type: vector_exists
+    path: "output/result_data.gdb/需整改社区"
+  - type: feature_count_between
+    path: "output/result_data.gdb/需整改社区"
+    value: [300, 600]
+timeout_seconds: 3600

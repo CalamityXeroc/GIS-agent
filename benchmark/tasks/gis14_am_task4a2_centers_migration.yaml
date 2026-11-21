@@ -1,0 +1,76 @@
+id: gis14_am_task4a2_centers_migration
+name: 第14届（2025）上午 任务四a-2 · 逐年分布中心与迁移图
+source: A上午
+prompt: |
+  本工作区有清洗并投影后的野生动物点位 input/animal_points.shp（UTM 10N，
+  字段 YEAR / COUNT / NAME / LON / LAT）与研究区矩形 input/study_area.shp。
+
+  请做**逐年分布中心与迁移图**（1982~2001 共 20 年，每年一个分布中心）：
+
+  1. 求每年的平均中心，输出 output/result_data.gdb/year_centers（字段 YEAR / X / Y / N，
+     共 20 个要素），并另存 CSV output/分布中心.csv。直接用配方：
+     run_recipe(recipe_id="point_centers_by_year", points="input/animal_points.shp",
+                out_centers="output/result_data.gdb/year_centers",
+                out_csv="output/分布中心.csv")
+  2. 相邻年连线：output/result_data.gdb/migration_lines（19 段，字段 FROM_YEAR / TO_YEAR /
+     DIST_M），按年份排序后依次连接相邻中心即可。
+  3. 出**迁移图** output/成果图/分布中心迁移.jpg + 同名 .aprx：
+     - 图面要有：研究区内底图、逐年中心点、迁移连线、**方向箭头**、**年份标注**、
+       图例（说明箭头含义，例如"分布中心逐年迁移方向"）、图名、比例尺、指北针。
+     - 做法：用 create_map 出图，并在 intent 里传 overlay —— 叠加层会把数据坐标换算到
+       像素后把箭头与年份画到导出图上：
+         intent = {"name": "分布中心迁移",
+                   "layers": ["output/result_data.gdb/migration_lines",
+                              "output/result_data.gdb/year_centers"],
+                   "title": "1982-2001 年野生动物分布中心迁移",
+                   "theme": "野生动物分布中心迁移", "region": "研究区",
+                   "scale": "1982-2001 年", "purpose": "competition",
+                   "overlay": {"arrows": [{"x0": X, "y0": Y, "x1": 下一中心X, "y1": 下一中心Y,
+                                           "label": "1982→1983"}, ...],
+                               "labels": [{"x": X, "y": Y, "text": "1982"}, ...]}}
+       arrows 传 19 段、labels 传 20 个年份；注意两者不要重复标注年份
+       （箭头标"起点年→终点年"时，labels 只标年份即可）。
+     - 出图后用 view_image 检查：年份是否可读、箭头是否可见、中文是否正常。
+
+  完成后请说明：20 个中心的迁移总量（km）、最大单年迁移距离、迁移图路径。
+inputs:
+  - source: "workspace/input/第14届真题数据/animal_points.shp"
+  - source: "workspace/input/第14届真题数据/study_area.shp"
+requirements:
+  - id: r1
+    text: 逐年分布中心与迁移线
+    acceptance: year_centers 20 个、migration_lines 19 段，中心落在研究区内
+  - id: r2
+    text: 迁移图（带年份与方向）
+    acceptance: 迁移图 JPG 存在且非空白、版面体检通过
+assertions:
+  - type: vector_exists
+    path: "output/result_data.gdb/year_centers"
+  - type: feature_count_between
+    path: "output/result_data.gdb/year_centers"
+    value: [18, 20]
+  - type: bbox_between
+    path: "output/result_data.gdb/year_centers"
+    value:
+      xmin: [325000, 355000]
+      ymin: [4533000, 4600000]
+      xmax: [330000, 360000]
+      ymax: [4534000, 4610000]
+  - type: feature_count_between
+    path: "output/result_data.gdb/migration_lines"
+    value: [17, 19]
+  - type: file_exists
+    path: "output/成果图/分布中心迁移.jpg"
+  - type: image_not_blank
+    path: "output/成果图/分布中心迁移.jpg"
+  - type: map_layout_ok
+    path: "output/成果图/分布中心迁移.aprx"
+    image: "output/成果图/分布中心迁移.jpg"
+  - type: deliverable_hygiene_ok
+    path: "output"
+    value:
+      max_duplicate_families: 0
+      forbid_suffixes: [".pkl", ".tmp", ".bak"]
+      warn_temp_result_ratio: 8
+max_turns: 130
+timeout_seconds: 4200

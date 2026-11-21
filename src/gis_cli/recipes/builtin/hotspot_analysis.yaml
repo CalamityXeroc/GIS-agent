@@ -1,0 +1,99 @@
+id: hotspot_analysis
+name: 热点分析（Getis-Ord Gi*）
+description: 对要素数值字段做 Getis-Ord Gi* 热点分析，探测高值集聚的热点区与低值集聚的冷点区。输出 GiZScore/GiPValue/Gi_Bin 字段（Gi_Bin：1/2/3=90/95/99% 置信热点，-1/-2/-3=冷点，0=不显著）。
+domain: spatial_statistics
+triggers: [热点, 冷点, 热点分析, 冷热点, 集聚, 高值集聚, 低值集聚, Getis, Gi星, 聚类分析]
+preconditions:
+  - 输入必须已投影到投影坐标系（空间权重基于距离/邻接）
+  - 分析字段为数值型、无空值且非零方差
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入要素路径（需已投影）
+  field_name:
+    type: string
+    required: true
+    description: 分析字段（数值，如各年人口）
+  output_path:
+    type: string
+    required: true
+    description: 输出要素类路径
+  conceptualization:
+    type: string
+    default: "CONTIGUITY_EDGES_CORNERS"
+    description: 空间关系概念化，默认邻接边角（面要素推荐）
+  standardization:
+    type: string
+    default: "ROW"
+    description: 标准化方式，可选 ROW / NONE
+steps:
+  - 校验字段为数值型
+  - 执行 Getis-Ord Gi* 热点分析
+  - 统计 Gi_Bin 分布（热点/冷点数量）并返回
+code_template: |
+  import arcpy
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  field_name = {{field_name}}
+  output_path = {{output_path}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  fields = {f.name: f.type for f in arcpy.ListFields(input_path)}
+  if field_name not in fields:
+      raise ValueError(f"字段不存在: {field_name}；可用字段: {sorted(fields)}")
+
+  sr = arcpy.Describe(input_path).spatialReference
+  if sr is None or sr.type == "Geographic":
+      raise ValueError("热点分析需要投影坐标系，请先投影（如 EPSG:4508/4527）")
+
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.stats.HotSpots(
+      Input_Feature_Class=input_path,
+      Input_Field=field_name,
+      Output_Feature_Class=output_path,
+      Conceptualization_of_Spatial_Relationships={{conceptualization}},
+      Standardization={{standardization}},
+  )
+
+  counts = {}
+  with arcpy.da.SearchCursor(output_path, ["Gi_Bin"]) as cur:
+      for row in cur:
+          key = int(row[0]) if row[0] is not None else 0
+          counts[key] = counts.get(key, 0) + 1
+  hot = sum(v for k, v in counts.items() if k > 0)
+  cold = sum(v for k, v in counts.items() if k < 0)
+  count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "gi_bin_counts": counts,
+      "hotspot_count": hot,
+      "coldspot_count": cold,
+      "fields_added": ["GiZScore", "GiPValue", "Gi_Bin"],
+  })
+  print(f"HotSpots done: hot={hot} cold={cold} bins={counts}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: fields_present
+    path: "{{output_path}}"
+    value: ["GiZScore", "GiPValue", "Gi_Bin"]
+  - type: field_distinct_gt
+    path: "{{output_path}}"
+    field: "Gi_Bin"
+    value: 1
+pitfalls:
+  - HotSpots 的 Standardization 取值是 ROW/NONE（不是 ROW_STANDARDIZATION，那是 Cluster and Outlier 的写法）。
+  - 字段全同值会报“零方差”错误；聚合结果若全 0 说明上游汇总没做成，先查上游。
+  - Gi_Bin=0 表示不显著；正值为热点（高值集聚），负值为冷点（低值集聚）。
+examples:
+  - "基于 2011、2012、2013 年地市总人口做热点分析，找出高值集聚与低值集聚区域"
+  - "识别老年人口占比的热点区"

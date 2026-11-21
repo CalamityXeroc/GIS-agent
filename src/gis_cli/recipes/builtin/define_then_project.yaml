@@ -1,0 +1,103 @@
+id: define_then_project
+name: 定义坐标系后真实投影（坐标系丢失场景）
+description: 当数据丢失坐标系（无 .prj / Unknown）时，先复制并用 DefineProjection 明确源坐标系，再 Project 到目标投影坐标系。距离/面积分析前必须执行。
+domain: projection
+triggers: [定义投影, define projection, 坐标系丢失, unknown, 无prj, 定义坐标系, 投影]
+preconditions:
+  - 已通过 catalog_query 或 .prj 检查确认源坐标系缺失或错误
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入要素类路径
+  output_path:
+    type: string
+    required: true
+    description: 输出要素类路径（必须位于 workspace/output 下）
+  source_srid:
+    type: integer
+    default: 4326
+    description: 源坐标系 EPSG（丢失坐标系时按数据实际经纬度判断，默认 4326）
+  target_srid:
+    type: integer
+    default: 4508
+    description: 目标 EPSG；华中/河南一带常用 4508（CGCS2000 6度带 111E）
+  temp_dir:
+    type: string
+    default: ""
+    description: 中间数据目录，空则用输出目录
+steps:
+  - 复制输入，避免改动原始数据
+  - DefineProjection 明确源坐标系
+  - Project 真实投影到目标坐标系
+  - 返回投影前后范围以便核对
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  source_srid = {{source_srid}}
+  target_srid = {{target_srid}}
+  temp_dir = {{temp_dir}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+
+  out_parent = os.path.dirname(output_path)
+  gdb_dir = str(out_parent).lower().endswith(".gdb")
+  if gdb_dir:
+      # 不能对 .gdb 直接 makedirs（会造出假目录导致后续操作失败）
+      gdb_folder = os.path.dirname(out_parent)
+      if gdb_folder and not os.path.isdir(gdb_folder):
+          os.makedirs(gdb_folder, exist_ok=True)
+      if not arcpy.Exists(out_parent):
+          arcpy.management.CreateFileGDB(gdb_folder, os.path.basename(out_parent)[:-4])
+  elif out_parent and not os.path.isdir(out_parent):
+      os.makedirs(out_parent, exist_ok=True)
+
+  tmp_base = temp_dir or out_parent or "."
+  # 临时数据不能直接建在 .gdb 目录下（会因 .shp 后缀报 000354 非法字符）
+  if str(tmp_base).lower().endswith(".gdb"):
+      tmp_fc = os.path.join(tmp_base, "_defined_tmp")
+  else:
+      tmp_fc = os.path.join(tmp_base, "_defined_tmp.shp")
+  if arcpy.Exists(tmp_fc):
+      arcpy.management.Delete(tmp_fc)
+
+  # 1) 复制，避免 DefineProjection 改动原始数据
+  arcpy.management.CopyFeatures(input_path, tmp_fc)
+  # 2) 明确源坐标系
+  arcpy.management.DefineProjection(tmp_fc, arcpy.SpatialReference(int(source_srid)))
+  # 3) 真实投影
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+  arcpy.management.Project(tmp_fc, output_path, arcpy.SpatialReference(int(target_srid)))
+
+  d = arcpy.Describe(output_path)
+  e = d.extent
+  count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({
+      "output": output_path,
+      "feature_count": count,
+      "source_srid": source_srid,
+      "target_srid": d.spatialReference.factoryCode,
+      "extent": [e.XMin, e.YMin, e.XMax, e.YMax],
+  })
+  print(f"Defined {source_srid} then projected to {d.spatialReference.name}: {count} features")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+  - type: crs_wkid
+    path: "{{output_path}}"
+    value: "{{target_srid}}"
+pitfalls:
+  - DefineProjection 只贴标签不改坐标，必须紧跟 Project 才是真实变换。
+  - 源坐标系判断错会导致整体位置偏移；用经纬度范围/邻接数据交叉验证。
+  - 输出是 .gdb 时必须用 CreateFileGDB 建库（makedirs 会造出假 gdb 目录）；
+    临时要素类建在 gdb 内时不能带 .shp 后缀（否则报 000354 非法字符）。
+examples:
+  - "county.shp 丢了坐标系，先定义 WGS84 再投影到 CGCS2000 111E"

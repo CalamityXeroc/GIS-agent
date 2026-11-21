@@ -1,0 +1,76 @@
+id: summarize_stats
+name: 汇总统计（Statistics）
+description: 按案例字段对数值字段做汇总统计（SUM/MEAN/COUNT 等），输出统计表。常用于“把区县人口汇总到地市”这类聚合。
+domain: spatial_analysis
+triggers: [汇总, 统计, summarize, statistics, 求和, 均值, 聚合, 每个市, 每个区]
+preconditions:
+  - 输入表/要素存在，案例字段与统计字段已确认
+params:
+  in_table:
+    type: string
+    required: true
+  out_table:
+    type: string
+    required: true
+    description: 输出统计表路径（workspace/output 下）
+  stat_fields:
+    type: string
+    required: true
+    description: 形如 "Y2020 SUM;Y2019 SUM" 或 "人口 SUM"
+  case_field:
+    type: string
+    required: true
+    description: 分组字段（如 name/code）
+steps:
+  - 校验字段存在
+  - Statistics 汇总
+  - 返回记录数
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  in_table = {{in_table}}
+  out_table = {{out_table}}
+  stat_fields = {{stat_fields}}
+  case_field = {{case_field}}
+
+  if not arcpy.Exists(in_table):
+      raise ValueError(f"输入不存在: {in_table}")
+
+  have = {f.name for f in arcpy.ListFields(in_table)}
+  parsed = []
+  for token in str(stat_fields).split(";"):
+      token = token.strip()
+      if not token:
+          continue
+      parts = token.split()
+      if parts[0] not in have:
+          raise ValueError(f"统计字段不存在: {parts[0]}；现有: {sorted(have)}")
+      parsed.append(token if len(parts) > 1 else f"{token} SUM")
+
+  out_parent = os.path.dirname(out_table)
+  # 注意：不要用 makedirs 造出假 .gdb 目录，必须用 CreateFileGDB
+  if str(out_parent).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_parent):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_parent), os.path.basename(out_parent)[:-4])
+  elif out_parent and not os.path.isdir(out_parent):
+      os.makedirs(out_parent, exist_ok=True)
+  if arcpy.Exists(out_table):
+      arcpy.management.Delete(out_table)
+
+  arcpy.analysis.Statistics(in_table, out_table, ";".join(parsed), case_field)
+
+  count = int(arcpy.management.GetCount(out_table)[0])
+  set_result({"output": out_table, "record_count": count, "stat_fields": parsed, "case_field": case_field})
+  print(f"Statistics done: {count} records")
+validation:
+  - type: file_exists
+    path: "{{out_table}}"
+  - type: feature_count_gt
+    path: "{{out_table}}"
+    value: 0
+pitfalls:
+  - 统计字段语法是 “字段 统计类型”，多个用分号分隔。
+  - 输出表记录数 = 案例字段的唯一值数。
+examples:
+  - "把区县人口按地市 name 汇总求和"

@@ -1,0 +1,69 @@
+id: minimum_bounding_geometry
+name: 最小包围几何（凸包/外包矩形）
+description: 生成要素的最小凸包或外包矩形，用于范围概化、服务范围近似、空间范围描述。
+domain: geometry
+category: geometry
+triggers: [凸包, 外包矩形, 包围盒, convex hull, bounding, 范围概化]
+preconditions:
+  - 输入为面/点/线要素
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入要素
+  output_path:
+    type: string
+    required: true
+    description: 输出面要素
+  geometry_type:
+    type: string
+    default: "CONVEX_HULL"
+    description: CONVEX_HULL（凸包）/ RECTANGLE_BY_AREA（按面积最小矩形）/ RECTANGLE_BY_WIDTH
+  group_option:
+    type: string
+    default: "NONE"
+    description: NONE=每个要素一个；ALL=全部合成一个
+steps:
+  - MinimumBoundingGeometry
+  - 返回要素数
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  geometry_type = {{geometry_type}}
+  group_option = {{group_option}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.management.MinimumBoundingGeometry(input_path, output_path, geometry_type, group_option)
+  count = int(arcpy.management.GetCount(output_path)[0])
+  if count == 0:
+      raise ValueError("包围几何结果为空")
+  e = arcpy.Describe(output_path).extent
+  set_result({"output": output_path, "feature_count": count, "geometry_type": geometry_type,
+              "extent": [e.XMin, e.YMin, e.XMax, e.YMax]})
+  print(f"MinimumBoundingGeometry done: {count} features, type={geometry_type}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - group_option="ALL" 时输出只有一个要素（整体范围）；按要素则需要分组字段。
+  - 凸包会明显大于实际范围，不适合替代真实边界做面积统计。
+examples:
+  - "求所有医院的凸包，概化服务范围"
+  - "取研究区外包矩形"

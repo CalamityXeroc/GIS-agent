@@ -1,0 +1,5 @@
+# 批处理必须 CRLF 存盘：cmd.exe 的 if (…)/for 多行块与行尾 REM 在裸 LF 下会散架
+# （实测：LF 存盘后长注释被切碎，满屏「'------' 不是内部或外部命令」）。
+# 显式声明 eol，避免 clone 时的 core.autocrlf 设置决定脚本能不能跑。
+*.bat text eol=crlf
+*.cmd text eol=crlf

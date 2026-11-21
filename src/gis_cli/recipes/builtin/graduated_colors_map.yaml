@@ -1,0 +1,188 @@
+id: graduated_colors_map
+name: 分级设色专题图（自动版式 + 可编辑工程）
+description: >
+  分级设色出图：先采集数据事实（范围长宽比、要素数、字段分布、九宫格占用度），
+  由制图规则引擎自动决定纸张朝向、图名格式与字号、图例内容与位置、比例尺整数刻度与单位、
+  指北针样式，再渲染导出 JPG 并保存可编辑 .aprx；渲染后自动做版面体检，不合格会微调重渲。
+  图例标签默认用简洁语义词（少/较少/中/较多/多），可选取整区间或两者结合。
+domain: cartography
+category: cartography
+triggers: [专题图, 制图, 分级设色, choropleth, 地图, 图例, 指北针, 比例尺, 出图, 版式]
+preconditions:
+  - 已确认分级字段真实存在且为数值型
+  - 输入为面要素（也支持栅格）
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入数据路径
+  field_name:
+    type: string
+    required: true
+    description: 分级字段名（必须是数据中真实存在的数值字段）
+  output_path:
+    type: string
+    required: true
+    description: 输出 JPG 路径
+  theme:
+    type: string
+    default: ""
+    description: 图主题材（如"老年人口"），决定图名与配色
+  title:
+    type: string
+    default: ""
+    description: 完整图名（给了就不再自动拼装）
+  region:
+    type: string
+    default: ""
+    description: 区域名（如"郑州市"），自动拼进图名
+  scale:
+    type: string
+    default: ""
+    description: 尺度词（如"社区尺度"），自动拼进图名
+  purpose:
+    type: string
+    default: "分布"
+    description: 用途（分布/评价/规划/对比/汇报），影响版式取舍
+  medium:
+    type: string
+    default: ""
+    description: 输出介质（print_A4 / print_A3 / screen_16_9），空则按数据自动
+  orientation:
+    type: string
+    default: "auto"
+    description: 朝向（auto/portrait/landscape）
+  class_bounds:
+    type: string
+    default: ""
+    description: >-
+      显式分级上界（逗号分隔，如 "0,50,100,200,400"）。多期/多图要共用同一图例时必传
+      （如 4 期核密度图），否则每张图按各自最小值起算、图例无法对比。
+      传了它就用 Manual 分级，级数由上界个数决定，class_count 参数会被忽略。
+  legend_labels:
+    type: string
+    default: ""
+    description: 图例标签（semantic 语义词 / range 取整区间 / both 两者），空则用档位默认
+  legend_title:
+    type: string
+    default: ""
+    description: 图例标题（空则用主题）
+  color_ramp_name:
+    type: string
+    default: ""
+    description: 色带名（如 Greens、YlOrRd），空则按主题自动
+  style_profile:
+    type: string
+    default: ""
+    description: 风格档位（competition_standard / screen_report / dense_raster），空则默认
+  aprx_path:
+    type: string
+    default: ""
+    description: 工程文件(.aprx)路径；空则与图片同名同目录
+  overrides:
+    type: object
+    default: {}
+    description: '强制覆盖设计（点路径，如 {"legend.outside": true, "title.height_pt": 18}）'
+steps:
+  - 采集数据事实（范围/字段分布/占用度）
+  - 规则引擎产出布局规格（纸张、图名、图例、比例尺、指北针、配色）
+  - 渲染导出 JPG + 保存 .aprx
+  - 版面体检（图名居中/图例不压数据/刻度整数/元素不越界），不合格则微调重渲
+code_template: |
+  import json, os
+  import arcpy
+  from gis_cli.cartography import create_map
+
+  input_path = {{input_path}}
+  field_name = {{field_name}}
+  output_path = {{output_path}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入数据不存在: {input_path}")
+  # 栅格输入不需要字段（分类/拉伸都按像元值来）——只有矢量才校验字段存在，
+  # 否则会出现"字段不存在: Value；可用字段: []"把栅格出图卡死（实测任务四a）。
+  _desc = arcpy.Describe(input_path)
+  _is_raster = str(getattr(_desc, "dataType", "")).lower().startswith("raster") or bool(getattr(_desc, "isRaster", False))
+  if not _is_raster:
+      fields = [f.name for f in arcpy.ListFields(input_path)]
+      if field_name not in fields:
+          raise ValueError(f"字段不存在: {field_name}；可用字段: {fields}")
+
+  intent = {
+      "class_bounds": {{class_bounds}},
+      "theme": {{theme}} or {{title}},
+      "title": {{title}},
+      "region": {{region}},
+      "scale": {{scale}},
+      "purpose": {{purpose}},
+      "medium": {{medium}},
+      "orientation": {{orientation}},
+      "legend_labels": {{legend_labels}},
+      "legend_title": {{legend_title}},
+      "color_ramp": {{color_ramp_name}},
+      "style_profile": {{style_profile}},
+      "field": field_name,
+      "overrides": {{overrides}},
+  }
+  result = create_map([input_path], intent, output_path=output_path,
+                      aprx_path={{aprx_path}}, field=field_name)
+
+  # 分级字段空值不上色：必须显式统计并报告，否则"未分析"与"值为 0"在图上无法区分
+  # 栅格没有属性表：arcpy.da.SearchCursor 打不开栅格（实测报 cannot open <raster>），
+  # 故按数据类型分流——矢量走 SearchCursor，栅格按 NoData 统计（栅格输入不再中断出图）。
+  total = 0
+  nulls = 0
+  if _is_raster:
+      try:
+          _nd = getattr(arcpy.Raster(input_path), "noDataValue", None)
+          _nd = -9999.0 if _nd is None else float(_nd)
+          _arr = arcpy.RasterToNumPyArray(input_path, None, None, None, _nd)
+          total = int(_arr.size)
+          nulls = int((_arr == _nd).sum())
+          print("栅格空值统计：NoData=" + str(_nd) + "，共 " + str(total) + " 像元，其中 NoData " + str(nulls))
+      except Exception as _exc:
+          print("栅格空值统计失败（忽略，不影响出图）: " + str(_exc)[:80])
+  else:
+      with arcpy.da.SearchCursor(input_path, [field_name]) as cur:
+          for (value,) in cur:
+              total += 1
+              if value is None:
+                  nulls += 1
+  null_rate = round(nulls / total, 4) if total else 0.0
+  if nulls:
+      print(f"注意：分级字段 {field_name} 有 {nulls}/{total} 个空值（{null_rate:.1%}）不上色，"
+              "请在结论中说明这些单元为「无数据」")
+
+  # 设计规格落盘（便于追溯与复现）
+  spec_path = os.path.splitext(result["output"])[0] + ".spec.json"
+  with open(spec_path, "w", encoding="utf-8") as fh:
+      json.dump({k: v for k, v in result.items() if k != "spec"}, fh, ensure_ascii=False, indent=2)
+
+  set_result({
+      "output": result["output"], "size": result.get("size"), "success": True,
+      "aprx": result.get("aprx"), "aprx_size": result.get("aprx_size"), "aprx_saved": result.get("aprx_saved"),
+      "design_note": result.get("design_note"), "qc_ok": result.get("qc_ok"),
+      "qc_summary": result.get("qc_summary"), "repair_rounds": result.get("repair_rounds"),
+      "spec_path": spec_path, "notes": (result.get("notes") or [])[:12],
+      "null_count": nulls, "total_count": total, "null_rate": null_rate,
+      "decisions": [f"{d.get('key')}={d.get('value')}" for d in (result.get("decisions") or [])],
+  })
+validation:
+  - type: file_exists
+    path: "{{output_path}}"
+  - type: image_not_blank
+    path: "{{output_path}}"
+  - type: result_key_truthy
+    key: "aprx_saved"
+  - type: file_exists
+    path: "{{output_path}}"
+    # 规格边车文件（同名 .spec.json）由代码模板写出，便于复现设计
+pitfalls:
+  - 字段名必须是数据中的真实字段（中文名可能被 DBF 截断），先 catalog_query 确认。
+  - 图例默认用语义词（少/较少/中/较多/多）保持简洁；需要精确数值时传 legend_labels=range（会自动取整）。
+  - 版式由规则引擎决定：数据近方形→A4 竖版；宽扁→横版；数据满覆盖时图例自动移到图框外。
+  - '想固定某个决定时用 overrides，例如 {"orientation": "portrait"} 或 {"legend.outside": true}。'
+  - 空值不上色，必须报告空值数量；要给全量上色先用 attribute_join_table 把结果挂回全量图层。
+examples:
+  - "用 ELDER_N 字段做老年人口分级设色图，theme=老年人口，region=郑州市，scale=社区尺度"
+  - "绿地服务价值分级图，legend_labels=range 让图例显示取整区间"

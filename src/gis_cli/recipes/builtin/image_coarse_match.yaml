@@ -1,0 +1,149 @@
+id: image_coarse_match
+name: 无空间参考影像的粗匹配（按范围对应重采样）
+description: >
+  影像没有空间参考（Extent 是像素坐标）时，按"整幅影像 ↔ 目标参考范围线性对应"的假设
+  重采样到目标网格并写入坐标系。适用于"没有地面控制点，只能按范围/尺寸粗匹配"的场景。
+domain: raster
+category: raster
+triggers: [影像匹配, 粗配准, 无空间参考, 缺少控制点, 配准, georeference, 影像对齐]
+preconditions:
+  - 已知目标范围/像元的参考数据（如 DEM 或研究区范围）
+  - 输入影像的像元值可读（多波段用 `路径/Band_2` 这样的子数据集名）
+params:
+  input_path:
+    type: string
+    required: true
+    description: 无空间参考的输入影像（如 Landsat.tif）
+  reference_path:
+    type: string
+    required: true
+    description: 参考数据（提供目标范围、像元与坐标系），如研究区面或已配准栅格
+  output_path:
+    type: string
+    required: true
+    description: 输出影像（TIFF）
+  cell_size:
+    type: number
+    default: 0
+    description: 输出像元大小（米）；0 则取参考栅格的像元大小
+  bands:
+    type: string
+    default: ""
+    description: 波段号逗号分隔（如 "1,2,3,4,5,6"）；留空则按输入的波段数全部处理
+  clip_to_reference:
+    type: boolean
+    default: true
+    description: 是否裁切到参考范围（面要素时按面裁切）
+steps:
+  - 读参考范围/像元/坐标系与输入波段
+  - 按"整幅 ↔ 目标范围"线性对应做重采样（最近邻，缺控制点时的粗匹配）
+  - 写出多波段影像并定义坐标系
+  - 返回各波段取值范围与输出网格
+code_template: |
+  import arcpy, os, numpy as np
+
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  reference_path = {{reference_path}}
+  output_path = {{output_path}}
+  cell_size = float({{cell_size}} or 0)
+  bands_spec = str({{bands}}).strip()
+  clip_to_reference = bool({{clip_to_reference}})
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入影像不存在: {input_path}")
+  if not arcpy.Exists(reference_path):
+      raise ValueError(f"参考数据不存在: {reference_path}")
+
+  ref_desc = arcpy.Describe(reference_path)
+  ref_extent = ref_desc.extent
+  ref_sr = ref_desc.spatialReference
+  if not getattr(ref_sr, "factoryCode", None):
+      raise ValueError("参考数据没有坐标系，无法确定目标坐标系")
+  if not cell_size:
+      cell_size = float(getattr(ref_desc, "meanCellWidth", 0) or 0)
+  if not cell_size:
+      raise ValueError("无法确定像元大小，请显式传 cell_size")
+
+  width_m = ref_extent.XMax - ref_extent.XMin
+  height_m = ref_extent.YMax - ref_extent.YMin
+  cols = int(np.ceil(width_m / cell_size))
+  rows = int(np.ceil(height_m / cell_size))
+
+  # 波段清单：无空间参考的影像用 Describe.bandCount 也可能失败，直接试读第一个波段
+  if bands_spec:
+      band_list = [int(b) for b in bands_spec.replace("，", ",").split(",") if b.strip()]
+  else:
+      band_list = []
+      probe_index = 1
+      while probe_index <= 32:
+          try:
+              arcpy.RasterToNumPyArray(f"{input_path}/Band_{probe_index}")
+              band_list.append(probe_index)
+              probe_index += 1
+          except Exception:
+              break
+      if not band_list:
+          band_list = [1]
+
+  def resample_to_grid(arr, target_rows, target_cols):
+      """整幅 ↔ 目标范围的线性对应重采样（最近邻，粗匹配）。"""
+      row_idx = np.clip(np.round((np.arange(target_rows) + 0.5) * (arr.shape[0] / target_rows) - 0.5).astype(int), 0, arr.shape[0] - 1)
+      col_idx = np.clip(np.round((np.arange(target_cols) + 0.5) * (arr.shape[1] / target_cols) - 0.5).astype(int), 0, arr.shape[1] - 1)
+      return arr[np.ix_(row_idx, col_idx)]
+
+  origin = arcpy.Point(ref_extent.XMin, ref_extent.YMin)
+  stats = {}
+  out_rasters = []
+  for index, band in enumerate(band_list, start=1):
+      src = f"{input_path}/Band_{band}"
+      try:
+          raw = arcpy.RasterToNumPyArray(src, nodata_to_value=np.nan).astype("float64")
+      except Exception as exc:
+          raise ValueError(f"读取 {src} 失败: {exc}")
+      matched = resample_to_grid(raw, rows, cols)
+      stats[str(band)] = [float(np.nanmin(matched)), float(np.nanmax(matched))]
+      band_out = output_path if len(band_list) == 1 else f"{os.path.splitext(output_path)[0]}_b{band}.tif"
+      raster = arcpy.NumPyArrayToRaster(matched.astype("float32"), origin, cell_size, cell_size, value_to_nodata=-9999)
+      raster.save(band_out)
+      arcpy.management.DefineProjection(band_out, ref_sr)
+      out_rasters.append(band_out)
+
+  clipped = []
+  if clip_to_reference and str(getattr(ref_desc, "dataType", "")).lower().startswith("feature"):
+      for band_out in out_rasters:
+          target = band_out.replace(".tif", "_clip.tif")
+          arcpy.management.Clip(in_raster=band_out, out_raster=target, rectangle="",
+                                in_template_dataset=reference_path, nodata_value="",
+                                clipping_geometry="ClippingGeometry")
+          clipped.append(target)
+
+  set_result({
+      "output": output_path,
+      "outputs": out_rasters,
+      "clipped": clipped,
+      "grid": {"rows": rows, "cols": cols, "cell": cell_size},
+      "band_ranges": stats,
+      "crs": getattr(ref_sr, "factoryCode", None),
+      "note": "无控制点：按整幅影像与参考范围的线性对应做粗匹配（最近邻）",
+  })
+  print(f"粗匹配完成: {len(out_rasters)} 个波段 → {output_path}")
+validation:
+  - type: raster_not_constant
+    path: "{{output_path}}"
+  - type: crs_wkid
+    path: "{{output_path}}"
+    value: 32610
+pitfalls:
+  - >-
+    **不要**指望 DefineProjection + ProjectRaster 能改范围：无参考影像的范围是像素坐标 （如 0~6000），投影后仍被当成米，研究区（几十万米）不在其中，Clip 会报 ERROR 001566「裁剪要素超出栅格范围」。必须按范围对应显式重采样。
+  - >-
+    多波段读取用子数据集名 `xxx.tif/Band_2`（RasterToNumPyArray 没有 band_index 参数）。
+  - >-
+    无参考 TIFF 的 NoData 常用 -1.79e308 之类哨兵表示，务必 `nodata_to_value=np.nan`， 否则 Min/Max 归一化会被毁掉。
+  - >-
+    这是"粗"匹配：没有控制点，只保证范围对应，不保证地物严格套合。
+examples:
+  - >-
+    把无空间参考的 Landsat 影像按研究区范围粗匹配到 UTM 10N

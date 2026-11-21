@@ -1,0 +1,133 @@
+id: gis14_am_combo_density_landcover
+name: 第14届（2025）上午 · 组合任务（核密度与迁移图 + 土地覆盖云区修补）
+source: A上午（组合，用于长任务/子代理 A/B）
+prompt: |
+  本工作区有第14届上午的两套数据，请完成**两件互不依赖的交付**，都写到 workspace/output。
+  两件事用到的数据、中间结果、图件都不同，可以分开推进。
+
+  ## 交付 A：动物点位 4 期核密度与分布中心迁移
+  数据：input/animal_points.shp（UTM 10N，字段 YEAR / COUNT / NAME / LON / LAT）、
+  input/study_area.shp（研究区矩形）。
+
+  1. 每 5 年一期核密度（1982-1986、1987-1991、1992-1996、1997-2001）：
+     搜索邻域面积 100 km²（半径 ≈ 5642 m），像元 100 m；每期一个栅格
+     output/result_data.gdb/kde_1982_1986 等。可先用
+     run_recipe(recipe_id=kernel_density, points=…, out_dir=…, periods=…,
+     neighborhood_area_km2=100, cell_size=100)，它会返回 suggested_bounds。
+  2. 4 张密度图必须**共用同一图例**：先把 4 期密度值放一起定统一分级（整数步长），
+     再每张都传同一个 class_bounds 出图，输出 output/成果图/密度_1982_1986.jpg 等，
+     每张都要有图名/图例/比例尺/指北针，并交付同名可编辑 .aprx。
+  3. 逐年分布中心（1982~2001，平均中心）→ output/result_data.gdb/year_centers（YEAR/X/Y/N）、
+     相邻年连线 output/result_data.gdb/migration_lines（FROM_YEAR/TO_YEAR/DIST_M），
+     另存 CSV output/分布中心.csv。
+  4. 迁移图 output/成果图/分布中心迁移.jpg（标年份、有箭头方向、图例说明箭头含义）+ .aprx。
+     箭头与年份标注用 create_map 的 intent["overlay"]（arrows + labels，二选一别重复）。
+
+  ## 交付 B：土地覆盖云区修补与分类面积统计
+  数据：input/landcover_clip.tif（UTM 10N，10 m，类别编码 1~11，10 = 云 Clouds）。
+  类别编码表（必须按此命名，不要自创）：
+    1 水域 WaterAreas ｜ 2 林地 Trees ｜ 4 淹没植被区 FloodedVegetationArea ｜
+    5 耕地 Crops ｜ 7 建筑区 BuiltAreas ｜ 8 裸地 BareGroundAreas ｜
+    9 雪/冰 SnoworIce ｜ 10 云 Clouds ｜ 11 牧场 RangelandsAreas
+
+  1. 设计并实现云区修补：把编码 10 的像元替换为**周边面积占比较多的其他地类**
+     （邻域众数 / 焦点统计 / 分块统计占比替换等，自行选择并说明理由）。
+     输出 output/landcover.gdb/landcover_fixed（UTM 10N、10 m、编码 1~11、**不含编码 10**）。
+  2. 基于修补后的数据统计各类面积（km²），写 output/分类面积统计.md：
+     每个类别一行（编码、名称、像元数、面积 km²，按 10 m 像元 = 100 m² 计）+ 合计行，
+     并说明修补前云像元数、修补后云像元数（应为 0）、各类因修补增加的像元数。
+  3. 云区修补前后对比图（加分）：output/云修补对比.jpg（修补前/后并排）。
+
+  完成后请分别说明：交付 A 的 4 期密度最大值、统一分级边界、20 个中心的迁移总量（km）；
+  交付 B 的云原始像元数、修补方法、修补后云像元数、各类面积统计表路径。
+inputs:
+  - source: "workspace/input/第14届真题数据/animal_points.shp"
+  - source: "workspace/input/第14届真题数据/study_area.shp"
+  - source: "workspace/input/第14届真题数据/landcover_clip.tif"
+requirements:
+  - id: a1
+    text: 四期核密度栅格（100 km² 邻域、100 m 像元）
+    acceptance: 4 个 kde_* 栅格存在且非常量
+  - id: a2
+    text: 4 张密度图共用同一图例
+    acceptance: 4 份 .spec.json 的实测分级完全一致
+  - id: a3
+    text: 逐年分布中心与迁移线
+    acceptance: year_centers 20 个、migration_lines 19 段，中心落在研究区内
+  - id: a4
+    text: 迁移图（带年份与方向）
+    acceptance: 迁移图 JPG 存在且非空白、版面体检通过
+  - id: b1
+    text: 云区修补（替换为周边占比多的地类）
+    acceptance: landcover_fixed 存在、不再含编码 10、其余类别编码不变
+  - id: b2
+    text: 分类面积统计表
+    acceptance: output/分类面积统计.md 存在，含各类别像元数与面积（km²）及合计
+assertions:
+  - type: raster_not_constant
+    path: "output/result_data.gdb/kde_1982_1986"
+  - type: raster_not_constant
+    path: "output/result_data.gdb/kde_1997_2001"
+  - type: raster_stat_between
+    path: "output/result_data.gdb/kde_1982_1986"
+    stat: "max"
+    value: [2.0, 12.0]
+  - type: vector_exists
+    path: "output/result_data.gdb/year_centers"
+  - type: feature_count_between
+    path: "output/result_data.gdb/year_centers"
+    value: [18, 20]
+  - type: bbox_between
+    path: "output/result_data.gdb/year_centers"
+    value:
+      xmin: [325000, 355000]
+      ymin: [4533000, 4600000]
+      xmax: [330000, 360000]
+      ymax: [4534000, 4610000]
+  - type: feature_count_between
+    path: "output/result_data.gdb/migration_lines"
+    value: [17, 19]
+  - type: shared_legend_bounds
+    path: "output/成果图"
+    pattern: "密度_*.spec.json"
+    value: {"min_files": 4}
+  - type: file_exists
+    path: "output/成果图/分布中心迁移.jpg"
+  - type: image_not_blank
+    path: "output/成果图/分布中心迁移.jpg"
+  - type: map_layout_ok
+    path: "output/成果图/分布中心迁移.aprx"
+    image: "output/成果图/分布中心迁移.jpg"
+  - type: raster_not_constant
+    path: "output/landcover.gdb/landcover_fixed"
+  - type: raster_value_absent
+    path: "output/landcover.gdb/landcover_fixed"
+    value: [10]
+  - type: raster_stat_between
+    path: "output/landcover.gdb/landcover_fixed"
+    stat: "min"
+    value: [1, 2]
+  - type: raster_stat_between
+    path: "output/landcover.gdb/landcover_fixed"
+    stat: "max"
+    value: [9, 11]
+  - type: bbox_between
+    path: "output/landcover.gdb/landcover_fixed"
+    value:
+      xmin: [323000, 329000]
+      ymin: [4531000, 4536000]
+      xmax: [357000, 363000]
+      ymax: [4594000, 4600000]
+  - type: file_exists
+    path: "output/分类面积统计.md"
+  - type: file_contains
+    path: "output/分类面积统计.md"
+    value: "林地"
+  - type: file_contains
+    path: "output/分类面积统计.md"
+    value: "建筑区"
+  - type: file_contains
+    path: "output/分类面积统计.md"
+    value: "km"
+timeout_seconds: 5400
+max_turns: 120

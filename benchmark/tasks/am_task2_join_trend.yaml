@@ -1,0 +1,34 @@
+id: am_task2_join_trend
+name: AM 任务二 · 数据关联与条件查询
+source: B上午
+prompt: |
+  请完成第十三届 GIS 大赛 B 卷上午的"任务二：数据关联与条件查询"：
+  1. 把 population.csv（区县 2011-2020 逐年人口）挂接到 county 面要素上，使其成为面要素属性。
+  2. 基于 2020 年人口数据，找出"人口数量大于与之接壤的所有区县（含自身）人口均值"的区县，
+     并用颜色在地图上突出展示。
+  3. 在挂接人口数据的 county 中新增 trend_type 字段：2011-2020 年人口每年都在增长的区县赋值为 1，
+     其他赋值为 0。
+  请用中文说明方法论、关键参数，并交付可核查的产物（属性表 + 一张突出显示的地图）。
+inputs:
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/city.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/county.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/population.CSV"
+requirements:
+  - id: r1
+    text: population 十年数据挂接到 county 面要素
+    acceptance: county 结果含各年人口字段
+  - id: r2
+    text: 识别 2020 年人口高于邻接区县均值的目标区县
+    acceptance: 产出含标识字段或专题图
+  - id: r3
+    text: 新增 trend_type 字段并正确赋值 0/1
+    acceptance: 字段存在且取值仅 0/1
+assertions:
+  - type: vector_exists
+    path: "output/county_pop.shp"
+  - type: fields_present
+    path: "output/county_pop.shp"
+    value: ["trend_type"]
+  - type: file_exists
+    path: "output/county_highlight.jpg"
+timeout_seconds: 2400

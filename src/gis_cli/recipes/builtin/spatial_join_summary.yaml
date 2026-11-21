@@ -1,0 +1,86 @@
+id: spatial_join_summary
+name: 空间连接统计
+description: 把点/面要素按空间关系连接（如点落入面），并统计每区内的数量/属性汇总。
+domain: spatial_analysis
+triggers: [空间连接, spatial join, 统计数量, 落入, 每个区有多少, 点面关联]
+preconditions:
+  - 两个图层坐标系一致
+params:
+  target_path:
+    type: string
+    required: true
+    description: 目标要素（如行政区/社区）
+  join_path:
+    type: string
+    required: true
+    description: 被连接要素（如医院/建筑点）
+  output_path:
+    type: string
+    required: true
+  match_option:
+    type: string
+    default: "INTERSECT"
+    description: 空间关系，INTERSECT/WITHIN/CLOSEST 等
+  summary_fields:
+    type: string
+    default: ""
+    description: 可选，形如 "字段 SUM,字段2 MEAN"，空则只计数
+steps:
+  - 检查坐标系
+  - SpatialJoin
+  - 返回结果要素数
+code_template: |
+  import arcpy
+  arcpy.env.overwriteOutput = True
+
+  target_path = {{target_path}}
+  join_path = {{join_path}}
+  output_path = {{output_path}}
+  match_option = {{match_option}}
+  summary_fields = {{summary_fields}}
+
+  if not arcpy.Exists(target_path) or not arcpy.Exists(join_path):
+      raise ValueError("目标或被连接数据不存在")
+  if arcpy.Describe(target_path).spatialReference.name != arcpy.Describe(join_path).spatialReference.name:
+      raise ValueError("两个图层坐标系不一致，请先统一投影")
+
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  field_mapping = None
+  if summary_fields:
+      field_mapping = ";".join(summary_fields.split(","))
+      arcpy.analysis.SpatialJoin(
+          target_features=target_path,
+          join_features=join_path,
+          out_feature_class=output_path,
+          join_operation="JOIN_ONE_TO_ONE",
+          join_type="KEEP_ALL",
+          match_option=match_option,
+          field_mapping=field_mapping,
+      )
+  else:
+      arcpy.analysis.SpatialJoin(
+          target_features=target_path,
+          join_features=join_path,
+          out_feature_class=output_path,
+          join_operation="JOIN_ONE_TO_ONE",
+          join_type="KEEP_ALL",
+          match_option=match_option,
+      )
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({"output": output_path, "feature_count": count, "match_option": match_option})
+  print(f"Spatial join done: {count} features")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - JOIN_ONE_TO_ONE + KEEP_ALL 会保留没有匹配的目标要素（Join_Count=0），这是多数统计场景想要的。
+  - 字段重名时结果会自动加后缀，取字段前先 ListFields 确认。
+examples:
+  - "统计每个社区内的医院数量"
+  - "每个行政区包含多少个建筑点"

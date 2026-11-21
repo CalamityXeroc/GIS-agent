@@ -1,0 +1,173 @@
+id: public_service_value_rank
+name: 公共服务服务价值排序（前后 N 名）
+description: >-
+  口径：社区面（含绿地面积 GREEN_AREA、老年人口 ELDER_COMM）+ 老年人口栅格 →
+  社区中心点 service_radius 范围内的老年人口（SUM_VALUE，圆形缓冲区逐像元解析求和，
+  支持缓冲区互相重叠）→ 服务价值 SERVICE_VALUE = 服务人口 / 绿地面积
+  （无绿地的社区为空值，不填 0）→ 按 SERVICE_VALUE 排前后 top_n / bottom_n 名并导出两个名单。
+  回答「哪些社区的绿地服务价值最高、哪些最该整改」。
+  只做服务价值这一维的排名；人均绿地指数（PER_CAPITA）那一维不在本模板内。
+version: "1.0"
+# 只声明 arcpy：链上有 3 个 arcpy-only 配方——feature_to_centroid（要素转点）、
+# rank_top_bottom_flag（排名标记）、select_by_attribute（属性筛选导出），
+# 它们没有 GDAL 版，写 [arcpy, gdal] 会让 GDAL-only 机器跑到第 3 步才炸。
+# 预检阶段就会因为「某步配方只有 arcpy」而整条链拒绝执行，并报「需 ArcGIS」。
+backend: [arcpy]
+
+data:
+  communities:
+    type: vector
+    required: true
+    purpose: >-
+      社区边界面。需带整型唯一 ID 字段（默认 COMM_ID）：中心点按它带出服务人口、
+      挂接回社区、排名标记都靠它；还需要 GREEN_AREA（绿地面积，m²）与
+      ELDER_COMM（社区老年人口，人——后 N 名在服务价值为空时按它降序排「整改迫切性」）。
+      坐标系不限，模板第 2 步统一投影到 target_srid
+  elderly_raster:
+    type: raster
+    required: true
+    purpose: >-
+      老年人口栅格（人/像元，60+ 或 65+ 口径）。必须已是 target_srid 的坐标系与格网：
+      模板不重投影栅格（重采样会改人口总量，这个决定不替用户做）。
+      缓冲区求和按「像元中心到中心点的距离 ≤ 半径」解析判定，所以格网越细越准
+  target_srid:
+    type: integer
+    required: false
+    default: 4527
+    purpose: 分析用投影坐标系 EPSG/WKID（默认 4527，米制；缓冲区半径才有物理意义，且必须与栅格一致）
+  service_radius:
+    type: integer
+    required: false
+    default: 500
+    purpose: 社区中心点的服务半径（target_srid 的投影单位，即米；默认 500 米）
+  community_id_field:
+    type: string
+    required: false
+    default: COMM_ID
+    purpose: >-
+      社区唯一标识字段名，必须是整型（Long/Short）：point_buffer_raster_sum 的 id_field
+      会按 LONG 建字段，文本 ID 会在写表时被转成整数（不同社区可能撞号）
+  top_n:
+    type: integer
+    required: false
+    default: 500
+    purpose: 服务价值前 N 名的名额（默认 500，对应源任务的「前 500 名」）
+  bottom_n:
+    type: integer
+    required: false
+    default: 500
+    purpose: 服务价值后 N 名的名额（默认 500；服务价值为空的社区按 ELDER_COMM 降序优先占名额）
+
+pipeline:
+  # point_buffer_raster_sum（arcpy 端）只往**已存在**的文件地理数据库里建表：
+  # 它拒绝 .dbf / 内存工作空间，所以先显式建结果库，而不是等它报错。
+  - id: result_gdb
+    recipe_id: create_file_gdb
+    params:
+      gdb_path: $out/result_data.gdb
+      recreate: true
+  - id: project_communities
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.communities
+      output_path: $out/result_data.gdb/communities_proj
+      target_srid: $data.target_srid
+  # 中心点必须从**投影后**的社区面转出来：点与栅格的坐标系要逐字一致
+  # （point_buffer_raster_sum 直接比对两个图层的坐标系名称）。
+  - id: centroids
+    recipe_id: feature_to_centroid
+    params:
+      input_path: $steps.project_communities.output
+      output_path: $out/result_data.gdb/comm_centroid
+  # 源任务明说不要用「缓冲区面转栅格」：一个像元只能归属一个分区，几千个互相重叠的
+  # 500 米缓冲区会丢数（这也是不需要 comm_buffer_500 面图层的原因）。
+  - id: service_pop
+    recipe_id: point_buffer_raster_sum
+    params:
+      points_path: $steps.centroids.output
+      id_field: $data.community_id_field
+      raster_path: $data.elderly_raster
+      radius: $data.service_radius
+      output_table: $out/result_data.gdb/buffer_elder_tbl
+  - id: service_join
+    recipe_id: attribute_join_table
+    params:
+      target_path: $steps.project_communities.output
+      target_key: $data.community_id_field
+      join_table: $steps.service_pop.output
+      join_key: $data.community_id_field
+      join_fields: SUM_VALUE
+      output_path: $out/result_data.gdb/community_service
+  - id: service_value
+    recipe_id: field_calculate
+    params:
+      input_path: $steps.service_join.output
+      # 服务价值 = 服务人口 / 绿地面积（人/m²）。无绿地（GREEN_AREA=0）或服务人口缺失时
+      # 留空值，**不填 0**：填 0 会让「无绿地」和「有绿地但服务人口为 0」混为一谈，
+      # 而源任务的排名口径正是「SERVICE_VALUE 为空 = 无绿地 = 最该整改」。
+      field_name: SERVICE_VALUE
+      expression: "!SUM_VALUE! / !GREEN_AREA! if (!GREEN_AREA! and !SUM_VALUE! is not None) else None"
+      field_type: DOUBLE
+  # 排名：前 N 名只从有值要素里取；后 N 名里空值视为最差、优先占名额，
+  # 空值内部按 ELDER_COMM 降序（老年人口越多越迫切）——与源任务的 BOT_SVC 口径一致。
+  - id: rank
+    recipe_id: rank_top_bottom_flag
+    params:
+      input_path: $steps.service_value.output
+      rank_field: SERVICE_VALUE
+      output_path: $out/result_data.gdb/community_rank
+      top_n: $data.top_n
+      bottom_n: $data.bottom_n
+      bottom_include_null: true
+      second_field: ELDER_COMM
+  - id: top_communities
+    recipe_id: select_by_attribute
+    params:
+      input_path: $steps.rank.output
+      output_path: $out/result_data.gdb/top_communities
+      where_clause: "TOP_FLAG = 1"
+      expect_min: 1
+  - id: bottom_communities
+    recipe_id: select_by_attribute
+    params:
+      input_path: $steps.rank.output
+      output_path: $out/result_data.gdb/bottom_communities
+      where_clause: "BOTTOM_FLAG = 1"
+      expect_min: 1
+
+assertions:
+  # 缓冲区统计表：每个社区一行（点转丢了会少行），服务人口合计不能为 0
+  # （全 0 最常见的原因是格网/坐标系对不上，或者栅格值其实是密度权重而不是人数）。
+  - type: feature_count_between
+    path: $steps.service_pop.output
+    value: [1, $steps.project_communities.feature_count]
+  - type: field_sum_gt
+    path: $steps.service_pop.output
+    field: SUM_VALUE
+    value: 0
+  - type: fields_present
+    path: $steps.rank.output
+    value: ["SUM_VALUE", "SERVICE_VALUE", "TOP_FLAG", "BOTTOM_FLAG"]
+  # 排名用的是 CopyFeatures：要素数必须与投影后的社区面一致（丢要素 = 链路出错）
+  - type: feature_count_between
+    path: $steps.rank.output
+    value: [1, $steps.project_communities.feature_count]
+  # 前 N 名 / 后 N 名的标记数是 0/1 之和，落在 [1, N] 之外说明排序或空值策略写歪了
+  # （空值策略坏了会让后 N 名把有值社区挤掉，或者一个都没标记上）。
+  - type: field_stats_between
+    path: $steps.rank.output
+    field: TOP_FLAG
+    stat: sum
+    value: [1, $data.top_n]
+  - type: field_stats_between
+    path: $steps.rank.output
+    field: BOTTOM_FLAG
+    stat: sum
+    value: [1, $data.bottom_n]
+  # 两个名单是从排名结果里筛出来的：非空，且不超过各自名额
+  - type: feature_count_between
+    path: $steps.top_communities.output
+    value: [1, $data.top_n]
+  - type: feature_count_between
+    path: $steps.bottom_communities.output
+    value: [1, $data.bottom_n]

@@ -1,0 +1,84 @@
+id: map_quality_eval
+name: 社区尺度评价图（分类设色 + 可编辑工程）
+description: >-
+  口径：带前后 N 名标记（TOP_FLAG / BOTTOM_FLAG）的社区面 → 合并成一个「类别」字段
+  （标杆社区 / 需整改社区 / 其他）→ 按类别设色出图（标杆=蓝 #1F77B4、需整改=绿 #2CA02C、
+  其他=浅灰 #E8E8E8），同时导出 JPG 与可编辑 .aprx（工程里有图名/图例/比例尺/指北针，
+  渲染器是唯一值）。回答「评价结果长什么样、能不能直接交付成图」。
+  只做「一屏分类评价图」这一件事：不做分级设色、不做多期对比、不做报告。
+version: "1.0"
+# 只声明 arcpy：category_map 是 arcpy-only（唯一值渲染器、版式自动编排、.aprx 工程都靠
+# arcpy.mp），链上第 1 步的 field_calculate 也是 arcpy-only。GDAL-only 机器上预检即报「需 ArcGIS」。
+backend: [arcpy]
+
+data:
+  community_service:
+    type: vector
+    required: true
+    purpose: >-
+      评价结果图层（社区面）。必须带 TOP_FLAG / BOTTOM_FLAG 两个 0/1 标记字段——
+      public_service_value_rank 的排名产物直接就能用。同时需要一个类名字段供图例显示
+      （默认取第一个字符串字段，如 NAME）。
+      注意：BOTTOM_FLAG 是 11 个字符，.shp 的 dBASE 字段名上限 10，会被截成 BOTTOM_FLA
+      —— 所以这个图层必须放在 .gdb / .gpkg 里（排名模板的产物本来就在 .gdb 内）
+  map_title:
+    type: string
+    required: false
+    default: 社区服务价值评价
+    purpose: 图名（落在版面图名文本框与 .aprx 里；不给则用默认值）
+
+pipeline:
+  # 先复制一份再改：field_calculate 是原地加字段，直接改用户传进来的图层会在
+  # 调用方的原始数据上留下 CATEGORY 字段（重跑还会因为「字段已存在」直接失败）。
+  # 产物同样落在 .gdb 里：CATEGORY 之外的标记字段名（BOTTOM_FLAG 11 字符）
+  # 只有在 .gdb/.gpkg 里才不会被截断，也方便与上游排名产物同库对齐。
+  - id: copy_input
+    recipe_id: select_by_attribute
+    params:
+      input_path: $data.community_service
+      output_path: $out/community_eval.gdb/community_eval
+      where_clause: "1 = 1"
+      expect_min: 1
+  # 两个名单合并成一个类别字段。判定顺序是「标杆优先」：同时入选前后 N 名（两者数量
+  # 之和可能超过社区数）时算标杆社区，与源任务「属于标杆清单的标为标杆社区」一致。
+  - id: category
+    recipe_id: field_calculate
+    params:
+      input_path: $steps.copy_input.output
+      field_name: CATEGORY
+      expression: "\"标杆社区\" if !TOP_FLAG! == 1 else (\"需整改社区\" if !BOTTOM_FLAG! == 1 else \"其他\")"
+      field_type: TEXT
+  - id: map
+    recipe_id: category_map
+    params:
+      input_path: $steps.category.output
+      category_field: CATEGORY
+      # 配色是交付口径的一部分：标杆=蓝、需整改=绿、其余=浅灰，改色要同步改 docs。
+      category_colors: "标杆社区:#1F77B4;需整改社区:#2CA02C"
+      other_color: "#E8E8E8"
+      title: $data.map_title
+      output_path: $out/community_eval_map.jpg
+
+assertions:
+  - type: fields_present
+    path: $steps.category.output
+    value: ["CATEGORY"]
+  # 三类都得在：只有两类说明标记字段读错了（比如把 TOP_FLAG 当类别用），
+  # 一类都没有说明 where/字段名根本没绑上。
+  - type: field_distinct_gt
+    path: $steps.category.output
+    field: CATEGORY
+    value: 2
+  - type: file_exists
+    path: $steps.map.output
+  # 「非空白」不是文件存在：读图算标准差，纯白/纯黑版面会红。
+  - type: image_not_blank
+    path: $steps.map.output
+  - type: file_exists
+    path: $steps.map.aprx
+  # 可编辑工程要能打开且版面齐全：唯一值渲染器 + 两类配色 + 图名/图例/比例尺/指北针。
+  - type: aprx_map_check
+    path: $steps.map.aprx
+    renderer: UniqueValueRenderer
+    colors: "标杆社区=#1F77B4;需整改社区=#2CA02C"
+    elements: ["图名", "图例", "比例尺", "指北针"]

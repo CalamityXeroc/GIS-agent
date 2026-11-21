@@ -1,0 +1,704 @@
+# -*- coding: utf-8 -*-
+"""Persistent ArcPy kernel.
+
+Runs a long-lived Jupyter kernel inside the ArcGIS Pro Python environment so
+that ``arcpy`` is imported once and Python state survives across agent steps.
+
+Design notes
+------------
+- The kernel is launched through a generated kernelspec that pins the ArcGIS
+  Pro interpreter, so the agent process itself does not have to be that
+  interpreter.
+- Every call is single-flight; the caller owns the session.
+- On timeout we try a soft interrupt first; if the kernel does not come back
+  promptly the caller may ``restart()``.
+- All payloads crossing the boundary are JSON-serializable.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from . import env_guard
+
+logger = logging.getLogger(__name__)
+
+_RESULT_VAR = "__arcpy_engine_result__"
+
+#: 取结果的哨兵（一行前缀，避免与用户自己的 print 撞车）
+_RESULT_MARKER = "__ENGINE_RESULT__"
+
+#: 拼在用户代码后面的“取结果”尾巴。
+#:
+#: 为什么这么做：以前 ``execute()`` 先跑用户代码、再发一条消息跑
+#: ``_fetch_result()`` —— 每次执行要两趟 ZMQ 往返（发消息 + 收 iopub +
+#: 等 idle，每趟都有固定开销）。把取结果拼进同一次执行后只需一趟。
+#:
+#: **执行前先把结果置 None**：结果变量是持久命名空间里的全局量，上一步
+#: ``set_result`` 的值会留到这一步 —— 不重置的话，“这次没调 set_result”
+#: 会静默返回**上一步的旧结果**（实测：``x=1`` 返回了上一次的 ``[1,2,3]``），
+#: 模型会拿着过期数据继续干活。
+#:
+#: 用 ``try`` 包住：结果里有不可序列化对象时，不能让“取结果”反过来把一次
+#: 成功的执行变失败（旧路径里这一步失败也只是返回 None）。
+#: 用 ``sys.stdout`` 直写而不是 print：用户代码可能重定向了 sys.stdout，
+#: 直写拿到的才是真正的 iopub 流。
+_RESULT_TAIL = (
+    "\n"
+    "try:\n"
+    "    import json as _json, sys as _sys\n"
+    f"    _sys.stdout.write('{_RESULT_MARKER}' + _json.dumps("
+    f"globals().get('{_RESULT_VAR}'), default=str) + '\\n')\n"
+    "    _sys.stdout.flush()\n"
+    "except Exception:\n"
+    "    pass\n"
+    "finally:\n"
+    f"    globals()['{_RESULT_VAR}'] = None\n"
+)
+
+#: 拼在用户代码**前面**的“清结果”头（避免读到上一步的旧结果）。
+_RESULT_HEAD = f"globals()['{_RESULT_VAR}'] = None\n"
+
+#: 哨兵没出现时的标记（与“结果就是 None”区分开）
+_RESULT_MISSING = object()
+
+
+def _split_result(stdout: str) -> tuple[Any, str]:
+    """从 stdout 里剖出结果行，返回 ``(结果, 去掉结果行后的 stdout)``。
+
+    结果行取**最后一次**出现的哨兵：用户代码自己 print 里如果恰好含同样
+    字样，后面拼的那行才是真正的结果。
+    """
+    idx = stdout.rfind(_RESULT_MARKER)
+    if idx < 0:
+        return _RESULT_MISSING, stdout
+    head = stdout[:idx]
+    line_end = stdout.find("\n", idx)
+    payload = stdout[idx + len(_RESULT_MARKER): line_end if line_end >= 0 else len(stdout)].strip()
+    tail = stdout[line_end + 1:] if line_end >= 0 else ""
+    if not payload or payload == "null":
+        return None, head + tail
+    try:
+        return json.loads(payload), head + tail
+    except Exception:
+        # 非 JSON（理论上有 default=str 不会发生）：原样当字符串返回
+        return payload, head + tail
+
+
+_PRELUDE = f'''
+import builtins as _bi
+import os as _os
+# 内核进程的启动目录：只在这里捕获一次（_cwd_launch 是常量，不会漂移）。
+# 以前每次 execute 都 getcwd()，上一次异常把 cwd 留在工作区里，
+# 恢复目标就永久挪一格，再也回不到启动目录（DAIR-13）。
+_cwd_launch = _os.getcwd()
+{_RESULT_VAR} = None
+
+def set_result(value):
+    global {_RESULT_VAR}
+    {_RESULT_VAR} = value
+
+_bi.{_RESULT_VAR} = None
+
+# 中文字体与绘图环境：matplotlib 默认字体没有中文字形，图里中文会变方框（tofu）。
+# 统一配置一次（缺 matplotlib 时静默跳过），保证 agent 自绘图的中文可读。
+try:
+    from gis_cli.runtime.mpl_setup import configure as _mpl_configure
+    _mpl_configure()
+except Exception:
+    pass
+'''
+
+
+def _cwd_prefix_statements(safe_workspace: str) -> str:
+    """execute 前缀里的 CWD 语句（先回启动目录，再进本次工作区）。
+
+    execute 和测试共用这一份：测试用 exec 真跑同一段语句，
+    而不是只断言“字符串在不在”。
+    """
+    return (
+        "_os.chdir(_cwd_launch)\n"
+        f"_os.chdir(r'{safe_workspace}')\n"
+    )
+
+
+def _chdir_back_stmt() -> str:
+    """cwd 归位语句（用户代码抛异常时 cell 会中断，execute 在错误路径补一趟）。"""
+    return "_os.chdir(_cwd_launch)\n"
+
+
+class KernelError(RuntimeError):
+    """Base kernel failure."""
+
+
+_NOISE_MARKERS = (
+    "Unable to load code page translation table",
+    "Code page conversion is off",
+)
+
+
+def _strip_arcgis_noise(text: str) -> str:
+    """Drop ArcGIS locale warnings that pollute kernel stdout."""
+    if not text or not any(marker in text for marker in _NOISE_MARKERS):
+        return text
+    kept = [
+        line
+        for line in text.splitlines(keepends=True)
+        if not any(marker in line for marker in _NOISE_MARKERS)
+    ]
+    return "".join(kept)
+
+
+class KernelTimeout(KernelError):
+    """Execution exceeded its timeout."""
+
+
+@dataclass
+class ExecResult:
+    """Result of one kernel execution."""
+
+    ok: bool
+    stdout: str = ""
+    stderr: str = ""
+    result: Any = None
+    error: dict[str, Any] | None = None
+    duration_ms: int = 0
+    interrupted: bool = False
+    display_images: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "result": self.result,
+            "error": self.error,
+            "duration_ms": self.duration_ms,
+            "interrupted": self.interrupted,
+            "display_images": self.display_images,
+        }
+
+
+class ArcpyKernel:
+    """A persistent Jupyter kernel for ArcPy code execution."""
+
+    def __init__(
+        self,
+        *,
+        python_executable: str | None = None,
+        state_dir: str | Path | None = None,
+        kernel_name: str = "arcpy-engine",
+        startup_timeout: float = 180.0,
+        workspace: str | None = None,
+        watchdog_grace: float = 45.0,
+    ):
+        self.python_executable = python_executable or self._discover_arcgis_python()
+        self.state_dir = Path(state_dir or Path.home() / ".gis_agent" / "kernel")
+        self.kernel_name = kernel_name
+        self.startup_timeout = startup_timeout
+        self.workspace = workspace
+        self.watchdog_grace = watchdog_grace
+        self._km: Any = None
+        self._kc: Any = None
+        #: 内核子进程 stdout/stderr 的落点（见 :meth:`_child_stream_kwargs`）
+        self._child_log: Any = None
+        #: 日志路径。句柄在 ``shutdown()`` 里关掉后仍保留：启动失败时界面要拿它
+        #: 告诉用户 traceback 在哪（DAIR-320）。
+        self.log_path: Path | None = None
+        self._started = False
+        self._namespace_dirty = False
+        self._exec_count = 0
+        #: 执行串行化锁。
+        #:
+        #: **必须**：ZMQ socket 不是线程安全的。预热把内核建在后台线程、
+        #: 主线程随后执行代码时，两边的 socket 操作会交叉写坏 wire 协议。
+        #: 实测症状（可复现）：内核侧报 ``Invalid Signature: b'<IDS|MSG>'``
+        #: / ``DELIM not in msg_list``，客户端侧报 zmq ``Bad address``。
+        #: 锁把"发消息 + 收 iopub/shell + 取结果"整段封起来。
+        self._exec_lock = threading.RLock()
+
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _discover_arcgis_python() -> str:
+        try:
+            from ..arcpy_bridge import discover_arcgis_pro_python
+
+            return discover_arcgis_pro_python().python_executable
+        except Exception as exc:
+            # 发现失败的原因和候选链都在 arcpy_bridge，这里只排版、不另写一份：
+            # 只留一句英文 "not found" 时用户得自己猜是注册表坏了还是装到别处了。
+            from ..arcpy_bridge import discovery_routes
+
+            raise KernelError(
+                "未找到 ArcGIS Pro Python，持久内核无法启动。已试过："
+                + "；".join(discovery_routes())
+                + "。修好后重试；找不到 Pro 期间每步会退回一次性子进程（重新导入 arcpy，约 15s）。"
+            ) from exc
+
+    def _ensure_kernelspec(self) -> None:
+        """Create a kernelspec pinned to the ArcGIS Pro interpreter."""
+        spec_dir = self.state_dir / "kernels" / self.kernel_name
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        kernel_json = {
+            "argv": [
+                self.python_executable,
+                "-m",
+                "ipykernel_launcher",
+                "-f",
+                "{connection_file}",
+            ],
+            "display_name": "ArcPy Engine (ArcGIS Pro)",
+            "language": "python",
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "FOR_DISABLE_CONSOLE_CTRL_HANDLER": "1",
+            },
+        }
+        (spec_dir / "kernel.json").write_text(
+            json.dumps(kernel_json, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        existing = os.environ.get("JUPYTER_PATH", "")
+        paths = [p for p in existing.split(os.pathsep) if p]
+        if str(self.state_dir) not in paths:
+            os.environ["JUPYTER_PATH"] = os.pathsep.join([str(self.state_dir), *paths])
+
+    # ------------------------------------------------------------ life cycle
+    def start(self) -> None:
+        """Start the kernel and verify arcpy is importable."""
+        if self._started and self.is_alive():
+            return
+        from .timing import StageTimer
+
+        _timer = StageTimer("kernel.start")
+        self._ensure_kernelspec()
+        try:
+            from jupyter_client.manager import KernelManager
+        except ImportError as exc:  # pragma: no cover
+            # 这里是**跑 agent 的那个解释器**缺包，不是内核解释器缺包。
+            # 以前的文案写“Install it in the ArcGIS Pro Python environment”会把人
+            # 带去错的地方：ArcGIS 环境本来就有，缺的往往是 venv。
+            raise KernelError(
+                "persistent kernel needs jupyter_client in the interpreter running the "
+                f"agent ({sys.executable}); install it there (pip install jupyter-client). "
+                "Without it every step falls back to a fresh subprocess that re-imports "
+                "arcpy (~15s) and loses cross-step variables."
+            ) from exc
+
+        self._km = KernelManager(kernel_name=self.kernel_name)
+        self._km.start_kernel(**self._child_stream_kwargs())
+        self._kc = self._km.client()
+        self._kc.start_channels()
+        try:
+            self._kc.wait_for_ready(timeout=self.startup_timeout)
+        except Exception as exc:
+            # 子进程输出已经接进日志文件，启动失败时终端上看不到 traceback，
+            # 把日志路径随错误一起给出（否则只会看到一句“没就绪”）。
+            hint = f" (child output: {self._child_log.name})" if self._child_log is not None else ""
+            self.shutdown()
+            raise KernelError(f"Kernel did not become ready: {exc}{hint}") from exc
+
+        self._started = True
+        self._exec_count = 0
+        self._namespace_dirty = False
+        self._run_prelude()
+        probe = self.execute("import arcpy; print('arcpy', arcpy.GetInstallInfo()['Version'])", timeout=120)
+        if not probe.ok:
+            self.shutdown()
+            raise KernelError(f"Kernel started but arcpy is unavailable: {probe.error}")
+        # 分解：进程+连接就绪 vs 导入 arcpy（后者是大头，实测十几秒）
+        _timer.done(startup=".", exec_ms=probe.duration_ms)
+
+    def _child_stream_kwargs(self) -> dict[str, Any]:
+        """把内核子进程的 stdout/stderr 接到日志文件，返回 ``start_kernel`` 的参数。
+
+        为什么必须接走：arcpy/GDAL 的原生库直接写 fd 1/2（不过 Python 的
+        ``sys.stdout``），所以 :func:`_strip_arcgis_noise` 那条 IOPub 过滤拦不住。
+        实测会把 ``WARNING: Unable to load code page translation table …`` 和
+        ``Code page conversion is off …`` 直接打进输入框，把框和状态行拆成
+        碎片（DAIR-312）。写进 ``.gis_agent/logs/kernel.log`` 还能事后查。
+
+        拿不到日志文件时返回空 dict（保持旧行为：继承控制台）——日志写不了不能
+        连带内核起不动。
+        """
+        if self._child_log is not None:
+            return {"stdout": self._child_log, "stderr": self._child_log}
+        try:
+            log_dir = Path(self.workspace or self.state_dir) / ".gis_agent" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            # 二进制：不经 Python 编码层，原生库写什么就落什么。
+            # 追加而不是 "wb"：``shutdown()`` 会关句柄并置 None，启动失败重试 /
+            # ``restart()`` 回退都会再开一次——用 "wb" 恰好把上一次的日志（最需要
+            # 它的时候）截掉（DAIR-316）。
+            self._child_log = open(log_dir / "kernel.log", "ab", buffering=0)
+            self.log_path = log_dir / "kernel.log"
+        except Exception:
+            self._child_log = None
+            return {}
+        return {"stdout": self._child_log, "stderr": self._child_log}
+
+    def _run_prelude(self) -> None:
+        self._execute_raw(_PRELUDE, timeout=60)
+
+    def is_alive(self) -> bool:
+        if not self._started or self._km is None:
+            return False
+        try:
+            return bool(self._km.is_alive())
+        except Exception:
+            return False
+
+    def restart(self) -> None:
+        """Restart the kernel, dropping all state."""
+        if self._km is None:
+            self.start()
+            return
+        try:
+            self._km.restart_kernel(now=True)
+        except Exception:
+            self.shutdown()
+            self.start()
+            return
+        try:
+            self._kc.start_channels()
+            self._kc.wait_for_ready(timeout=self.startup_timeout)
+        except Exception as exc:
+            raise KernelError(f"Kernel restart failed: {exc}") from exc
+        self._started = True
+        self._exec_count = 0
+        self._namespace_dirty = False
+        self._run_prelude()
+
+    def shutdown(self) -> None:
+        """Shut down the kernel.
+
+        **先让 ArcGIS 把数据刷盘，再杀内核**。实测（14 届 4a-1）：直接
+        ``shutdown_kernel(now=True)`` 硬杀时，GDB 里刚写完的栅格还没落盘，
+        内核一死文件就跟着没了，目录里只剩 ``*.sr.lock``；模型上一轮明明
+        用 ``arcpy.ListRasters()`` 确认过四个 kde_* 都在，交付时却报“缺失”。
+        所以先给内核一点时间收尾。
+        """
+        self._flush_arcpy_writes()
+        try:
+            if self._kc is not None:
+                self._kc.stop_channels()
+        except Exception:
+            pass
+        try:
+            if self._km is not None:
+                self._km.shutdown_kernel(now=True)
+        except Exception:
+            pass
+        self._km = None
+        self._kc = None
+        self._started = False
+        if self._child_log is not None:
+            try:
+                self._child_log.close()
+            except Exception:
+                pass
+            self._child_log = None
+
+    def _flush_arcpy_writes(self) -> None:
+        """Best-effort: let ArcGIS finish writing before the kernel is killed.
+
+        实测（14 届 4a-1）：``shutdown_kernel(now=True)`` 硬杀时，GDB 里刚写完的
+        栅格尚未落盘，内核一死数据就丢了，只留下 ``*.sr.lock``——模型上一轮
+        还用 ``arcpy.ListRasters()`` 确认过四个 kde_* 都在，交付时却报“缺失”。
+
+        做法（全部容忍失败）：删临时引用 → 触发 GC（释放游标/数据集句柄，
+        ArcGIS 在对象析构时提交）→ 再等一拍。不跑重型检查，避免关机变慢。
+        """
+        if not self._started or self._kc is None:
+            return
+        try:
+            self.execute(
+                "import gc\n"
+                "gc.collect()\n"
+                "set_result({'flushed': True})",
+                timeout=30,
+            )
+        except Exception as exc:  # pragma: no cover - 关机不能因刷盘失败而中断
+            logger.debug("flush before shutdown failed: %s", exc)
+        time.sleep(0.5)
+
+    def interrupt(self) -> None:
+        """Send a soft interrupt to running code.
+
+        Never blocks for long: ``interrupt_kernel`` waits for a ZMQ reply
+        which a wedged kernel never sends, so it runs in a daemon thread.
+        """
+        try:
+            km = self._km
+            if km is not None:
+                t = threading.Thread(target=km.interrupt_kernel, daemon=True)
+                t.start()
+                t.join(timeout=4.0)
+        except Exception as exc:
+            logger.warning("kernel interrupt failed: %s", exc)
+
+    def _hard_kill(self, km: Any) -> None:
+        """真正杀掉内核进程。
+
+        ``jupyter_client`` 的 ``KernelManager`` **没有** ``kill()``（只有
+        ``shutdown_kernel(now=True)`` 和私有的 ``_kill_kernel()``）。以前这里直接
+        ``km.kill()``，每次抛 AttributeError 又被吞掉——看门狗其实从没杀掉过进程：
+        卡在 GP 调用里的内核一直活着占着文件句柄（实测：600s 卡死之后，下一次
+        执行直接吃 PermissionError，因为旧内核还攥着那个 .tif）。
+        """
+        try:
+            km.shutdown_kernel(now=True)
+            return
+        except Exception as exc:
+            logger.debug("shutdown_kernel(now=True) failed: %s", exc)
+        kill = getattr(km, "_kill_kernel", None)
+        if callable(kill):
+            try:
+                kill()
+                return
+            except Exception as exc:
+                logger.debug("_kill_kernel failed: %s", exc)
+        kill = getattr(getattr(km, "provisioner", None), "kill", None)
+        if callable(kill):
+            try:
+                kill()
+                return
+            except Exception as exc:
+                logger.warning("kernel hard kill failed: %s", exc)
+
+    def _destroy_kernel(self) -> None:
+        """Hard-stop the kernel process (used when soft interrupt fails)."""
+        km = self._km
+        if km is not None:
+            self._hard_kill(km)
+        try:
+            if self._kc is not None:
+                self._kc.stop_channels()
+        except Exception:
+            pass
+        # 必须把句柄清掉：只置 _started=False 时，下一次 start() 会 new 一个
+        # KernelManager，旧进程和旧通道就成了没人收的僵尸。
+        self._km = None
+        self._kc = None
+        self._started = False
+        logger.warning("kernel process destroyed (wedged); will restart on next use")
+
+    # ------------------------------------------------------------- execution
+    def execute(
+        self,
+        code: str,
+        *,
+        timeout: float = 600.0,
+        workspace: str | None = None,
+    ) -> ExecResult:
+        """Execute user code in the persistent namespace.
+
+        ``set_result(value)`` inside the code is captured and returned.
+        整个“执行 + 取结果”过程是**串行的**（见 ``_exec_lock`` 的说明）。
+
+        取结果**并入同一次执行**（少一次 ZMQ 往返，实测每步省 0.1~0.3s）。
+        做法：在用户代码后面拼一段“把结果打成一行哨兵文本”，从同一条
+        stdout 里剖出来；剖不到就退回旧的 ``_fetch_result()``（兼容
+        用户代码自己 print 干扰、或结果非 JSON 可序列化的情况）。
+
+        ``arcpy.env`` 在这一层做按次隔离（见 ``env_guard``，DAIR-289）：跑前快照、
+        期间盖成干净基线、跑后（含异常）还原。配方级别的 ``finally`` 只能守住
+        自己 ``try`` 之后的代码，守不住各自第 1 步的 ``CopyFeatures``。
+        """
+        ws = workspace or self.workspace
+        prefix = ""
+        if ws:
+            safe = ws.replace(chr(92), chr(92) * 2).replace(chr(39), chr(92) + chr(39))
+            # 先回启动目录（_cwd_launch 是 prelude 里捕获的常量，不会漂移），
+            # 再进本次工作区。用户代码抛异常会让 cell 中断，cwd 可能留在
+            # 上一个工作区，所以下一次 execute 仍从 _cwd_launch 起步。
+            prefix = "import os as _os\n" + _cwd_prefix_statements(safe)
+        # 快照要早于下面那两行改写（workspace / overwriteOutput），记的才是
+        # “这次执行之前”的外部态。
+        prefix += "import arcpy\n" + env_guard.snapshot_code()
+        if ws:
+            prefix += (
+                f"arcpy.env.workspace = r'{safe}'\n"
+                "arcpy.env.overwriteOutput = True\n"
+            )
+        started = time.time()
+        # 整段串行化（发消息→收 iopub→取结果）：ZMQ socket 不是线程安全的，
+        # 与预热线程或另一个 execute 交叉操作会写坏 wire 协议（实测现象：
+        # 内核侧 Invalid Signature / DELIM not in msg_list，客户端 zmq Bad address）。
+        # 等锁也要封顶：若上一次执行卡在无法中断的 GP 调用里，这里的无限等待
+        # 会让整个 run 静默（实测 14 届任务四a：第 31 轮后无事件 2400s+）。
+        lock_budget = float(timeout) + float(getattr(self, "watchdog_grace", 45.0))
+        if not self._exec_lock.acquire(timeout=lock_budget):
+            raise KernelTimeout(
+                f"等待内核空闲超过 {lock_budget:.0f}s：上一次执行可能卡在无法中断的 GP 调用里"
+            )
+        try:
+            if not self.is_alive():
+                self.start()
+            combined = prefix + _RESULT_HEAD + code + _RESULT_TAIL + env_guard.restore_code()
+            outcome = self._execute_raw(combined, timeout=timeout)
+            outcome.duration_ms = int((time.time() - started) * 1000)
+            if not outcome.ok:
+                # 用户代码抛异常会让整个 cell 中断：cwd 可能停在工作区里，接在
+                # 结果尾巴后面的 env 还原也没跑到 —— 错误路径补一趟把两件都归位
+                # （成功路径不需要：cwd 由 prefix 自愈，env 由尾巴还原）。
+                self._repair_after_failure(ws)
+            if outcome.ok:
+                result, stdout = _split_result(outcome.stdout or "")
+                outcome.stdout = stdout
+                if result is _RESULT_MISSING:
+                    # 兜底：哨兵没出现（用户代码可能重定向了 stdout / 提前 return），
+                    # 走旧的两趟路径，行为与以前完全一致。
+                    outcome.result = self._fetch_result()
+                else:
+                    outcome.result = result
+        finally:
+            self._exec_lock.release()
+        return outcome
+
+    def _repair_after_failure(self, ws: str | None) -> None:
+        """失败补丁趟：cwd 回启动目录 + ``arcpy.env`` 还原到快照（DAIR-13 / DAIR-289）。
+
+        失败不能掩盖原始错误：这一趟出错只记日志。
+        """
+        repair = ""
+        if ws:
+            repair += "import os as _os\n" + _chdir_back_stmt()
+        repair += "import arcpy\n" + env_guard.restore_code()
+        try:
+            self._execute_raw(repair, timeout=30)
+        except Exception as exc:  # pragma: no cover - 归位失败不掩盖原始错误
+            logger.warning("失败后归位（cwd/env）没走成: %s", exc)
+
+    def _execute_raw(self, code: str, *, timeout: float) -> ExecResult:
+        """Execute code and collect iopub output until idle."""
+        if self._kc is None:
+            raise KernelError("Kernel is not running")
+        self._exec_count += 1
+        msg_id = self._kc.execute(code)
+        stdout: list[str] = []
+        stderr: list[str] = []
+        images: list[str] = []
+        error: dict[str, Any] | None = None
+        deadline = time.time() + timeout
+        interrupted = False
+
+        # Watchdog: even if the iopub/control channels wedge (native arcpy
+        # blocking), hard-kill the kernel process so execution is bounded.
+        hard_timeout = timeout + self.watchdog_grace
+        km = self._km
+        done = threading.Event()
+
+        def _watchdog() -> None:
+            if not done.wait(hard_timeout) and km is not None:
+                logger.warning(
+                    "watchdog: wedged kernel after %ss, hard-killing process", hard_timeout
+                )
+                try:
+                    self._hard_kill(km)
+                except Exception as exc:  # pragma: no cover - best effort
+                    logger.warning("watchdog kill failed: %s", exc)
+                self._started = False
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    if not interrupted:
+                        interrupted = True
+                        self.interrupt()
+                        deadline = time.time() + 15.0  # grace period after interrupt
+                        continue
+                    self._destroy_kernel()
+                    raise KernelTimeout(f"Execution exceeded {timeout}s and did not stop after interrupt")
+                try:
+                    msg = self._kc.get_iopub_msg(timeout=min(remaining, 1.0))
+                except Exception:
+                    continue
+                if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                    continue
+                mtype = msg.get("msg_type")
+                content = msg.get("content", {}) or {}
+                if mtype == "stream":
+                    if content.get("name") == "stderr":
+                        stderr.append(content.get("text", ""))
+                    else:
+                        stdout.append(_strip_arcgis_noise(content.get("text", "")))
+                elif mtype == "error":
+                    error = {
+                        "type": content.get("ename", "Error"),
+                        "message": content.get("evalue", ""),
+                        "traceback": "\n".join(content.get("traceback", []) or []),
+                    }
+                elif mtype in {"display_data", "execute_result"}:
+                    data = content.get("data", {}) or {}
+                    if "image/png" in data:
+                        images.append(str(data["image/png"]))
+                    if "text/plain" in data and mtype == "execute_result":
+                        stdout.append(str(data["text/plain"]))
+                elif mtype == "status" and content.get("execution_state") == "idle":
+                    break
+        finally:
+            done.set()
+
+        # Drain the shell reply so it does not leak into the next call.
+        try:
+            self._kc.get_shell_msg(timeout=5.0)
+        except Exception:
+            pass
+
+        return ExecResult(
+            ok=error is None,
+            stdout="".join(stdout),
+            stderr="".join(stderr),
+            error=error,
+            interrupted=interrupted,
+            display_images=images,
+        )
+
+    def _fetch_result(self) -> Any:
+        """Fetch and JSON-decode the value passed to set_result()."""
+        marker = "__ENGINE_RESULT__"
+        outcome = self._execute_raw(
+            f"import json as _json; print('{marker}' + _json.dumps(globals().get('{_RESULT_VAR}'), default=str))",
+            timeout=60,
+        )
+        if not outcome.ok:
+            return None
+        text = outcome.stdout or ""
+        idx = text.rfind(marker)
+        if idx < 0:
+            return None
+        payload = text[idx + len(marker):].strip()
+        if not payload or payload == "null":
+            return None
+        try:
+            return json.loads(payload)
+        except Exception:
+            return payload
+
+    # --------------------------------------------------------------- helpers
+    def reset(self) -> None:
+        """Clear user namespace but keep arcpy imported."""
+        self._execute_raw(
+            "for _k in [k for k in list(globals()) if not k.startswith('__') and k not in "
+            "('set_result', 'arcpy', '_bi', 'builtins')]:\n"
+            "    del globals()[_k]\n",
+            timeout=60,
+        )
+        self._run_prelude()
+        self._namespace_dirty = False
+
+    def run_arcpy(self, code: str, *, timeout: float = 600.0, workspace: str | None = None) -> ExecResult:
+        """Convenience wrapper requiring arcpy to be importable."""
+        return self.execute(code, timeout=timeout, workspace=workspace)
