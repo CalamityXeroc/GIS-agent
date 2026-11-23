@@ -1,0 +1,55 @@
+id: am_task1b_import
+name: AM 任务一(b) · 数据入库与坐标系统一（子任务，分钟级）
+source: B上午
+prompt: |
+  完成数据入库，不要做其他事（所有产出必须放在 workspace/output/ 下）：
+  1. 在 workspace/output 下创建两个文件地理数据库：temp_data.gdb（过程数据）和 result_data.gdb（结果数据）。
+  2. 将 city.shp、county.shp 真实投影到 CGCS2000 6 度带高斯-克吕格 CM 111E（EPSG:4508），
+     导入 result_data.gdb，名称保持不变（city、county）。
+  3. 将 population.CSV、population_census.csv 导入 result_data.gdb，表名分别为 population、
+     population_census（表无几何，不需要投影）。
+  完成后简要说明你的方法论。
+inputs:
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/city.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/county.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/population.CSV"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/population_census.csv"
+requirements:
+  - id: r1
+    text: 创建 temp_data.gdb 与 result_data.gdb
+    acceptance: 两个 .gdb 存在于 output 下
+  - id: r2
+    text: city/county 投影到 EPSG:4508 并入库，名称不变
+    acceptance: 两图层 WKID=4508，要素数分别为 49 / 385
+  - id: r3
+    text: 两张 CSV 表入库为 population / population_census
+    acceptance: 两表存在于 result_data.gdb
+assertions:
+  - type: file_exists
+    path: "output/result_data.gdb"
+  - type: file_exists
+    path: "output/temp_data.gdb"
+  - type: vector_exists
+    path: "output/result_data.gdb/county"
+  - type: crs_wkid
+    path: "output/result_data.gdb/county"
+    value: 4508
+  - type: feature_count_equal
+    path: "output/result_data.gdb/county"
+    value: 385
+  - type: vector_exists
+    path: "output/result_data.gdb/city"
+  - type: crs_wkid
+    path: "output/result_data.gdb/city"
+    value: 4508
+  - type: feature_count_equal
+    path: "output/result_data.gdb/city"
+    value: 49
+  - type: fields_present
+    path: "output/result_data.gdb/county"
+    value: ["name", "code"]
+  - type: vector_exists
+    path: "output/result_data.gdb/population"
+  - type: vector_exists
+    path: "output/result_data.gdb/population_census"
+timeout_seconds: 1200

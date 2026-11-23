@@ -1,0 +1,77 @@
+id: simplify_geometry
+name: 几何简化（制图概化）
+description: 按容差简化面/线几何（Douglas-Peucker），减少节点数量，用于制图概化与减小数据量。
+domain: geometry
+category: geometry
+triggers: [简化, 概化, simplify, 抽稀, 减少节点, 制图简化]
+preconditions:
+  - 输入为面或线；容差单位与数据坐标系一致（投影坐标系为米）
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入要素
+  output_path:
+    type: string
+    required: true
+    description: 输出要素
+  tolerance:
+    type: number
+    default: 10
+    description: 简化容差（投影坐标系下为米）
+steps:
+  - 校验坐标系（建议投影坐标系）
+  - SimplifyPolygon / SimplifyLine
+  - 返回节点减少情况
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+  tolerance = float({{tolerance}})
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+  d = arcpy.Describe(input_path)
+  shape = d.shapeType
+  if shape not in ("Polygon", "Polyline"):
+      raise ValueError(f"几何简化需要面或线，输入是 {shape}")
+  if d.spatialReference.type == "Geographic":
+      raise ValueError("当前为地理坐标系，容差单位是度；请先投影到投影坐标系再简化")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  try:
+      if shape == "Polygon":
+          arcpy.cartography.SimplifyPolygon(input_path, output_path, "POINT_REMOVE", tolerance)
+      else:
+          arcpy.cartography.SimplifyLine(input_path, output_path, "POINT_REMOVE", tolerance)
+      method = "cartography"
+  except Exception as exc:
+      print(f"制图简化不可用({str(exc)[:60]})，降级为 Generalize")
+      arcpy.edit.Generalize(input_path, output_path, f"{tolerance} Meters")
+      method = "generalize"
+
+  count = int(arcpy.management.GetCount(output_path)[0])
+  set_result({"output": output_path, "feature_count": count, "tolerance": tolerance, "method": method})
+  print(f"Simplify done: {count} features, tolerance={tolerance}, method={method}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 容差过大会让要素"缩水"甚至消失；制图概化建议取像元/输出比例的 1~2 倍。
+  - 地理坐标系下容差单位是度，直接用米数值会得到荒谬结果。
+examples:
+  - "把绿地斑块简化到 5 米容差用于出图"
+  - "概化道路线减少节点"

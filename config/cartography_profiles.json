@@ -1,0 +1,21 @@
+{
+  "_readme": [
+    "风格档位覆盖文件：只写你想改的字段，其余用 cartography/profiles.py 里的内置默认值。",
+    "内置档位：competition_standard（竞赛标准/A4竖版）、screen_report（16:9 屏幕）、dense_raster（满覆盖栅格）。",
+    "示例：把标题上限改到 22pt、图例字号改成 8pt、比例尺单位改成「千米」。"
+  ],
+  "competition_standard": {
+    "_comment": "以下为可选覆盖示例，删掉即回到内置默认",
+    "title": {
+      "font": "宋体",
+      "max_pt": 20.0
+    },
+    "legend": {
+      "font_pt": 9.0,
+      "labels_mode": "semantic"
+    },
+    "scale_bar": {
+      "unit_label": "米"
+    }
+  }
+}

@@ -1,0 +1,274 @@
+# -*- coding: utf-8 -*-
+"""制图能力包：把"数据事实"变成"专业版式"的完整管线。
+
+    facts（采集事实） → design（规则引擎出 LayoutSpec） → apply（渲染到 ArcGIS）
+                        ↑                                        ↓
+                        └──── qc（版面体检） ←── 不合格则按建议微调重渲 ────┘
+
+对外只暴露两个入口：
+
+- :func:`design_only`：只做设计，返回人类可读的设计说明 + spec（给 Agent 用，先"读设计"再出图）；
+- :func:`create_map`：一条龙出图（含版面自修复闭环），配方与工具都调它。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+from . import facts as _facts_mod
+from .design import design_layout, normalize_intent, suggest_fixes
+from .profiles import DEFAULT_PROFILE_NAME, load_profile, profile_names
+from .styles import load_catalog
+
+logger = logging.getLogger(__name__)
+
+MAX_REPAIR_ROUNDS = 2
+
+
+def collect_facts(layers: list[Any], *, field: str = "", code_runner: Any = None) -> dict[str, Any]:
+    return _facts_mod.collect_map_facts(layers, field=field, code_runner=code_runner)
+
+
+def design_only(
+    layers: list[Any],
+    intent: dict[str, Any] | None = None,
+    *,
+    code_runner: Any = None,
+    facts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """只做设计：返回 ``{"spec", "facts", "summary"}``（不落盘、不渲染）。"""
+    data_facts = facts if facts is not None else collect_facts(
+        layers, field=normalize_intent(intent).get("field", ""), code_runner=code_runner)
+    spec = design_layout(data_facts, intent)
+    return {"spec": spec, "facts": data_facts, "summary": describe_spec(spec)}
+
+
+def _absolute_layers(layers: list[Any]) -> list[Any]:
+    """把图层路径统一成绝对路径。
+
+    实测（14 届 4a-2）：``addDataFromPath("input/study_area.shp")`` 传**相对路径**
+    时，ArcGIS 不把它当本地文件，而当成 Web 服务去解析，直接报
+
+        RuntimeError: AUTOMATIC 失败，可能需要提供更具体的 web_service_type。
+
+    绝对路径就正常。模型习惯写相对路径（基准工作区文档就这么写的），
+    所以入口处先解析成绝对路径；非字符串（已经是的 Layer 对象等）原样保留。
+    """
+    resolved: list[Any] = []
+    for item in layers or []:
+        if isinstance(item, (str, Path)):
+            raw = str(item).strip()
+            if not raw:
+                continue
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = (Path.cwd() / candidate).resolve()
+            resolved.append(str(candidate))
+        else:
+            resolved.append(item)
+    return resolved
+
+
+def create_map(
+    layers: list[Any],
+    intent: dict[str, Any] | None = None,
+    *,
+    output_path: str,
+    aprx_path: str = "",
+    field: str = "",
+    code_runner: Any = None,
+    facts: dict[str, Any] | None = None,
+    max_rounds: int = MAX_REPAIR_ROUNDS,
+    catalog_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """出图（含版面自修复）：facts → design → render → qc →（不合格）微调重渲。
+
+    出图后还会跑一次**合规自检**（P1-2）：结论写在 ``result["compliance"]``，
+    并以 ``<图名>.compliance.json`` 边车落盘，供 ``verify_outputs`` / ``finish``
+    汇总。``catalog_rows`` 是数据目录里与本次图层相关的登记记录（None = 没拿到，
+    来源类规则不下结论）。合规自检**不改变出图成败**，是否阻断由调用方决定。
+    """
+    from . import apply as _apply
+    from . import qc as _qc
+
+    layers = _absolute_layers(list(layers or []))
+    normalized = normalize_intent(intent)
+    if field and not normalized.get("field"):
+        normalized["field"] = field
+    data_facts = facts if facts is not None else collect_facts(
+        layers, field=normalized.get("field", "") or field, code_runner=code_runner)
+    profile = load_profile(normalized.get("style_profile"))
+    catalog = load_catalog()
+
+    hints: dict[str, Any] = {}
+    repair_log: list[dict[str, Any]] = []
+    result: dict[str, Any] = {}
+    # 每轮渲染到**临时路径**，最后一轮结束后再拷贝到目标：
+    # 否则第二轮会因第一轮的 .aprx 仍被 ArcGIS 占用而报 PermissionError。
+    out_path = Path(output_path).expanduser()
+    import tempfile as _tempfile
+
+    work_dir = Path(_tempfile.mkdtemp(prefix="cartography_"))   # 每次调用独立临时目录，避免上一步的 ArcGIS 句柄冲突
+    work_dir.mkdir(parents=True, exist_ok=True)
+    rounds = max(1, max_rounds + 1)
+    final_output = ""
+    final_aprx = ""
+    for round_index in range(rounds):
+        round_out = str(work_dir / f"round{round_index}{out_path.suffix or '.jpg'}")
+        round_aprx = str(work_dir / f"round{round_index}.aprx")
+        spec = design_layout(data_facts, normalized, profile=profile, hints=hints)
+        result = _apply.render(spec, round_out, aprx_path=round_aprx, catalog=catalog)
+        final_output, final_aprx = result["output"], result["aprx"]
+        verdict = _qc.check_layout(final_aprx, spec=spec, image_path=final_output)
+        result["qc_ok"] = bool(verdict.get("ok"))
+        result["qc"] = verdict
+        result["qc_summary"] = _qc.summarize(verdict)
+        result["repair_rounds"] = round_index
+        if verdict.get("ok") or round_index >= max_rounds:
+            break
+        new_hints = suggest_fixes(verdict.get("checks") or [])
+        repair_log.append({"round": round_index, "failed": _failed_names(verdict), "hints": new_hints})
+        if not new_hints:
+            break
+        hints.update(new_hints)
+
+    # 把获胜轮次的成果拷贝到目标路径（此时已不再持有临时文件句柄）
+    result["output"] = _publish(final_output, str(out_path))
+    aprx_target = str(Path(aprx_path).expanduser()) if aprx_path else str(out_path.with_suffix(".aprx"))
+    result["aprx"] = _publish(final_aprx, aprx_target)
+    try:
+        result["size"] = Path(result["output"]).stat().st_size
+        result["aprx_size"] = Path(result["aprx"]).stat().st_size
+        result["aprx_saved"] = True
+    except Exception:
+        pass
+    # 合规自检放在最后：此时图已落盘，边车能挨着图写；失败也绝不能带崩出图
+    _compliance_selfcheck(result, layers=layers, intent=normalized, catalog_rows=catalog_rows)
+    import shutil as _shutil
+
+    _shutil.rmtree(work_dir, ignore_errors=True)
+    result["repair_log"] = repair_log
+    result["design_note"] = result.get("design_note") or ""
+    result["summary_note"] = describe_spec(result.get("spec") or {})
+    return result
+
+
+def _compliance_selfcheck(
+    result: dict[str, Any],
+    *,
+    layers: list[Any],
+    intent: dict[str, Any],
+    catalog_rows: list[dict[str, Any]] | None,
+) -> None:
+    """出图后的合规自检（P1-2）：事实 → YAML 规则 → 分级结论 + 边车。
+
+    为什么在这里而不是工具层：``create_map`` 是配方与工具共用的出图入口，
+    自检放在最里层，两条调用路径都跑得到（工具层再按级别决定放不放行）。
+    """
+    from ..compliance import check_map
+    from ..compliance.facts import context_from_spec
+    from ..compliance.store import write_sidecar
+
+    image = str(result.get("output") or "")
+    try:
+        context = context_from_spec(
+            result.get("spec") or {},
+            layers=layers,
+            catalog_rows=catalog_rows,
+            intent=intent,
+            image=image,
+        )
+        report = check_map(context)
+        result["compliance"] = report.to_dict()
+        if image:
+            try:
+                result["compliance_sidecar"] = str(write_sidecar(image, report, context=context))
+            except OSError as exc:
+                result["compliance_sidecar_error"] = str(exc)[:200]
+    except Exception as exc:  # pragma: no cover - 闸门自身故障不许影响出图
+        logger.warning("合规自检未完成: %s", exc)
+        result["compliance_error"] = str(exc)[:200]
+
+
+def _publish(source: str, target: str) -> str:
+    """把临时产物拷贝到目标路径（目标被 ArcGIS Pro 占用时给出明确提示）。
+
+    批量出图时 ArcGIS 进程可能还持有上一步的文件句柄，因此加几次短重试。
+    """
+    import shutil as _shutil
+    import time as _time
+
+    if not source:
+        return target
+    if os.path.abspath(source) == os.path.abspath(target):
+        return target
+    # 目标目录不存在时 copy2 抛 FileNotFoundError（WinError 3），以前会被当成
+    # “文件被 ArcGIS Pro 占用”重试 4 次再报错（实测组合任务：连续 4 次
+    # create_map 全失败，最后模型自己 os.makedirs 才出图）。出图前先把目录建好。
+    Path(target).parent.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            _shutil.copy2(source, target)
+            return target
+        except PermissionError as exc:
+            last_error = exc
+            _time.sleep(0.6 * (attempt + 1))
+        except OSError as exc:
+            last_error = exc
+            _time.sleep(0.4)
+    raise RuntimeError(
+        f"无法写入 {target}（{last_error}）：该文件可能正在 ArcGIS Pro 中打开，请先关闭后重试"
+    )
+
+
+def _failed_names(verdict: dict[str, Any]) -> list[str]:
+    return [str(c.get("name")) for c in (verdict.get("checks") or []) if not c.get("ok")]
+
+
+def describe_spec(spec: dict[str, Any]) -> str:
+    """把 spec 变成一段人能读的"设计说明"（Agent 可据此向用户解释）。"""
+    if not spec:
+        return ""
+    page = spec.get("page") or {}
+    title = spec.get("title") or {}
+    legend = spec.get("legend") or {}
+    scale_bar = spec.get("scale_bar") or {}
+    north = spec.get("north_arrow") or {}
+    renderer = spec.get("renderer") or {}
+    lines = [
+        f"纸张：{page.get('paper')} {page.get('orientation')}（{page.get('width_mm')}×{page.get('height_mm')} mm）",
+        f"图名：{title.get('text')}（{title.get('height_pt')}pt，{title.get('lines')} 行，顶部居中）",
+        (
+            f"图例：{'放' + str(legend.get('corner')) if legend.get('needed') else '不放'}"
+            + (f"，标题「{legend.get('title')}」" if legend.get('title') else "，无标题")
+            + f"，标签模式 {renderer.get('labels_mode')}"
+        ),
+        f"比例尺：{scale_bar.get('length_m'):g} m / {scale_bar.get('divisions')} 段，单位 {scale_bar.get('unit_label')}"
+        f"（地图比例尺约 1:{scale_bar.get('map_scale'):,.0f}）",
+        f"指北针：{'罗盘玫瑰' if north.get('needed') else '不放'}，{north.get('size_mm'):g} mm 右上角",
+        f"配色：{renderer.get('color_ramp') or renderer.get('category_colors') or '默认'}，"
+        f"{renderer.get('class_count')} 类（{renderer.get('classification_method')}）",
+    ]
+    reasons = [f"- {d.get('key')}：{d.get('value')}（{d.get('why')}）" for d in (spec.get("decisions") or [])]
+    if reasons:
+        lines.append("决策理由：")
+        lines.extend(reasons)
+    return "\n".join(lines)
+
+
+__all__ = [
+    "collect_facts",
+    "design_only",
+    "create_map",
+    "describe_spec",
+    "design_layout",
+    "normalize_intent",
+    "suggest_fixes",
+    "load_profile",
+    "profile_names",
+    "DEFAULT_PROFILE_NAME",
+]

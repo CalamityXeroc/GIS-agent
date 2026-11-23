@@ -1,0 +1,87 @@
+id: gis14_am_task3a_landcover_cloud_fix
+name: 第14届（2025）上午 任务三a · 土地覆盖云区修补与分类面积统计
+source: A上午
+carry_from: gis14_am_task2b_dem_landcover
+prompt: |
+  继续本工作区的工作。土地覆盖已裁切到研究区：output/result_data.gdb/landcover_clip
+  （UTM 10N，10 m，类别编码 1~11，其中 10 = 云 Clouds）；若该图层不在（例如单独重跑本任务），
+  把 input/landcover_clip.tif 导入 output/result_data.gdb 后再修补（坐标系与类别编码保持不变）。
+  DEM 裁切结果在 output/result_data.gdb/dem_clip（或在 input/dem_clip.tif）。
+  若工作区有 .gis_agent/PROJECT_LOG.md，先读它了解口径。
+
+       土地覆盖类别编码表（赛题表 2，必须按此命名，不要自己起名）：
+         1 水域 WaterAreas ｜ 2 林地 Trees ｜ 4 淹没植被区 FloodedVegetationArea ｜
+         5 耕地 Crops ｜ 7 建筑区 BuiltAreas ｜ 8 裸地 BareGroundAreas ｜
+         9 雪/冰 SnoworIce ｜ 10 云 Clouds ｜ 11 牧场 RangelandsAreas
+
+  本步任务：修补土地覆盖数据中被云遮蔽的区域。
+
+  官方要求：观察土地覆盖数据，部分地区因云层遮蔽存在地物信息缺失（编码 10 的像元）。
+  需要对类型为 Clouds 的区域进行修改，原则是**将其替换为周边面积占比较多的其他地类**；
+  方法自行设计，但必须保证所有有云的地方全部替换成其他地表覆盖类型（修完后不允许再
+  存在编码 10 的像元）。
+
+  请完成任务（产出写到 workspace/output）：
+  1. 设计并实现云区修补方法（提示方向：邻域众数/多数重采样、焦点统计、或分块统计周边
+     类别占比后按占比替换等；说明你选择的方法与理由）。
+     输出 output/result_data.gdb/landcover_fixed（UTM 10N、10 m、类别编码 1~11、不含云）。
+  2. 基于修补后的数据统计各类土地覆盖面积（km²），写成 output/分类面积统计.md：
+     每个类别一行（编码、名称、像元数、面积 km²，按 10 m 像元面积 100 m² 计），
+     并附合计行；再说明修补前云的像元数、修补后云的像元数（应为 0）、
+     各类别因修补增加的像元数。
+  3. 交付一张云区修补前后对比图（可选加分）：修补前/后并排，输出 output/云修补对比.jpg。
+
+  完成后请说明：云的原始像元数与位置特征（分布在哪些区域）、你采用的修补方法、
+  修补后云像元数是否为 0、以及各类别面积统计表的路径。
+inputs:
+  - source: "workspace/input/第14届真题数据/landcover_clip.tif"
+  - source: "workspace/input/第14届真题数据/study_area.shp"
+requirements:
+  - id: r1
+    text: 设计并实现云区修补（替换为周边占比多的地类）
+    acceptance: landcover_fixed 存在且不再含编码 10 的像元，其余类别编码不变
+  - id: r2
+    text: 分类面积统计表
+    acceptance: output/分类面积统计.md 存在，含各类别像元数与面积（km²）及合计
+assertions:
+  - type: raster_not_constant
+    path: "output/result_data.gdb/landcover_fixed"
+  - type: raster_value_absent
+    path: "output/result_data.gdb/landcover_fixed"
+    value: [10]
+  - type: raster_stat_between
+    path: "output/result_data.gdb/landcover_fixed"
+    stat: "min"
+    value: [1, 2]
+  - type: raster_stat_between
+    path: "output/result_data.gdb/landcover_fixed"
+    stat: "max"
+    value: [9, 11]
+  - type: bbox_between
+    path: "output/result_data.gdb/landcover_fixed"
+    value:
+      xmin: [323000, 329000]
+      ymin: [4531000, 4536000]
+      xmax: [357000, 363000]
+      ymax: [4594000, 4600000]
+  - type: file_exists
+    path: "output/分类面积统计.md"
+  - type: file_contains
+    path: "output/分类面积统计.md"
+    value: "km"
+  - type: deliverable_hygiene_ok
+    path: "output"
+    value:
+      max_duplicate_families: 0
+      forbid_suffixes: [".pkl", ".tmp", ".bak"]
+      warn_temp_result_ratio: 5
+  - type: file_contains
+    path: "output/分类面积统计.md"
+    value: "林地"
+  - type: file_contains
+    path: "output/分类面积统计.md"
+    value: "牧场"
+  - type: file_contains
+    path: "output/分类面积统计.md"
+    value: "建筑区"
+timeout_seconds: 3000

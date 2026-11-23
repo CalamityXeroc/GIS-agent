@@ -1,0 +1,69 @@
+id: pm_task2a_green_area_index
+name: PM 任务二a · 绿地面积与人均绿地指数（链式：承接任务一）
+source: B下午
+carry_from: pm_task1_elderly_raster
+prompt: |
+  继续本工作区的工作（工作区 output/result_data.gdb 里已有任务一的成果：district_prj、
+  community_prj、pop_density_prj、elder_fill，以及 community_elder（含社区老年人口字段 ELDER_COMM）。
+  若工作区有 .gis_agent/PROJECT_LOG.md，先读它了解前一步的结论与口径，不要重复劳动。
+
+  本步目标：计算每个社区的绿地面积与人均绿地指数（所有新产出放 workspace/output/result_data.gdb）。
+  1. 把 green_land 投影到 EPSG:4548（输出 green_land_prj）。
+  2. 【相交】green_land_prj × community_prj → green_inter（把社区信息（BSM）带给每一块绿地；
+     注意不要用空间连接，会产生冗余）。
+  3. 【融合】green_inter 按 BSM 融合、统计 Shape_Area → green_comm_stat
+     （一个社区一条记录，含该社区绿地总面积）。
+  4. 把 green_comm_stat 挂回 community_elder（key = BSM），绿地面积字段命名为 GREEN_AREA。
+  5. 人均绿地面积 PER_CAPITA = GREEN_AREA / ELDER_COMM（无绿地的社区为空值，不要填 0）；
+     再算人均绿地指数 GREEN_IDX：对"非空且非 0"的人均绿地面积做极值标准化，
+     即 (PER_CAPITA - min) / (max - min)，取值范围 0~1（空值保持空值）。
+     输出 workspace/output/result_data.gdb/community_green。
+  完成后说明：社区数、绿地面积合计、人均绿地指数的最大/最小值、
+  以及人均绿地指数为空值的社区有多少个（即没有绿地的社区）。
+inputs:
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B下午/B下午/数据/green_land.shp"
+requirements:
+  - id: r1
+    text: 绿地与社区相交并按社区融合统计绿地面积
+    acceptance: green_inter 存在且要素数>0；green_comm_stat 每个社区一条记录，含绿地面积
+  - id: r2
+    text: 社区绿地面积与人均绿地面积入库
+    acceptance: community_green 含 GREEN_AREA/PER_CAPITA 字段，绿地面积合计与相交结果一致
+  - id: r3
+    text: 人均绿地指数极值标准化到 0~1
+    acceptance: GREEN_IDX 非空值范围在 [0,1]，空值数=没有绿地的社区数（约 815）
+assertions:
+  - type: vector_exists
+    path: "output/result_data.gdb/green_inter"
+  - type: feature_count_gt
+    path: "output/result_data.gdb/green_inter"
+    value: 0
+  - type: vector_exists
+    path: "output/result_data.gdb/community_green"
+  - type: fields_present
+    path: "output/result_data.gdb/community_green"
+    value: ["GREEN_AREA", "PER_CAPITA", "GREEN_IDX"]
+  - type: feature_count_between
+    path: "output/result_data.gdb/community_green"
+    value: [2300, 2400]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_green"
+    field: "GREEN_AREA"
+    stat: "sum"
+    value: [6000000, 200000000]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_green"
+    field: "GREEN_IDX"
+    stat: "max"
+    value: [0.99, 1.01]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_green"
+    field: "GREEN_IDX"
+    stat: "min"
+    value: [0.0, 0.02]
+  - type: field_stats_between
+    path: "output/result_data.gdb/community_green"
+    field: "GREEN_IDX"
+    stat: "null"
+    value: [780, 850]
+timeout_seconds: 2700

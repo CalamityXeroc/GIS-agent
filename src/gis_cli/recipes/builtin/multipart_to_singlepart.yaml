@@ -1,0 +1,59 @@
+id: multipart_to_singlepart
+name: 多部件转单部件
+description: 把多部件要素拆成单部件要素（如融合后的缓冲区、合并的绿地），是"面转点"或逐块统计前的必要步骤。
+domain: geometry
+category: geometry
+triggers: [多部件, 单部件, multipart, 拆分, 打散, explode]
+preconditions:
+  - 输入要素可能含多部件
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入要素
+  output_path:
+    type: string
+    required: true
+    description: 输出要素
+steps:
+  - MultipartToSinglepart
+  - 核对要素数变化
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  output_path = {{output_path}}
+
+  if not arcpy.Exists(input_path):
+      raise ValueError(f"输入不存在: {input_path}")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  in_count = int(arcpy.management.GetCount(input_path)[0])
+  arcpy.management.MultipartToSinglepart(input_path, output_path)
+  count = int(arcpy.management.GetCount(output_path)[0])
+  if count == 0:
+      raise ValueError("拆分结果为空")
+  set_result({"output": output_path, "feature_count": count, "input_count": in_count,
+              "multipart_detected": count > in_count})
+  print(f"MultipartToSinglepart done: {in_count} -> {count}")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 拆分会增加要素数并复制属性；如果要素数没变说明本来就没有多部件。
+  - 拆分后不要再按原 id 去重统计（同一原要素可能对应多行）。
+examples:
+  - "缓冲区融合后拆分，再转点得到每个合并点"
+  - "多部件面拆分后逐块统计"

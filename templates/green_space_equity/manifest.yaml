@@ -1,0 +1,145 @@
+id: green_space_equity
+name: 绿地公平性（人均绿地 + 覆盖缺口）
+description: >-
+  口径：社区边界 + 绿地斑块 + 人口栅格 → 每个社区的绿地面积、人均绿地（m²/人），
+  以及「缺口」标记（有人口但人均绿地低于 9 m²/人 的社区）。
+  回答「哪些社区的绿地不够分」。不做绿地可达性/服务半径覆盖，也不给绿地分质量等级。
+version: "1.0"
+# 只声明 arcpy：第 5 步的表格版分区统计（zonal_statistics）两端输出格式不通用
+# —— arcpy 写 .dbf、GDAL 只写 .csv/.gpkg，同一条链没有两边都能用的表格式。
+backend: [arcpy]
+
+data:
+  communities:
+    type: vector
+    required: true
+    purpose: >-
+      社区边界面。需带整型唯一 ID 字段（默认 COMM_ID，分区统计与挂接用），
+      以及一个唯一字符串字段（aggregate_to_zones 按 name、否则按第一个字符串字段归属回写）
+  green_spaces:
+    type: vector
+    required: true
+    purpose: >-
+      绿地斑块面（公园绿地/防护绿地等）。按斑块整体归属：斑块中心落在哪个社区就整块算给谁，
+      不按面积切分（要按面积切分请先 clip 到社区面）。中心点落在所有社区之外的斑块
+      不计入任何社区（DAIR-171 实测：34002 块里有 353 块属此类，其中 329 块整块在社区外、
+      24 块与社区相交但中心点判空，详见 docs/templates.md）
+  population_raster:
+    type: raster
+    required: true
+    purpose: >-
+      常住人口栅格（人/像元）。必须已是 target_srid 的坐标系与格网：
+      模板不重投影栅格（重采样会改人口总量，这个决定不替用户做）
+  target_srid:
+    type: integer
+    required: false
+    default: 4527
+    purpose: 分析用投影坐标系 EPSG/WKID（默认 4527，米制；绿地面积才是平方米）
+  community_id_field:
+    type: string
+    required: false
+    default: COMM_ID
+    purpose: >-
+      社区唯一标识字段名。必须是整型（Long/Short）：分区统计会按它分区，挂接又要求两边字段类型一致；
+      文本 ID 会在统计时被转成整数，挂接时类型对不上
+
+pipeline:
+  - id: project_communities
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.communities
+      output_path: $out/communities_proj.shp
+      target_srid: $data.target_srid
+  - id: project_green
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.green_spaces
+      output_path: $out/green_proj.shp
+      target_srid: $data.target_srid
+  - id: green_area
+    recipe_id: field_calculate
+    params:
+      input_path: $steps.project_green.output
+      # 字段名 ≤10 字符：.shp 的属性表是 dBASE，超长会被 arcpy 静默截断。
+      # GRA = 绿地面积（m²）；下游 aggregate_to_zones 会把它写成 SUM_GRA（7 字符）。
+      field_name: GRA
+      expression: "!shape.area@squaremeters!"
+      field_type: DOUBLE
+  - id: green_by_community
+    recipe_id: aggregate_to_zones
+    params:
+      zones_path: $steps.project_communities.output
+      source_path: $steps.green_area.output
+      output_path: $out/green_by_community.shp
+      # 聚合字段名是 SUM_<stat_fields>，所以 stat_fields 必须 ≤6 字符（SUM_ 占 4 个）
+      stat_fields: GRA
+      stat_type: SUM
+  - id: population_by_community
+    recipe_id: zonal_statistics
+    params:
+      zone_path: $steps.project_communities.output
+      raster_path: $data.population_raster
+      output_table: $out/population_by_community.dbf
+      zone_field: $data.community_id_field
+      statistics: SUM
+  - id: green_equity
+    recipe_id: attribute_join_table
+    params:
+      target_path: $steps.green_by_community.output
+      target_key: $data.community_id_field
+      join_table: $steps.population_by_community.output
+      join_key: $data.community_id_field
+      join_fields: SUM
+      output_path: $out/green_equity.shp
+  - id: green_per_capita
+    recipe_id: field_calculate
+    params:
+      input_path: $steps.green_equity.output
+      # 人均绿地（m²/人）。字段落在 .shp 上，10 字符上限：GPC 是缩写，写全
+      # GREEN_M2_PER_CAPITA（19 字符）会被截断，第 8 步与断言都读不到。
+      field_name: GPC
+      expression: "!SUM_GRA! / !SUM! if !SUM! else 0"
+      field_type: DOUBLE
+  - id: green_gap
+    recipe_id: field_calculate
+    params:
+      input_path: $steps.green_per_capita.output
+      field_name: GREEN_GAP
+      # 缺口阈值 9 m²/人 是本模板选定的口径常数（不是强制国标值）；要换阈值就改这里，
+      # 并同步改 docs/templates.md 的口径说明 —— 模板层不支持把参数插进表达式。
+      expression: "1 if (!SUM! > 0 and !GPC! < 9.0) else 0"
+      field_type: SHORT
+
+assertions:
+  - type: file_exists
+    path: $steps.green_gap.output
+  - type: file_exists
+    path: $steps.population_by_community.output
+  # 守恒：每个绿地斑块按中心点至多归属一个社区，所以各社区「归属斑块数」之和
+  # 不得超过输入斑块总数（上界直接绑第 2 步的 feature_count）。SpatialJoin 扇出/
+  # 重复计数这类典型错法会让它超上界，而不是静默出个好看的均值。
+  - type: field_stats_between
+    path: $steps.green_by_community.output
+    field: SRC_COUNT
+    stat: sum
+    value: [1, $steps.project_green.feature_count]
+  # 人口合计：空表 / 全 0 说明分区统计没落上（最常见的是栅格与社区面坐标系不一致）。
+  # 1e8 是量级护栏：超了多半是栅格单位错（千人写成一人）或分区重复计数。
+  - type: field_stats_between
+    path: $steps.population_by_community.output
+    field: SUM
+    stat: sum
+    value: [1, 100000000]
+  # 人均绿地量级护栏：均值超过 1000 m²/人 基本可判定绿地面积或人口单位错了
+  # （人口栅格按千人存、或绿地面积用了度² 当平方米）。
+  - type: field_stats_between
+    path: $steps.green_gap.output
+    field: GPC
+    stat: mean
+    value: [0, 1000]
+  # 缺口占比是 0/1 标记的均值，落在 [0,1] 之外说明标记算错了。
+  - type: field_stats_between
+    path: $steps.green_gap.output
+    field: GREEN_GAP
+    stat: mean
+    value: [0, 1]

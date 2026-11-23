@@ -1,0 +1,112 @@
+id: gis14_am_task1_animal_points
+name: 第14届（2025）上午 任务一 · 野生动物点位清洗/投影/研究区
+source: A上午
+prompt: |
+  本工作区 input/ 下有调查人员记录后整理成文本的野生动物观测数据 animal.csv
+  （GBK 编码、制表符分隔，表头为 Year / Count / Name / Latitude / Longitude）。
+  这份原始数据质量很差，需要清洗后入库。所有产出请写到 workspace/output 下。
+
+  请完成任务：
+
+  1. 建两个文件地理数据库（不要用 workspace 之外的路径）：
+     - output/temp_data.gdb：存放必要的过程数据
+     - output/result_data.gdb：存放每步的结果数据
+
+  2. 观测数据清洗，结果点图层输出到 output/result_data.gdb/animal_points，字段要求：
+     - YEAR（长整型，观测年份）
+     - COUNT（长整型，观测数量）
+     - NAME（文本，动物种类英文名，如 Giraffe / Gazelle / Impala / Bison / Zebra）
+     - LON、LAT（双精度，十进制度，WGS84 经纬度）
+
+     已知的脏数据情况与处理要求：
+     - 完全重复的记录要去重（同一行重复出现只保留一条）；
+     - 关键字段（Year、Count、Latitude、Longitude）缺失的记录要剔除；
+     - 有一条记录里打包了多条观测的情况：整格加了引号、字段内用英文逗号把多条记录的
+       数量/种类/纬度/经度一一对应地列出来（例如 `"5,25"` 对应 `"Impala,Giraffe"`），
+       这种要拆成多条独立记录（拆出来的条数要报出来）；
+     - 经纬度是度分秒文本（如 41°2'15.00″N、124°47'8.20″W），要解析成十进制度；
+     - 存在整块错误记录：纬度在赤道以南（约 4°S~41°S）、经度在 85°W 附近，这些不是
+       本研究区的观测，要全部剔除；
+     - 少量记录经度半球符号写错（写成 E，但量级与主体群一致，约 124.8°），应纠正为西经
+       （即取负值），不要直接丢弃；
+     - 注意：不要凭观感删记录，除上述两类错误记录外都要保留。
+
+     清洗过程与条目数写进 output/清洗报告.md：原始多少条、去重多少条、缺关键字段多少条、
+     拆行多少条、剔除错误区域多少条、纠正半球多少条、最终多少条。
+
+  3. 数据投影变换：观测点分布在 41°N、124°W 附近，请据此自行判断应选用的 UTM 投影带，
+     把 animal_points 投影到对应的 WGS84 UTM 平面坐标系（属性不变，仍为 animal_points）。
+     注意后续所有分析都要用该平面坐标系。
+
+  4. 制作研究区范围：以清洗后观测点的最小包络矩形为基础向外扩展 2 公里，得到矩形研究区
+     多边形，输出 output/result_data.gdb/study_area（一个矩形面要素）。
+
+  完成后请说明：清洗后多少个点、各物种分别多少个点、选了哪个 UTM 带（EPSG 代码）、
+  研究区在平面坐标下的范围与面积（km²）、以及清洗报告的位置。
+inputs:
+  - source: "E:/GIS_documents/小火的竞赛资料/14第十四届全国大学生GIS应用技能大赛/14第十四届全国大学生GIS应用技能大赛/A上午/A上午/data/动物点位/animal.csv"
+requirements:
+  - id: r1
+    text: 建库并清洗观测数据
+    acceptance: animal_points 存在，字段 YEAR/COUNT/NAME/LON/LAT 齐全，无缺失坐标
+  - id: r2
+    text: 脏数据按规则处理（去重/剔除缺失/拆行/剔除错误区域/纠正半球）
+    acceptance: 清洗后点数约 3468（合理区间 3350~3550），五个物种都有记录
+  - id: r3
+    text: 投影到合适的 UTM 带
+    acceptance: animal_points 的 CRS 为 UTM 10N（WGS84 32610 或 NAD83 26910）
+  - id: r4
+    text: 研究区为点群包络矩形外扩 2 km
+    acceptance: 研究区范围约 X 325821~359476 / Y 4533394~4596655（UTM 10N），面积约 2129 km²
+  - id: r5
+    text: 清洗过程可追溯
+    acceptance: output/清洗报告.md 存在
+assertions:
+  - type: vector_exists
+    path: "output/result_data.gdb/animal_points"
+  - type: fields_present
+    path: "output/result_data.gdb/animal_points"
+    value: ["YEAR", "COUNT", "NAME", "LON", "LAT"]
+  - type: crs_wkid_in
+    path: "output/result_data.gdb/animal_points"
+    value: [32610, 26910]
+  - type: feature_count_between
+    path: "output/result_data.gdb/animal_points"
+    value: [3350, 3550]
+  - type: field_value_counts_between
+    path: "output/result_data.gdb/animal_points"
+    field: "NAME"
+    value: {"Giraffe": [1700, 1850], "Gazelle": [1100, 1220], "Impala": [330, 400], "Bison": [120, 160], "Zebra": [10, 40]}
+  - type: field_stats_between
+    path: "output/result_data.gdb/animal_points"
+    field: "LAT"
+    stat: "min"
+    value: [40.8, 41.0]
+  - type: field_stats_between
+    path: "output/result_data.gdb/animal_points"
+    field: "LON"
+    stat: "max"
+    value: [-124.75, -124.6]
+  - type: field_stats_between
+    path: "output/result_data.gdb/animal_points"
+    field: "LAT"
+    stat: "null_rate"
+    value: [0.0, 0.0]
+  - type: vector_exists
+    path: "output/result_data.gdb/study_area"
+  - type: feature_count_between
+    path: "output/result_data.gdb/study_area"
+    value: [1, 4]
+  - type: crs_wkid_in
+    path: "output/result_data.gdb/study_area"
+    value: [32610, 26910]
+  - type: bbox_between
+    path: "output/result_data.gdb/study_area"
+    value:
+      xmin: [323000, 329000]
+      ymin: [4531000, 4536000]
+      xmax: [357000, 363000]
+      ymax: [4594000, 4600000]
+  - type: file_exists
+    path: "output/清洗报告.md"
+timeout_seconds: 2700

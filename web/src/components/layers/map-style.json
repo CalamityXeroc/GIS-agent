@@ -1,0 +1,13 @@
+{
+  "version": 8,
+  "name": "GIS Agent 本地预览样式",
+  "sources": {},
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": { "background-color": "rgba(0, 0, 0, 0)" }
+    }
+  ],
+  "id": "gis-agent-local-preview"
+}

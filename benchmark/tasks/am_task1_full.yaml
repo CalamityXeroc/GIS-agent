@@ -1,0 +1,70 @@
+id: am_task1_full
+name: AM 任务一 · 数据质量检查与入库（完整串联）
+source: B上午
+prompt: |
+  请完成第十三届 GIS 大赛 B 卷上午的"任务一：数据质量检查与入库"全部内容
+  （所有产出必须放在 workspace/output/ 下）：
+  1. 创建两个文件地理数据库：temp_data.gdb（过程数据）和 result_data.gdb（结果数据）。
+  2. 确认 county.shp 坐标系为 WGS_1984；将其真实投影到 CGCS2000 6 度带高斯-克吕格
+     CM 111E（EPSG:4508）。
+  3. 将 city.shp、county.shp 导入 result_data.gdb 并统一为上述投影，名称不变；
+     将 population.CSV、population_census.csv 导入 result_data.gdb（表名 population、
+     population_census）。
+  4. 对入库后的 county 做拓扑检查，找出同一 code 的重复/重叠面，从每组中删除冗余面
+     （保留面积最大者），完整保留 name、code 等属性字段，结果命名 county_1。
+  完成后用中文说明方法论与关键参数。
+inputs:
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/city.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/county.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/population.CSV"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/population_census.csv"
+requirements:
+  - id: r1
+    text: 创建 temp_data.gdb 与 result_data.gdb
+    acceptance: 两个 .gdb 存在于 output 下
+  - id: r2
+    text: city/county 统一投影到 EPSG:4508 入库，名称不变
+    acceptance: 两图层 WKID=4508，要素数 49/385
+  - id: r3
+    text: population/population_census 入库
+    acceptance: 两表存在于 result_data.gdb
+  - id: r4
+    text: county_1 拓扑修复，保留属性
+    acceptance: 要素数 380-384（参考 382），含 name/code
+assertions:
+  - type: file_exists
+    path: "output/result_data.gdb"
+  - type: file_exists
+    path: "output/temp_data.gdb"
+  - type: vector_exists
+    path: "output/result_data.gdb/county"
+  - type: crs_wkid
+    path: "output/result_data.gdb/county"
+    value: 4508
+  - type: feature_count_equal
+    path: "output/result_data.gdb/county"
+    value: 385
+  - type: vector_exists
+    path: "output/result_data.gdb/city"
+  - type: crs_wkid
+    path: "output/result_data.gdb/city"
+    value: 4508
+  - type: feature_count_equal
+    path: "output/result_data.gdb/city"
+    value: 49
+  - type: vector_exists
+    path: "output/result_data.gdb/population"
+  - type: vector_exists
+    path: "output/result_data.gdb/population_census"
+  - type: vector_exists
+    path: "output/result_data.gdb/county_1"
+  - type: crs_wkid
+    path: "output/result_data.gdb/county_1"
+    value: 4508
+  - type: feature_count_between
+    path: "output/result_data.gdb/county_1"
+    value: [380, 384]
+  - type: fields_present
+    path: "output/result_data.gdb/county_1"
+    value: ["name", "code"]
+timeout_seconds: 2400

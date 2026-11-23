@@ -1,0 +1,163 @@
+id: elderly_care_coverage
+name: 社区适老化评估（服务覆盖 + 老年人口）
+description: >-
+  口径：社区边界 + 老年人口栅格 + 养老设施点位 → 每个社区的老年人口合计、
+  被设施服务半径覆盖的面积与覆盖率（覆盖面积 / 社区面积）。
+  回答「这个社区的老人有多少还够不着服务」。不评估设施质量/床位/无障碍改造，
+  也不做年龄结构细分（老年人口栅格需按 60+ 或 65+ 口径事先备好）。
+version: "1.0"
+# 只声明 arcpy：第 7 步的表格版分区统计（zonal_statistics）两端输出格式不通用
+# —— arcpy 写 .dbf、GDAL 只写 .csv/.gpkg，同一条链没有两边都能用的表格式。
+# GDAL-only 机器上这个模板在预检阶段就明确报「需 ArcGIS」，不会跑到第 7 步才炸。
+backend: [arcpy]
+
+data:
+  communities:
+    type: vector
+    required: true
+    purpose: >-
+      社区边界面。需带整型唯一 ID 字段（默认 COMM_ID）：第 6 步按它把覆盖片段
+      按属性聚合回社区，第 8/9 步又用它做分区统计与挂接（挂接要求两边字段类型一致）
+  elderly_raster:
+    type: raster
+    required: true
+    purpose: >-
+      老年人口栅格（人/像元，60+ 或 65+ 口径）。必须已是 target_srid 的坐标系与格网：
+      模板不重投影栅格（重采样会改人口总量，这个决定不替用户做）
+  facilities:
+    type: vector
+    required: true
+    purpose: 养老设施点位（养老服务站/助餐点/日间照料中心等，点要素）
+  target_srid:
+    type: integer
+    required: false
+    default: 4527
+    purpose: 分析用投影坐标系 EPSG/WKID（默认 4527，米制；距离与面积才有物理意义）
+  service_radius:
+    type: string
+    required: false
+    default: 800 Meters
+    purpose: 设施服务半径，含单位（默认 800 米，按步行约 10 分钟的常用口径）
+  community_id_field:
+    type: string
+    required: false
+    default: COMM_ID
+    purpose: >-
+      社区唯一标识字段名。必须是整型（Long/Short）：分区统计会按它分区，挂接又要求两边字段类型一致；
+      文本 ID 会在统计时被转成整数，挂接时类型对不上
+
+pipeline:
+  - id: project_communities
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.communities
+      output_path: $out/communities_proj.shp
+      target_srid: $data.target_srid
+  - id: project_facilities
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.facilities
+      output_path: $out/facilities_proj.shp
+      target_srid: $data.target_srid
+  - id: service_area
+    recipe_id: buffer_dissolve
+    params:
+      input_path: $steps.project_facilities.output
+      output_path: $out/service_area.shp
+      distance: $data.service_radius
+      dissolve_type: ALL
+  - id: covered_parts
+    recipe_id: clip_layer
+    params:
+      input_path: $steps.project_communities.output
+      clip_path: $steps.service_area.output
+      output_path: $out/covered_parts.shp
+  - id: covered_area
+    recipe_id: field_calculate
+    params:
+      input_path: $steps.covered_parts.output
+      # 字段名 ≤10 字符：.shp 的属性表是 dBASE，超长会被 arcpy 静默截断，
+      # 后续步骤引用的原名就找不到了（本模板踩过这个坑）。
+      # COVA = 覆盖面积（m²）；下游 summarize_stats 会把它写成 SUM_COVA（8 字符）
+      # 与 COUNT_COVA（10 字符，正好卡在上限）。
+      field_name: COVA
+      expression: "!shape.area@squaremeters!"
+      field_type: DOUBLE
+  # 按片段**自带的 COMM_ID** 分组求和，不再做第二次空间归属（DAIR-171）：
+  # covered_parts 是社区面裁出来的，`COMM_ID` 就是它的归属，按属性聚合是恒等的；
+  # 走 aggregate_to_zones 的中心点再归属时，真实社区面形状不规则（凹形/镶嵌）会让
+  # 整块片段被算给邻居社区 —— 实测 34/2326 片段错配、COVER_RATE 最大 10.13（上界 1）。
+  - id: coverage_stats
+    recipe_id: summarize_stats
+    params:
+      in_table: $steps.covered_area.output
+      out_table: $out/coverage_stats.dbf
+      case_field: $data.community_id_field
+      # 聚合字段名是 <统计类型>_<stat_fields>，所以 stat_fields 必须 ≤6 字符
+      stat_fields: "COVA SUM;COVA COUNT"
+  - id: coverage_by_community
+    recipe_id: attribute_join_table
+    params:
+      target_path: $steps.project_communities.output
+      target_key: $data.community_id_field
+      join_table: $steps.coverage_stats.output
+      join_key: $data.community_id_field
+      join_fields: "SUM_COVA,COUNT_COVA"
+      output_path: $out/coverage_by_community.shp
+  - id: elderly_by_community
+    recipe_id: zonal_statistics
+    params:
+      zone_path: $steps.project_communities.output
+      raster_path: $data.elderly_raster
+      output_table: $out/elderly_by_community.dbf
+      zone_field: $data.community_id_field
+      statistics: SUM
+  - id: community_metrics
+    recipe_id: attribute_join_table
+    params:
+      target_path: $steps.coverage_by_community.output
+      target_key: $data.community_id_field
+      join_table: $steps.elderly_by_community.output
+      join_key: $data.community_id_field
+      join_fields: SUM
+      output_path: $out/community_metrics.shp
+  - id: coverage_rate
+    recipe_id: field_calculate
+    params:
+      input_path: $steps.community_metrics.output
+      field_name: COVER_RATE
+      expression: "!SUM_COVA! / !shape.area@squaremeters! if !shape.area@squaremeters! else 0"
+      field_type: DOUBLE
+
+assertions:
+  - type: file_exists
+    path: $steps.coverage_rate.output
+  - type: file_exists
+    path: $steps.elderly_by_community.output
+  # 覆盖率是比值：覆盖部分是从社区面里裁出来的，理论上界就是 1。留 5% 容差给
+  # 裁切边界与浮点（.shp 的面积字段与 !shape.area! 的口径也可能有微小差）。
+  - type: field_stats_between
+    path: $steps.coverage_rate.output
+    field: COVER_RATE
+    stat: max
+    value: [0, 1.05]
+  - type: field_stats_between
+    path: $steps.coverage_rate.output
+    field: COVER_RATE
+    stat: min
+    value: [0, 1]
+  # 守恒：每个裁切片段只属于一个社区（片段自带 COMM_ID），所以各社区「归属片段数」
+  # 之和必须恰好等于 covered_parts 的要素数 —— 漏算（片段被静默丢弃）会红；
+  # 错配不改变总数，靠 COVER_RATE 上界抓。
+  - type: field_stats_between
+    path: $steps.coverage_by_community.output
+    field: COUNT_COVA
+    stat: sum
+    value: [$steps.covered_parts.feature_count, $steps.covered_parts.feature_count]
+  # 人口合计：空表 / 全 0 说明分区统计没落上（最常见的是栅格与社区面坐标系不一致）。
+  # 1e8 是量级护栏：超了多半是栅格单位错（千人写成一人）或分区重复计数。
+  - type: field_stats_between
+    path: $steps.elderly_by_community.output
+    field: SUM
+    stat: sum
+    value: [1, 100000000]

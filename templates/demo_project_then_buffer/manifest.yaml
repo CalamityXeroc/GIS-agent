@@ -1,0 +1,45 @@
+id: demo_project_then_buffer
+name: 演示：先投影，再缓冲融合
+description: >-
+  玩具模板：把点图层投影到目标坐标系，再按距离做缓冲区并融合。只用来验证模板机制
+  （配方链、参数绑定、断言集），不含任何业务口径，也不是可直接交付的分析。
+  两步的输出都是 .shp，arcpy 与 GDAL 后端都能跑，用来演示「双后端模板」。
+version: "1.0"
+backend: [arcpy, gdal]
+
+data:
+  points:
+    type: vector
+    required: true
+    purpose: 点要素（如设施点位）
+  target_srid:
+    type: integer
+    required: false
+    default: 32610
+    purpose: 目标投影 EPSG/WKID（默认 UTM 10N，距离单位米）
+  distance:
+    type: string
+    required: false
+    default: 1000 Meters
+    purpose: 缓冲距离，含单位（如 "500 Meters"）
+
+pipeline:
+  - id: project
+    recipe_id: project_to_crs
+    params:
+      input_path: $data.points
+      output_path: $out/points_projected.shp
+      target_srid: $data.target_srid
+  - id: buffer
+    recipe_id: buffer_dissolve
+    params:
+      input_path: $steps.project.output
+      output_path: $out/points_buffer.shp
+      distance: $data.distance
+      dissolve_type: ALL
+
+assertions:
+  - type: file_exists
+    path: $out/points_projected.shp
+  - type: file_exists
+    path: $steps.buffer.output

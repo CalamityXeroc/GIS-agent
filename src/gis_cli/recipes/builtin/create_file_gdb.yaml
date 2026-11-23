@@ -1,0 +1,58 @@
+id: create_file_gdb
+name: 创建文件地理数据库
+description: 创建（或复用）文件地理数据库，作为过程数据与结果数据的统一容器。避免用 makedirs 造出假 .gdb 目录。
+domain: infra
+category: infra
+triggers: [创建数据库, 新建gdb, 建库, file gdb, 结果数据库]
+preconditions:
+  - 输出目录可写
+params:
+  gdb_path:
+    type: string
+    required: true
+    description: 目标 .gdb 完整路径（如 workspace/output/result_data.gdb）
+  recreate:
+    type: boolean
+    default: false
+    description: 是否先删除同名库重建（危险：会清空已有内容，默认 false）
+steps:
+  - 校验路径以 .gdb 结尾
+  - 存在则复用；recreate=true 时才删除重建
+  - 返回库路径与已有要素/表清单
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  gdb_path = {{gdb_path}}
+  recreate = bool({{recreate}})
+
+  if not str(gdb_path).lower().endswith(".gdb"):
+      raise ValueError(f"gdb_path 必须以 .gdb 结尾: {gdb_path}")
+  folder = os.path.dirname(os.path.abspath(gdb_path))
+  name = os.path.basename(gdb_path)[:-4]
+  if folder and not os.path.isdir(folder):
+      os.makedirs(folder, exist_ok=True)
+
+  existed = arcpy.Exists(gdb_path)
+  if existed and recreate:
+      arcpy.management.Delete(gdb_path)
+      existed = False
+  if not existed:
+      arcpy.management.CreateFileGDB(folder, name)
+
+  arcpy.env.workspace = gdb_path
+  fcs = arcpy.ListFeatureClasses() or []
+  tables = arcpy.ListTables() or []
+  rasters = arcpy.ListRasters() or []
+  set_result({"output": gdb_path, "reused": existed, "feature_classes": fcs,
+              "tables": tables, "rasters": rasters})
+  print(f"GDB ready: {gdb_path} (reused={existed}); fc={len(fcs)} tables={len(tables)} rasters={len(rasters)}")
+validation:
+  - type: vector_exists
+    path: "{{gdb_path}}"
+pitfalls:
+  - 绝不能对 .gdb 直接 os.makedirs：会造出一个假目录，后续 CreateFileGDB/要素写入都会失败。
+  - 同名库默认复用（不重建），需要清空时必须显式 recreate=true。
+examples:
+  - "创建 workspace/output/result_data.gdb 作为结果库"
+  - "创建 temp_data.gdb 存放过程数据"

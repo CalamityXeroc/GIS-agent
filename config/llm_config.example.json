@@ -1,0 +1,97 @@
+{
+  "model": "Pro/zai-org/GLM-5",
+  "api_key": "sk-your-api-key-here",
+  "api_base": "https://api.siliconflow.cn/v1",
+  "temperature": 0.5,
+  "max_tokens": 2048,
+  "timeout": 60,
+  "provider": "siliconflow",
+  "enable_prompt_optimizer": true,
+  "enable_baml_standardizer": true,
+  "provider_models": {
+    "siliconflow": [
+      "Qwen/Qwen3.5-32B",
+      "Pro/zai-org/GLM-5"
+    ],
+    "openai": [
+      "gpt-4o-mini"
+    ]
+  },
+  "routing_rules": {
+    "planning": [
+      "Qwen/Qwen3.5-32B"
+    ],
+    "intent": [
+      "gpt-4o-mini"
+    ],
+    "task_refine": [
+      "Qwen/Qwen3.5-32B"
+    ]
+  },
+  "baml_functions": {
+    "planning": [
+      "generate_gis_plan"
+    ],
+    "intent": [
+      "infer_gis_intent"
+    ],
+    "task_refine": [
+      "refine_gis_task"
+    ],
+    "recovery": [
+      "suggest_gis_recovery"
+    ]
+  },
+  "enable_baml_preflight": true,
+  "baml_preflight_strict": false,
+  "baml_required_capabilities": [
+    "intent",
+    "task_refine",
+    "planning",
+    "recovery"
+  ],
+  "enable_baml_builtin_fallback": true,
+  "_comment": "这是配置示例文件，请复制为 llm_config.json 并填入真实的 API Key",
+  "engine": {
+    "max_turns": 60,
+    "max_repairs": 4,
+    "kernel_exec_timeout_seconds": 600,
+    "run_deadline_seconds": 7200,
+    "auto_backup_destructive": true,
+    "auto_extract_requirements": true,
+    "hygiene_check": "warn",
+    "_comment_engine": {
+      "run_deadline_seconds": "整跑截止时间（秒）。网关长时间不可用时，单轮调用会反复重试；没有总截止时一次 run 可能整夜空转。到点后状态置 deadline_exceeded。",
+      "hygiene_check": "交付卫生检查：warn（默认，验收时仅提醒过程库重做残留/过程文件）| block（计入验收失败）| off。",
+      "model_failure_threshold": "主模型连续超时/连断达到该次数就冷却，直接走备用模型（写在本段或 llm 根段都行）。",
+      "model_cooldown_seconds": "首次冷却时长；同一模型反复失败会指数升级（上限 model_cooldown_max_seconds=3600）。",
+      "vision_check": "图面识图质检：warn（默认，让识图模型看图并提醒中文是否可读/图面是否被裁）| block（计入验收失败）| off。需在配置里设 \"vision\": true 且模型支持识图。",
+      "reasoning_effort": "思考档位（minimal/low/medium/high/xhigh/max），部分推理模型不传就没有思考内容。留空则不传该字段；换到不认此参数的网关时必须留空。"
+    },
+    "vision_check": "warn"
+  },
+  "_examples": {
+    "硅基流动 (SiliconFlow)": {
+      "api_base": "https://api.siliconflow.cn/v1",
+      "model": "Pro/zai-org/GLM-5"
+    },
+    "阿里千问 (Qwen)": {
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-turbo"
+    },
+    "DeepSeek": {
+      "api_base": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat"
+    },
+    "智谱 GLM": {
+      "api_base": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "glm-4-flash"
+    },
+    "OpenAI": {
+      "api_base": "https://api.openai.com/v1",
+      "model": "gpt-4"
+    }
+  },
+  "vision": false,
+  "_comment_vision": "模型支持识图时设为 true：把产出的图附进对话，让模型自己核对图面（并启用图面识图质检）。"
+}

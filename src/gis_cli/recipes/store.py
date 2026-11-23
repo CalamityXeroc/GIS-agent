@@ -1,0 +1,1816 @@
+# -*- coding: utf-8 -*-
+"""Recipe library: load, search, execute, and validate GIS methodology units."""
+
+from __future__ import annotations
+
+import importlib.util
+import logging
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+#: 真假 GDB 的判定（execute_code 预检与配方参数检查共用同一份）
+from ..runtime.gdb import GDB_MARKERS as _GDB_MARKERS, is_real_gdb as _is_real_gdb
+
+from .backends import (
+    DEFAULT_BACKEND,
+    backend_hint,
+    pick_backend,
+    runner_backends,
+    unavailable_message,
+)
+from .gdal_checks import gdal_raster_check, gdal_vector_check
+from .schema import WORKSPACE_SENTINEL, Recipe
+
+logger = logging.getLogger(__name__)
+
+#: 断言「未核验」的错误类型：环境里没有 arcpy / ArcGIS 解释器没跑出结论。
+#: 必须与断言失败（``ok=False`` 且 ``error_type`` 为空）严格分开——前者是「没测」，
+#: 后者是「做错了」。实测（DAIR-57）一个完全合格的 .aprx 在没有 arcpy 的 CLI 里
+#: 19.9 ms 被判「无法打开工程」并算出 0 分，而 arcgispro-py3 里同一条断言 ok=true。
+ENV_NEEDS_ARCGIS = "NeedsArcGIS"
+
+#: 断言目标路径没解析出来的错误类型：相对路径在当前 CWD 与 code_runner 工作区都找不到。
+#: 与「工程文件不存在」的断言失败分开——路径给错是「没测」，不是版面不合格；也不并入
+#: ``NeedsArcGIS``：要补救的地方不一样（换解释器 vs 换路径），混在一起又会误导模型。
+ENV_PATH_UNRESOLVED = "PathUnresolved"
+
+#: 核验过程本身报错的错误类型：工程打开了，但遍历图层/布局时抛异常（工程损坏、arcpy
+#: 版本不兼容…）。这是「真报错」，既不是「版面不合格」，也不是「没测」。
+ENV_CHECK_ERROR = "CheckError"
+
+#: 后端专属的断言实现：``(backend, kind) -> 处理函数``。
+#:
+#: 为什么需要：同一断言语义在不同后端下判法不同（``raster_exists`` 在 arcpy 里
+#: 是 ``arcpy.Exists``，在 GDAL 里是 ``osgeo`` 能不能打开）。配方声明了 backend，
+#: 断言就必须用**同一个后端**去验，否则"GDAL 写出来的产物拿 arcpy 判"全是假阴性。
+#: 没登记的组合一律走内置实现 —— 现有 arcpy 断言行为因此一行不变。
+_BACKEND_CHECKS: dict[tuple[str, str], Any] = {}
+
+
+def register_backend_assertion(backend: str, kind: str, func: Any) -> None:
+    """登记某后端专属的断言实现（P0-1b 的 GDAL 断言从这里接进来）。
+
+    ``func`` 的调用约定与 ``RecipeLibrary._check`` 一致：
+    ``func(library, kind, target, expected, raw, result) -> ValidationResult``。
+    """
+    _BACKEND_CHECKS[(str(backend).strip().lower(), str(kind).strip())] = func
+
+
+def backend_assertion(backend: str, kind: str) -> Any:
+    """取某后端对某 kind 的专属实现；没登记 → ``None``（用内置实现）。"""
+    return _BACKEND_CHECKS.get((str(backend).strip().lower(), str(kind).strip()))
+
+
+def _backend_note(recipe: Recipe, available: set[str] | None) -> str:
+    """操作目录里的后端标注。
+
+    arcpy 配方（缺省值）且本机能跑时一个字不加 —— 47 个老配方在目录里的样子
+    必须与以前完全一致，不拿一行行“后端: arcpy”把 5200 字的预算吃光。
+    """
+    declared = list(recipe.backend or [DEFAULT_BACKEND])
+    note = ""
+    if declared != [DEFAULT_BACKEND]:
+        note = f" ｜后端: {','.join(declared)}"
+    if available is not None and not set(declared) & available:
+        note += " ｜本机缺此后端"
+    return note
+
+
+_SLOT = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+#: ``@@param@@``：参数嵌进文本/正则/表达式时用的原样替换（与 Recipe.render 一致）。
+#: 蒸馏出的断言常用它（如 ``value: "@@group_field@@ | 记录数"``），只认
+#: ``{{param}}`` 会让断言把 ``@@group_field@@`` 当成字面量而永远不过。
+_RAW_SLOT = re.compile(r"@@\s*([A-Za-z_][A-Za-z0-9_]*)\s*@@")
+
+
+def _describe_code(path: str) -> str:
+    """Describe 快照的代码：内核会话与 Pro 子进程复核共用一份（口径必须一致）。"""
+    return (
+        "import arcpy, json\n"
+        f"_p = {path!r}\n"
+        "_rec = {'exists': arcpy.Exists(_p)}\n"
+        "if arcpy.Exists(_p):\n"
+        "    _d = arcpy.Describe(_p)\n"
+        "    _sr = getattr(_d, 'spatialReference', None)\n"
+        "    _rec['wkid'] = getattr(_sr, 'factoryCode', None) if _sr else None\n"
+        "    _rec['crs_name'] = getattr(_sr, 'name', '') if _sr else ''\n"
+        "    _rec['geom_type'] = getattr(_d, 'shapeType', '') or ''\n"
+        "    try:\n"
+        "        _rec['feature_count'] = int(arcpy.management.GetCount(_p)[0])\n"
+        "    except Exception:\n"
+        "        _rec['feature_count'] = None\n"
+        "    try:\n"
+        "        _rec['fields'] = [f.name for f in arcpy.ListFields(_p)]\n"
+        "    except Exception:\n"
+        "        _rec['fields'] = []\n"
+        "    try:\n"
+        "        _e = _d.extent\n"
+        "        _rec['extent'] = {'xmin': _e.XMin, 'ymin': _e.YMin, 'xmax': _e.XMax, 'ymax': _e.YMax}\n"
+        "    except Exception:\n"
+        "        _rec['extent'] = None\n"
+        "    try:\n"
+        "        _rec['raster_min'] = float(arcpy.management.GetRasterProperties(_p, 'MINIMUM').getOutput(0))\n"
+        "    except Exception:\n"
+        "        _rec['raster_min'] = None\n"
+        "    try:\n"
+        "        _rec['raster_max'] = float(arcpy.management.GetRasterProperties(_p, 'MAXIMUM').getOutput(0))\n"
+        "    except Exception:\n"
+        "        _rec['raster_max'] = None\n"
+        "set_result(_rec)\n"
+    )
+
+
+@dataclass
+class ValidationResult:
+    """Outcome of one recipe assertion."""
+
+    kind: str
+    target: str
+    ok: bool
+    detail: str = ""
+    #: ``""`` = 这是对产物的判定；非空 = 根本没判定成（缺 arcpy / 解释器没跑出结论）。
+    #: 只在非空时写进 ``to_dict()``：普通断言的结果 JSON 保持原样。
+    error_type: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {"kind": self.kind, "target": self.target, "ok": self.ok, "detail": self.detail}
+        if self.error_type:
+            out["error_type"] = self.error_type
+        return out
+
+
+class RecipeLibrary:
+    """Loads built-in and user recipes, and runs them safely."""
+
+    def __init__(
+        self,
+        *,
+        builtin_dir: str | Path | None = None,
+        user_dir: str | Path | None = None,
+        code_runner: Any = None,
+        catalog: Any = None,
+    ):
+        self.builtin_dir = Path(builtin_dir) if builtin_dir else Path(__file__).parent / "builtin"
+        self.user_dir = Path(user_dir) if user_dir else None
+        self.code_runner = code_runner
+        self.catalog = catalog
+        self._recipes: dict[str, Recipe] = {}
+
+    # ------------------------------------------------------------------- load
+    def load(self) -> int:
+        """(Re)load all recipe YAML files."""
+        self._recipes = {}
+        for directory in [self.builtin_dir, self.user_dir]:
+            if directory is None or not directory.exists():
+                continue
+            for path in sorted(directory.glob("*.y*ml")):
+                try:
+                    recipe = Recipe.from_yaml(path)
+                    if recipe.id:
+                        self._recipes[recipe.id] = recipe
+                except Exception as exc:
+                    logger.warning("failed to load recipe %s: %s", path, exc)
+        return len(self._recipes)
+
+    def ensure_loaded(self) -> None:
+        if not self._recipes:
+            self.load()
+
+    # ------------------------------------------------------------------ query
+    def get(self, recipe_id: str) -> Recipe | None:
+        self.ensure_loaded()
+        return self._recipes.get(recipe_id)
+
+    def all(self) -> list[Recipe]:
+        self.ensure_loaded()
+        return list(self._recipes.values())
+
+    def search(self, query: str = "", limit: int = 8) -> list[dict[str, Any]]:
+        self.ensure_loaded()
+        scored = [(recipe.match_score(query), recipe) for recipe in self._recipes.values()]
+        scored = [item for item in scored if item[0] > 0]
+        scored.sort(key=lambda item: (-item[0], item[1].id))
+        return [recipe.to_dict() for _, recipe in scored[:limit]]
+
+    def catalog_digest(self, *, max_chars: int = 5200) -> str:
+        """紧凑操作目录：按类别分组列出全部配方（id / 用途 / 必填参数）。
+
+        目的是让模型不必反复调用 list_recipes 就能看到全部可选操作。
+        """
+        self.ensure_loaded()
+        # 本机可用的后端（执行器没声明时是 None：不知道就不标）
+        available = runner_backends(self.code_runner)
+        groups: dict[str, list[Recipe]] = {}
+        for recipe in self._recipes.values():
+            groups.setdefault(recipe.category or recipe.domain or "general", []).append(recipe)
+        order = sorted(groups, key=lambda key: (-len(groups[key]), key))
+        label = {
+            "raster": "栅格",
+            "overlay": "叠加分析",
+            "geometry": "几何处理",
+            "analysis": "矢量分析",
+            "spatial_analysis": "空间分析",
+            "spatial_statistics": "空间统计",
+            "table": "属性表",
+            "data_management": "数据管理",
+            "projection": "投影与坐标系",
+            "data_quality": "数据质量",
+            "cartography": "制图",
+            "mapping": "制图",
+            "infra": "基础设施",
+        }
+        lines: list[str] = []
+        for key in order:
+            items = sorted(groups[key], key=lambda r: r.id)
+            title = label.get(key, key)
+            lines.append(f"### {title}（{len(items)}）")
+            for recipe in items:
+                required = [
+                    name
+                    for name, spec in recipe.params.items()
+                    if spec.required
+                ]
+                params = ", ".join(required) if required else "—"
+                brief = (recipe.name or recipe.description).strip()
+                brief = brief.split("（")[0].split("(")[0].strip()
+                lines.append(f"- {recipe.id}: {brief} ｜必填: {params}{_backend_note(recipe, available)}")
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[: max_chars - 40] + "\n…（更多配方用 list_recipes 关键词检索）"
+        return text
+
+    # -------------------------------------------------------------------- run
+    def run(self, recipe_id: str, params: dict[str, Any], ctx: Any, *, timeout: float | None = None) -> Any:
+        """Execute a recipe and its validation assertions.
+
+        ``timeout`` 可覆盖默认执行超时（缓冲区分区统计这类重活常需要 20 分钟以上）。
+        """
+        from ..engine.state import Observation
+
+        recipe = self.get(recipe_id)
+        if recipe is None:
+            return Observation(
+                ok=False,
+                summary=f"配方不存在: {recipe_id}",
+                error={"type": "RecipeNotFound", "message": f"可用配方: {', '.join(self._recipes)}"},
+            )
+        if self.code_runner is None and getattr(ctx, "code_runner", None) is None:
+            return Observation(ok=False, summary="没有可用的代码执行器", error={"type": "NoRunner"})
+        runner = getattr(ctx, "code_runner", None) or self.code_runner
+        # 按 backend 声明路由：配方说要用哪个后端，就得有能跑它的执行器。
+        # 一个都没有就当场报清楚，不要把 GDAL 代码丢给 ArcPy 内核去撞
+        # "No module named osgeo" 这种看不懂的错。
+        available = runner_backends(runner)
+        backend = pick_backend(recipe.backend, available)
+        if backend is None:
+            message = unavailable_message(recipe.backend, available)
+            return Observation(
+                ok=False,
+                summary=f"配方 {recipe.id} 在本机跑不了: {message}",
+                error={
+                    "type": "BackendUnavailable",
+                    "message": message,
+                    "recipe": recipe.id,
+                    "required": list(recipe.backend),
+                    "available": sorted(available or []),
+                },
+                hint=backend_hint(recipe.backend),
+            )
+        # 把工作区哨兵换成真实路径：蒸馏出来的配方常用 `ws = {{workspace}}`，
+        # 而内核的 CWD 不是工作区，写 `.` 会找不到 input/。
+        params = dict(params or {})
+        workspace_str = str(getattr(ctx, "workspace", "."))
+        for key, value in list(params.items()):
+            if isinstance(value, str) and value == WORKSPACE_SENTINEL:
+                params[key] = workspace_str
+        for key, spec in (recipe.params or {}).items():
+            if key not in params and isinstance(spec.default, str) and spec.default == WORKSPACE_SENTINEL:
+                params[key] = workspace_str
+        # 假 GDB 防线：`os.makedirs("x.gdb")` 建出来的是普通目录，而
+        # `arcpy.Exists()` 对它**返回 True** —— 模型随后跳过 CreateFileGDB
+        # 直接往里写，arcpy 读库内表时把二进制当文本解码，报
+        # UnicodeDecodeError（4a 实测连挂两次，还被误判成“编码猜错”）。
+        fake_gdb = _fake_gdb_param(recipe, params, workspace_str)
+        if fake_gdb:
+            return Observation(
+                ok=False,
+                summary=(
+                    f"参数 {fake_gdb} 指向一个假的 .gdb（普通目录）：{params.get(fake_gdb)}。"
+                    "arcpy.Exists() 对它也返回 True，后续写入会被当成 GDB 读二进制表，"
+                    "表现为 UnicodeDecodeError。"
+                ),
+                error={"type": "FakeGdbPath", "message": str(params.get(fake_gdb))},
+                hint="先删掉这个目录；要建库用 arcpy.management.CreateFileGDB(父目录, '名字.gdb')；"
+                "只是放 TIFF/表格就换成普通目录（如 output/）。",
+            )
+        try:
+            code = recipe.render(params, backend=backend)
+        except Exception as exc:
+            return Observation(
+                ok=False,
+                summary=f"配方参数错误: {exc}",
+                error={"type": "RecipeParamError", "message": str(exc)},
+            )
+
+        default_timeout = float(getattr(ctx, "exec_timeout", 0) or 0)
+        result = runner.run(
+            code,
+            timeout=float(timeout or default_timeout or 600.0),
+            workspace=str(getattr(ctx, "workspace", ".")),
+        )
+        if not result.ok:
+            return Observation(
+                ok=False,
+                summary=f"配方 {recipe.id} 执行失败: [{(result.error or {}).get('type')}] {(result.error or {}).get('message')}",
+                data={"stdout": (result.stdout or "")[-3000:], "code": code},
+                error=result.error,
+                hint="可改用 execute_code 手动实现，或修正参数后重试。",
+            )
+
+        resolved = recipe.resolve_params(params)
+        assertions = self._run_assertions(
+            recipe,
+            resolved,
+            result,
+            workspace=getattr(ctx, "workspace", None),
+            backend=backend,
+            runner=runner,
+        )
+        failed = [a for a in assertions if not a.ok]
+        from ..engine.tools import extract_outputs
+
+        artifacts = extract_outputs(result.result, str(getattr(ctx, "workspace", ".")))
+        if not artifacts:
+            # 兜底：配方代码不一定调 set_result（蒸馏出来的配方常常只 print）。
+            # 但它自己的 validation 已经点名了交付物——把通过的“存在性”断言
+            # 当成产物清单，否则下游会把“没有产物”当成失败。
+            artifacts = [
+                a.target
+                for a in assertions
+                if a.ok and str(a.kind) in {"vector_exists", "raster_exists", "file_exists"} and a.target
+            ]
+        summary = f"配方 {recipe.id} 执行成功"
+        if assertions:
+            summary += f"，断言 {len(assertions) - len(failed)}/{len(assertions)} 通过"
+        if failed:
+            summary += "；未通过: " + "；".join(f"{a.kind}({a.target}) {a.detail}" for a in failed[:3])
+        return Observation(
+            ok=not failed,
+            summary=summary,
+            data={
+                "stdout": (result.stdout or "")[-3000:],
+                "result": result.result,
+                "assertions": [a.to_dict() for a in assertions],
+                "recipe": recipe.to_dict(),
+                "backend": backend,
+            },
+            artifacts=artifacts,
+            images=result.display_images[:3],
+            hint="" if not failed else "请检查配方断言失败项，必要时用 execute_code 修正。",
+        )
+
+    # ------------------------------------------------------------- assertions
+    def run_assertions(
+        self,
+        assertions: list[dict[str, Any]],
+        *,
+        result: Any = None,
+        backend: str = DEFAULT_BACKEND,
+    ) -> list[ValidationResult]:
+        """Public entry for evaluating raw assertion dicts (used by benchmarks)."""
+        out: list[ValidationResult] = []
+        for raw in assertions or []:
+            kind = str(raw.get("type", "") or "")
+            target = str(raw.get("path", "") or raw.get("target", ""))
+            expected = raw.get("value")
+            try:
+                out.append(self._check(kind, target, expected, raw, result, backend=backend))
+            except Exception as exc:
+                out.append(ValidationResult(kind, target, False, f"断言执行异常: {exc}"))
+        return out
+
+    def _run_assertions(
+        self,
+        recipe: Recipe,
+        params: dict[str, Any],
+        result: Any,
+        *,
+        workspace: str | Path | None = None,
+        backend: str | None = None,
+        runner: Any = None,
+    ) -> list[ValidationResult]:
+        """跑配方自带断言。
+
+        ``backend`` 缺省取配方自己声明的第一个后端；``runner`` 是 ``run()``
+        实际执行这段代码的那一个执行器——断言必须问同一个执行器（见 ``_check``）。
+        """
+        backend = backend or pick_backend(recipe.backend, None) or DEFAULT_BACKEND
+        out: list[ValidationResult] = []
+        # 断言里可以用 {{output}} 引用配方自己返回的产物：多期配方的文件名带期号
+        # （kde_1982-1986.tif …），静态 path 写不出来，只能取返回值里的第一个产物。
+        slots = dict(params or {})
+        payload = getattr(result, "result", None)
+        if isinstance(payload, dict) and payload.get("output"):
+            slots.setdefault("output", payload["output"])
+        for raw in recipe.validation:
+            # 解析断言里所有字符串槽位（path/target/value 以及 field/reference 等自定义键）
+            raw = {
+                k: (_resolve(v, slots) if isinstance(v, str) else v)
+                for k, v in raw.items()
+            }
+            kind = str(raw.get("type", "") or "")
+            target = str(raw.get("path", "") or raw.get("target", ""))
+            expected = raw.get("value")
+            if isinstance(expected, list):
+                expected = [_resolve(str(v), slots) for v in expected]
+            target = self._absolutize(target, workspace)
+            try:
+                out.append(self._check(kind, target, expected, raw, result, backend=backend, runner=runner))
+            except Exception as exc:
+                out.append(ValidationResult(kind, target, False, f"断言执行异常: {exc}"))
+        return out
+
+    @staticmethod
+    def _absolutize(target: str, workspace: str | Path | None) -> str:
+        """相对路径按工作区解析。
+
+        蒸馏出来的配方，参数默认值往往是 ``output/result_data.gdb`` 这种
+        工作区相对路径；而断言执行器直接交给 arcpy，内核的 CWD 并不是工作区，
+        于是 ``arcpy.Exists('output/...')`` 一律 False，四条断言全红
+        （实测：配方执行成功、断言 0/4）。
+        """
+        if not target or workspace is None:
+            return target
+        p = Path(target)
+        if p.is_absolute():
+            return target
+        return str(Path(workspace) / target)
+
+    def _check(
+        self,
+        kind: str,
+        target: str,
+        expected: Any,
+        raw: dict[str, Any],
+        result: Any,
+        *,
+        backend: str = DEFAULT_BACKEND,
+        runner: Any = None,
+    ) -> ValidationResult:
+        # 后端专属实现优先：登记了就用它，没登记走下面的内置实现（arcpy 口径）。
+        impl = backend_assertion(backend, kind)
+        if impl is not None:
+            return impl(self, kind, target, expected, raw, result)
+        # GDAL 后端没有 arcpy：向量产物的存在性/要素数得让 .venv-gdal 自己数
+        # （pyogrio）；栅格产物的极值同理（rasterio）。只接管这几个 kind，
+        # 其余与后端无关的（file_exists 等）照旧。
+        if backend == "gdal":
+            # 用**执行了这段代码**的那个执行器去数要素，不是库里自带的那个：
+            # run() 里执行器是 ``ctx.code_runner or self.code_runner``，两者不同时
+            # 断言会换一个解释器去读，读到什么全看那个解释器装没装 pyogrio。
+            gdal_runner = runner or self.code_runner
+            verdict = gdal_vector_check(gdal_runner, kind, target, expected, raw)
+            if verdict is None:
+                verdict = gdal_raster_check(gdal_runner, kind, target, expected, raw)
+            if verdict is not None:
+                return ValidationResult(kind, target, verdict[0], verdict[1])
+        path = Path(target)
+        if kind == "file_exists":
+            return ValidationResult(kind, target, path.exists(), "" if path.exists() else "文件不存在")
+        if kind == "file_contains":
+            if not path.exists():
+                return ValidationResult(kind, target, False, "文件不存在")
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception as exc:
+                return ValidationResult(kind, target, False, f"读取失败: {exc}")
+            needle = str(expected or "")
+            ok = bool(needle) and needle in text
+            return ValidationResult(kind, target, ok, f"contains({needle})={ok}")
+        if kind == "file_matches":
+            # 文本产物的**格式**断言（``^\d+\.\d{2}$`` 这类）。实测蒸馏时模型会
+            # 把正则写进 file_contains 的值里，子串匹配必然不过；给个明确的口子，
+            # 而不是让“包含”偷偷变成“正则”（那会把真失败放过去）。
+            if not path.exists():
+                return ValidationResult(kind, target, False, "文件不存在")
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception as exc:
+                return ValidationResult(kind, target, False, f"读取失败: {exc}")
+            pattern = str(expected or "")
+            try:
+                ok = bool(pattern) and re.search(pattern, text, re.MULTILINE) is not None
+            except re.error as exc:
+                return ValidationResult(kind, target, False, f"正则无效: {exc}")
+            return ValidationResult(kind, target, ok, f"matches({pattern})={ok}")
+        if kind in {"vector_exists", "raster_exists"}:
+            # GDB 要素类/栅格不是文件系统路径：用 arcpy.Exists 判断。
+            # arcpy 对新写入的数据集有可见性缓存，刚 save 完可能瞬时为 False，
+            # 因此这里做一次短重试，避开“刚产出却判为不存在”的偶发误报。
+            if path.exists():
+                return ValidationResult(kind, target, True, "")
+            record = self._describe(target)
+            ok = bool(record and record.get("exists"))
+            if not ok:
+                time.sleep(0.8)
+                record = self._describe(target)
+                ok = bool(record and record.get("exists"))
+            return ValidationResult(kind, target, ok, "" if ok else "要素类/栅格不存在（arcpy.Exists 也为 False）")
+        if kind == "feature_count_gt":
+            count = self._feature_count(target)
+            ok = count is not None and count > int(expected or 0)
+            return ValidationResult(kind, target, ok, f"count={count}")
+        if kind == "feature_count_equal":
+            count = self._feature_count(target)
+            ok = count is not None and int(expected) == count
+            return ValidationResult(kind, target, ok, f"count={count} expected={expected}")
+        if kind == "feature_count_lt":
+            count = self._feature_count(target)
+            ok = count is not None and count < int(expected)
+            return ValidationResult(kind, target, ok, f"count={count} expected<{expected}")
+        if kind == "feature_count_between":
+            count = self._feature_count(target)
+            try:
+                lo, hi = int(expected[0]), int(expected[1])
+            except Exception:
+                return ValidationResult(kind, target, False, f"非法范围: {expected}")
+            ok = count is not None and lo <= count <= hi
+            return ValidationResult(kind, target, ok, f"count={count} expected in [{lo},{hi}]")
+        if kind == "field_value_counts":
+            expect = raw.get("value") or {}
+            if not isinstance(expect, dict) or not expect:
+                return ValidationResult(kind, target, False, "value 需要写成 {类别: 数量} 映射")
+            counts, bad = self._field_value_counts(
+                target, str(raw.get("field", "") or ""), {str(k): int(v) for k, v in expect.items()}
+            )
+            ok = counts is not None and not bad
+            if counts is None:
+                detail = f"字段读取失败: {getattr(self, '_last_counts_error', '')}"
+            else:
+                detail = f"counts={counts}" if ok else f"不符: {bad}；实际={counts}"
+            return ValidationResult(kind, target, ok, detail)
+        if kind == "field_value_counts_between":
+            # 脏数据任务的类别数量常有合理区间（多物种拆行/空值剔除方式不同），用区间断言避免假阴性
+            expect = raw.get("value") or expected or {}
+            if not isinstance(expect, dict) or not expect:
+                return ValidationResult(kind, target, False, "value 需要写成 {类别: [lo,hi]} 映射")
+            field = str(raw.get("field", "") or "")
+            try:
+                bands = {str(k): (int(v[0]), int(v[1])) for k, v in expect.items()}
+            except Exception:
+                return ValidationResult(kind, target, False, f"区间写法错误: {expect}")
+            counts, err = self._field_counts_all(target, field)
+            if counts is None:
+                return ValidationResult(kind, target, False, f"字段读取失败: {err}")
+            bad = [
+                f"{label}: 实际{counts.get(label)}(期望{lo}~{hi})"
+                for label, (lo, hi) in bands.items()
+                if counts.get(label) is None or not (lo <= int(counts[label]) <= hi)
+            ]
+            return ValidationResult(kind, target, not bad, f"counts={counts} 不符={bad}")
+        if kind == "field_values_subset":
+            allowed = expected if isinstance(expected, list) else [expected]
+            allowed_set = {str(a) for a in allowed}
+            values, bad = self._field_values(target, str(raw.get("field", "") or ""), allowed_set=allowed_set)
+            if values is None:
+                return ValidationResult(kind, target, False, f"字段读取失败: {bad}")
+            ok = not bad
+            return ValidationResult(kind, target, ok, f"values={sorted(values)[:8]} unexpected={sorted(bad)[:8]}")
+        if kind == "overlap_pairs_max":
+            max_allowed = int(expected if expected is not None else 0)
+            count, truncated = self._overlap_pairs(target, max_allowed)
+            ok = count is not None and count <= max_allowed
+            detail = f"overlaps={count}" + (" (truncated)" if truncated else "") + f" max={max_allowed}"
+            return ValidationResult(kind, target, ok, detail)
+        if kind == "extent_matches_reference":
+            return self._extent_check(target, str(raw.get("reference", "") or ""), raw, result)
+        if kind == "crs_wkid":
+            wkid = self._crs_wkid(target)
+            ok = wkid is not None and int(wkid) == int(expected)
+            return ValidationResult(kind, target, ok, f"wkid={wkid} expected={expected}")
+        if kind == "crs_wkid_in":
+            # 同一目标坐标系的等价写法可能有多个（如 UTM 10N 的 WGS84=32610 / NAD83=26910）
+            allowed = expected if isinstance(expected, list) else [expected]
+            wkid = self._crs_wkid(target)
+            ok = wkid is not None and int(wkid) in {int(a) for a in allowed}
+            return ValidationResult(kind, target, ok, f"wkid={wkid} allowed={sorted(int(a) for a in allowed)}")
+        if kind == "bbox_between":
+            # 范围框（投影坐标）落在给定区间内，用于「研究区应等于点群包络 ±2km」这类几何判据
+            box = self._bbox(target)
+            expect = raw.get("value") if raw.get("value") is not None else expected
+            try:
+                lo = {k: float(v[0]) for k, v in expect.items()}
+                hi = {k: float(v[1]) for k, v in expect.items()}
+            except Exception:
+                return ValidationResult(kind, target, False, f"value 需要写成 {{xmin:[lo,hi],...}}: {expect}")
+            if box is None:
+                return ValidationResult(kind, target, False, "范围读取失败（要素类不存在或内核不可用）")
+            bad = [k for k in lo if box.get(k) is None or not (lo[k] <= float(box[k]) <= hi[k])]
+            detail = " ".join(f"{k}={box.get(k):.1f}" if box.get(k) is not None else f"{k}=None" for k in ("xmin", "ymin", "xmax", "ymax"))
+            return ValidationResult(kind, target, not bad, f"{detail} out_of_range={bad}")
+        if kind == "fields_present":
+            fields = self._fields(target)
+            required = expected if isinstance(expected, list) else [expected]
+            missing = [f for f in required if f not in fields]
+            return ValidationResult(kind, target, not missing, f"missing={missing}")
+        if kind == "field_sum_gt":
+            field = str(raw.get("field", "") or "")
+            total = self._field_stat(target, field, "sum")
+            ok = total is not None and total > float(expected or 0)
+            return ValidationResult(kind, target, ok, f"sum({field})={total} expected>{expected}")
+        if kind == "field_distinct_gt":
+            field = str(raw.get("field", "") or "")
+            distinct = self._field_stat(target, field, "distinct")
+            ok = distinct is not None and distinct > int(expected or 0)
+            return ValidationResult(kind, target, ok, f"distinct({field})={distinct} expected>{expected}")
+        if kind == "field_stats_between":
+            field = str(raw.get("field", "") or "")
+            stat = str(raw.get("stat", "mean") or "mean").lower()
+            value = self._field_stat(target, field, stat)
+            try:
+                lo, hi = float(expected[0]), float(expected[1])
+            except Exception:
+                return ValidationResult(kind, target, False, f"非法区间: {expected}")
+            ok = value is not None and lo <= value <= hi
+            return ValidationResult(kind, target, ok, f"{stat}({field})={value} expected in [{lo},{hi}]")
+        if kind == "join_null_rate_below":
+            field = str(raw.get("field", "") or "")
+            rate = self._field_stat(target, field, "null_rate")
+            limit = float(expected if expected is not None else 0.05)
+            ok = rate is not None and rate <= limit
+            return ValidationResult(kind, target, ok, f"null_rate({field})={rate} expected<={limit}")
+        if kind == "raster_stat_between":
+            stat = str(raw.get("stat", "sum") or "sum").lower()
+            info = self._raster_stats(target)
+            try:
+                lo, hi = float(expected[0]), float(expected[1])
+            except Exception:
+                return ValidationResult(kind, target, False, f"非法区间: {expected}")
+            value = info.get(stat) if info else None
+            ok = value is not None and lo <= float(value) <= hi
+            detail = f"{stat}={value} expected in [{lo},{hi}]" + (f" stats={info}" if info and not ok else "")
+            return ValidationResult(kind, target, ok, detail)
+        if kind == "extent_within_reference":
+            reference = str(raw.get("reference", "") or "")
+            ok, detail = self._extent_within(target, reference)
+            return ValidationResult(kind, target, ok, detail)
+        if kind == "raster_not_constant":
+            info = self._raster_range(target)
+            ok = info is not None and info[0] is not None and info[1] is not None and info[0] != info[1]
+            return ValidationResult(kind, target, ok, f"range={info}")
+        if kind == "raster_value_absent":
+            # 土地覆盖云修补类任务：修完后不允许再出现指定类别（如 Clouds=10）
+            wanted = expected if isinstance(expected, list) else [expected]
+            values = [int(v) for v in wanted if v is not None]
+            found, detail = self._raster_find_values(target, values)
+            if found is None:
+                return ValidationResult(kind, target, False, detail)
+            return ValidationResult(kind, target, not found, f"found={found} {detail}")
+        if kind == "shared_legend_bounds":
+            # 统一图例：多张图（如 4 期核密度）必须用完全相同的分级上界才能横向对比。
+            # 比对各 .spec.json 里“实际生效”的 applied_bounds（来自渲染后读回的 classBreaks）。
+            spec_dir = Path(target)
+            pattern = str(raw.get("pattern") or "*.spec.json")
+            cfg_shared = expected if isinstance(expected, dict) else {}
+            if isinstance(raw.get("value"), dict):
+                cfg_shared = raw["value"]
+            min_files = int(cfg_shared.get("min_files") or 2)
+            if not spec_dir.exists():
+                return ValidationResult(kind, target, False, f"目录不存在: {spec_dir}")
+            files = sorted(spec_dir.glob(pattern))
+            # 目录不存在/没图时也要给出明确结论，不静默放行
+            if len(files) < min_files:
+                return ValidationResult(
+                    kind, target, False, f"只找到 {len(files)} 份 spec（{pattern}），少于要求的 {min_files} 份"
+                )
+            bounds_map: dict[str, list] = {}
+            missing: list[str] = []
+            for path in files:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    missing.append(f"{path.name}(解析失败:{str(exc)[:40]})")
+                    continue
+                bounds = self._spec_bounds(data if isinstance(data, dict) else {})
+                if not bounds:
+                    missing.append(path.name)
+                    continue
+                bounds_map[path.name] = [float(x) for x in bounds]
+            if missing:
+                return ValidationResult(
+                    kind, target, False, f"这些图没有分级信息（未统一图例）: {'、'.join(missing[:5])}"
+                )
+            unique = {tuple(v) for v in bounds_map.values()}
+            ok = len(unique) == 1
+            detail = f"{len(bounds_map)} 份图共用 {len(unique)} 套分级"
+            if ok:
+                detail += f": {list(unique)[0]}"
+            else:
+                detail += ": " + "; ".join(f"{k}={v}" for k, v in list(bounds_map.items())[:4])
+            return ValidationResult(kind, target, ok, detail)
+
+        if kind == "raster_class_counts_between":
+            # 分类栅格的按值像元数区间（土地覆盖更新类任务：水域/建筑区面积是否落在合理区间）
+            # value 形如 {"1": [lo, hi], "7": [lo, hi]}；支持 count_scale 换算（如 100 m² 像元 → km²）
+            cfg = expected if isinstance(expected, dict) else {}
+            if isinstance(raw.get("value"), dict):
+                cfg = raw["value"]
+            if not cfg:
+                return ValidationResult(kind, target, False, "value 需要写成 {类别: [lo,hi]} 映射")
+            scale = float(raw.get("scale") or 1.0)
+            # scale 的本意是"像元面积换算"，但它把像元尺寸写死了。实测 14 届任务三b：
+            # 模型把掩膜重采样到 10 m 输出，面积算出来是对的（8.83 km²），却被
+            # 0.000225（15 m 像元）放大成 19.87 km² 而判超界。面积才是这里的判定
+            # 语义，分辨率该由专门的断言管，所以优先用栅格实测像元面积。
+            scale_source = "yaml"
+            if raw.get("use_raster_cell", True):
+                cell_m2 = self._raster_cell_area_m2(target)
+                if cell_m2:
+                    scale = cell_m2 / 1_000_000.0
+                    scale_source = f"实测像元 {cell_m2 ** 0.5:.3g}m"
+            values = [int(float(k)) for k in cfg]
+            counts, detail = self._raster_find_values(target, values)
+            if counts is None:
+                return ValidationResult(kind, target, False, detail)
+            bad = []
+            report = {}
+            for key, band in cfg.items():
+                count = int(counts.get(str(int(float(key))), 0))
+                scaled = count * scale
+                report[key] = round(scaled, 3)
+                lo, hi = float(band[0]), float(band[1])
+                if not (lo <= scaled <= hi):
+                    bad.append(f"{key}: {scaled:.3f} 不在 [{lo},{hi}]")
+            return ValidationResult(
+                kind, target, not bad, f"values={report}（{scale_source}）不符={bad}"
+            )
+
+        if kind == "deliverable_hygiene_ok":
+            # 交付卫生：过程库里的**重做残留**（同前缀重复件）与禁止的过程文件。
+            # 实测第 14 届：temp_data.gdb 里 4 份 dem_mosaic*（159 MB），过程数据占交付量 96%，
+            # 而考卷要求“提交时删除非必要数据”。体积比只做警告（DEM 拼接这类天然偏大）。
+            cfg = raw.get("value") if isinstance(raw.get("value"), dict) else (expected if isinstance(expected, dict) else {})
+            max_families = int(cfg.get("max_duplicate_families", 0) or 0)
+            forbid = [str(x).lower() for x in (cfg.get("forbid_suffixes") or [".pkl", ".tmp", ".bak"])]
+            ratio_limit = float(cfg.get("warn_temp_result_ratio", 5) or 0)
+            problems, warnings_out, detail = self._hygiene_report(
+                target, max_duplicate_families=max_families, forbid_suffixes=forbid, ratio_limit=ratio_limit
+            )
+            if detail is None:
+                return ValidationResult(kind, target, False, self._last_hygiene_error or "交付卫生检查失败")
+            ok = not problems
+            note = "；".join(problems + [f"警告: {w}" for w in warnings_out]) or detail
+            return ValidationResult(kind, target, ok, note[:300])
+        if kind == "image_not_blank":
+            return self._image_check(target)
+        if kind == "aprx_map_check":
+            return self._aprx_map_check(target, raw)
+        if kind == "map_layout_ok":
+            # 版面体检：图名居中/图例不压数据/比例尺整数刻度/元素不越界（制图交付的硬指标）
+            spec = raw.get("spec") or self._load_sibling_spec(target, raw.get("image"))
+            image_path = str(raw.get("image") or "")
+            min_font_pt = float(raw.get("min_font_pt") or 7.0)
+            # 版面体检要读 .aprx，只有 arcpy 能读。benchmark/CLI 跑在 venv 里
+            # （没装 arcpy），直接 import 会报 “No module named 'arcpy'” 而判失败——
+            # 实测 14 届 4a-1 就报 “版面体检失败: ...”。有 code_runner（内核/子进程）
+            # 时改让它在 ArcGIS 解释器里体检，把结果回传。
+            if self.code_runner is not None:
+                return self._map_layout_via_runner(
+                    kind, target, spec=spec, image_path=image_path, min_font_pt=min_font_pt
+                )
+            try:
+                from ..cartography import qc as _qc
+
+                verdict = _qc.check_layout(
+                    target,
+                    spec=spec,
+                    image_path=image_path,
+                    min_font_pt=min_font_pt,
+                )
+                return ValidationResult(kind, target, bool(verdict.get("ok")), _qc.summarize(verdict))
+            except Exception as exc:  # pragma: no cover - 依赖 arcpy
+                return ValidationResult(kind, target, False, f"版面体检失败: {str(exc)[:120]}")
+        if kind == "code_ok":
+            ok = bool(getattr(result, "ok", False))
+            return ValidationResult(kind, target, ok, "")
+        if kind == "result_key_truthy":
+            key = str(raw.get("key", "") or "")
+            payload = getattr(result, "result", None)
+            value = payload.get(key) if isinstance(payload, dict) else None
+            return ValidationResult(kind, target, bool(value), f"{key}={value!r}")
+        if kind == "result_file_exists":
+            key = str(raw.get("key", "") or "output")
+            payload = getattr(result, "result", None)
+            raw_path = payload.get(key) if isinstance(payload, dict) else None
+            exists = bool(raw_path) and Path(str(raw_path)).exists()
+            return ValidationResult(kind, target, exists, f"{key}={raw_path}")
+        return ValidationResult(kind, target, True, "未知断言类型，已跳过")
+
+    @staticmethod
+    def _spec_bounds(data: dict[str, Any]) -> list | None:
+        """从一份 .spec.json 里找出实际生效的分级边界。
+
+        实测（14 届 4a-1）：制图配方写出的 spec 顶层**没有** ``renderer`` 键，
+        分级藏在 ``decisions``（``explicit_bounds=[0,2,4,6,8]``）与 ``notes``
+        （``raster_classify(统一图例): [2.0, 4.0, 6.0, 8.0]``）里。只认
+        renderer.applied_bounds 会误判“这些图没有分级信息”，而图其实是好的。
+
+        按可信度依次找：renderer 内的键 → 顶层同名键 → decisions 条目 → notes 文本。
+        """
+        renderer = data.get("renderer")
+        if isinstance(renderer, dict):
+            for key in ("applied_bounds", "explicit_bounds", "class_bounds"):
+                if renderer.get(key):
+                    return list(renderer[key])
+        for key in ("applied_bounds", "explicit_bounds", "class_bounds"):
+            if data.get(key):
+                return list(data[key])
+        for item in data.get("decisions") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("key", "")).lower() in (
+                "explicit_bounds",
+                "applied_bounds",
+                "class_bounds",
+            ) and item.get("value"):
+                return list(item["value"])
+        # 最后从 notes 文本里抽（形如 "raster_classify(统一图例): [2.0, 4.0, 6.0, 8.0]"）
+        for note in data.get("notes") or []:
+            match = re.search(r"\[\s*([\d.,\s]+?)\s*\]", str(note))
+            if match:
+                try:
+                    values = [float(x) for x in match.group(1).split(",") if x.strip()]
+                except Exception:
+                    continue
+                if values:
+                    return values
+        return None
+
+    @staticmethod
+    def _load_sibling_spec(target: str, image: Any = "") -> dict[str, Any] | None:
+        """加载与工程/成图同名的 ``.spec.json``（设计规格）。
+
+        版面体检里有些判据依赖设计决策（例如"图例刻意放在图框外"是允许的），
+        不传 spec 会把刻意设计误报成越界（14 届四a-2 实测）。
+        """
+        import json as _json
+
+        candidates: list[Path] = []
+        for raw_path in (target, image):
+            if not raw_path:
+                continue
+            path = Path(str(raw_path))
+            candidates.append(path.with_suffix(".spec.json"))
+            candidates.append(path.with_suffix(path.suffix + ".spec.json"))
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return _json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+        return None
+
+    def _field_counts_all(self, path: str, field: str) -> tuple[dict[str, int] | None, str]:
+        """字段全量取值计数：内核优先，进程内 arcpy 兜底。
+
+        返回 (计数字典 | None, 错误文本)。不得在断言进程内静默吞异常——
+        实测 runner 用非 ArcGIS 解释器启动时进程内 import arcpy 会失败，
+        若不透传错误，detail 只会剩一个空 {}，无法定位（14 届基准实测教训）。
+        """
+        if not field:
+            return None, "字段名为空"
+        if self.code_runner is not None:
+            lf = chr(10)
+            code = lf.join([
+                "import arcpy",
+                f"_p = {path!r}",
+                f"_f = {field!r}",
+                "_counts = {}",
+                "if arcpy.Exists(_p):",
+                "    _names = {f.name for f in arcpy.ListFields(_p)}",
+                "    if _f in _names:",
+                "        with arcpy.da.SearchCursor(_p, [_f]) as _cur:",
+                "            for _row in _cur:",
+                "                _k = '' if _row[0] is None else str(_row[0])",
+                "                _counts[_k] = _counts.get(_k, 0) + 1",
+                "set_result({'counts': _counts})",
+            ])
+            outcome = self.code_runner.run(code, timeout=300)
+            payload = outcome.result if outcome.ok and isinstance(outcome.result, dict) else None
+            if isinstance(payload, dict) and payload.get("error"):
+                return None, str(payload["error"])
+            if isinstance(payload, dict) and isinstance(payload.get("counts"), dict):
+                return {str(k): int(v) for k, v in payload["counts"].items()}, ""
+            # 内核返回不可用（实测长会话后可能出现 ok=True 但 result=None）→ 落到进程内兜底
+        try:
+            import arcpy  # type: ignore
+
+            if not arcpy.Exists(path):
+                return None, f"要素类不存在: {path}"
+            fields = {f.name for f in arcpy.ListFields(path)}
+            if field not in fields:
+                return None, f"字段不存在: {field}（现有 {sorted(fields)[:10]}）"
+            counts: dict[str, int] = {}
+            with arcpy.da.SearchCursor(path, [field]) as cur:
+                for (value,) in cur:
+                    key = "" if value is None else str(value)
+                    counts[key] = counts.get(key, 0) + 1
+            return counts, ""
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+    def _field_value_counts(
+        self, path: str, field: str, expected: dict[str, int] | None
+    ) -> tuple[dict[str, int] | None, dict[str, tuple[int, int]]]:
+        """统计字段各取值个数，返回 (实际计数, {取值: (实际, 期望)} 不符项)。
+
+        ``expected=None`` 表示只要全量计数（供区间断言使用）。
+        """
+        counts, err = self._field_counts_all(path, field)
+        if counts is None:
+            self._last_counts_error = err
+            return None, {}
+        self._last_counts_error = ""
+        bad = {
+            key: (counts.get(key, 0), want)
+            for key, want in (expected or {}).items()
+            if counts.get(key, 0) != want
+        }
+        return counts, bad
+
+    def _field_values(self, path: str, field: str, *, allowed_set: set[str]) -> tuple[set | None, set]:
+        """Read all values of a field via the kernel; return (values, unexpected)."""
+        if self.code_runner is None or not field:
+            return None, {"字段为空或无执行器"}
+        code = (
+            "import arcpy\n"
+            f"_p = {path!r}\n_f = {field!r}\n"
+            "_vals = set()\n"
+            "with arcpy.da.SearchCursor(_p, [_f]) as cur:\n"
+            "    for row in cur:\n"
+            "        if row[0] is not None:\n"
+            "            _vals.add(str(row[0]))\n"
+            "set_result({'values': sorted(_vals)})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=180)
+        if outcome.ok and isinstance(outcome.result, dict):
+            vals = {str(v) for v in outcome.result.get("values", [])}
+            unexpected = {v for v in vals if v not in allowed_set}
+            return vals, unexpected
+        return None, {str(outcome.error)[:80] if outcome.error else "读取失败"}
+
+    def _field_sum(self, path: str, field: str) -> float | None:
+        """Sum a numeric field via the kernel."""
+        return self._field_stat(path, field, "sum")
+
+    def _raster_cell_area_m2(self, path: str) -> float | None:
+        """读栅格的实际像元面积（m²）。内核优先，进程内兜底。
+
+        只认投影坐标系；地理坐标系返回 None，让调用方退回 yaml 里的 scale
+        —— 用度算面积没有意义。
+        """
+        code = "\n".join(
+            [
+                "import arcpy",
+                f"_p = {path!r}",
+                "try:",
+                "    _d = arcpy.Describe(_p)",
+                "    _cx = abs(float(_d.meanCellWidth)); _cy = abs(float(_d.meanCellHeight))",
+                "    _sr = _d.spatialReference",
+                "    _proj = bool(getattr(_sr, 'projectionCode', 0))",
+                "    set_result({'area': _cx * _cy if _proj else None})",
+                "except Exception as _e:",
+                "    set_result({'area': None, 'reason': str(_e)[:120]})",
+            ]
+        )
+        if self.code_runner is not None:
+            try:
+                outcome = self.code_runner.run(code, timeout=120)
+                payload = outcome.result if outcome.ok and isinstance(outcome.result, dict) else None
+                area = (payload or {}).get("area")
+                if area and float(area) > 0:
+                    return float(area)
+            except Exception:
+                pass
+        try:
+            import arcpy  # type: ignore
+
+            desc = arcpy.Describe(path)
+            if getattr(desc.spatialReference, "projectionCode", 0):
+                area = abs(float(desc.meanCellWidth)) * abs(float(desc.meanCellHeight))
+                return area if area > 0 else None
+        except Exception:
+            return None
+        return None
+
+    def _raster_find_values(self, path: str, values: list[int]) -> tuple[dict[str, int] | None, str]:
+        """统计栅格中指定取值各有多少像元（用 numpy 全量读取；超大数据拒绝判定）。"""
+        if self.code_runner is None:
+            return None, "无内核"
+        code = (
+            "import arcpy, numpy as np\n"
+            f"_p = {path!r}\n"
+            f"_vals = {values!r}\n"
+            "_d = arcpy.Describe(_p)\n"
+            "_n = int(getattr(_d, 'width', 0)) * int(getattr(_d, 'height', 0))\n"
+            "if _n == 0 or _n > 80000000:\n"
+            "    set_result({'counts': None, 'reason': f'像元数 {_n} 过大或未知，跳过'})\n"
+            "else:\n"
+            "    _arr = arcpy.RasterToNumPyArray(_p)\n"
+            "    set_result({'counts': {str(v): int((_arr == v).sum()) for v in _vals}, 'reason': ''})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=600)
+        payload = outcome.result if outcome.ok and isinstance(outcome.result, dict) else None
+        if not payload or payload.get("counts") is None:
+            counts = self._raster_counts_in_process(path, values)
+            if counts is None:
+                return None, f"栅格取值检查失败: {(payload or {}).get('reason') or outcome.error or '未知'}"
+            found = {k: v for k, v in counts.items() if int(v) > 0}
+            return found, f"counts={counts} (in-process)"
+        counts = payload["counts"]
+        found = {k: v for k, v in counts.items() if int(v) > 0}
+        return found, f"counts={counts}"
+
+    def _field_stat_in_process(self, path: str, field: str, kind: str) -> float | None:
+        """进程内 arcpy 计算字段统计（内核不可用时的兜底）。"""
+        try:
+            import arcpy  # type: ignore
+        except Exception:
+            return None
+        if not field:
+            return None
+        try:
+            if not arcpy.Exists(path):
+                return None
+            vals: list[float] = []
+            n = 0
+            null = 0
+            distinct: set[str] = set()
+            with arcpy.da.SearchCursor(path, [field]) as cur:
+                for row in cur:
+                    n += 1
+                    v = row[0]
+                    if v is None:
+                        null += 1
+                        continue
+                    distinct.add(str(v))
+                    try:
+                        vals.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+            if kind == "sum":
+                return float(sum(vals)) if vals else None
+            if kind == "min":
+                return float(min(vals)) if vals else None
+            if kind == "max":
+                return float(max(vals)) if vals else None
+            if kind == "mean":
+                return float(sum(vals) / len(vals)) if vals else None
+            if kind == "count":
+                return float(n)
+            if kind == "distinct":
+                return float(len(distinct))
+            if kind == "null_rate":
+                return float(null / n) if n else None
+            return None
+        except Exception:
+            return None
+
+    def _raster_counts_in_process(self, path: str, values: list[int]) -> dict[str, int] | None:
+        """进程内 arcpy 统计栅格指定取值像元数（兜底）。"""
+        try:
+            import arcpy  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:
+            return None
+        try:
+            desc = arcpy.Describe(path)
+            n = int(getattr(desc, "width", 0)) * int(getattr(desc, "height", 0))
+            if n == 0 or n > 80000000:
+                return None
+            arr = arcpy.RasterToNumPyArray(path)
+            return {str(v): int((arr == v).sum()) for v in values}
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------- 交付卫生
+    def _hygiene_report(
+        self,
+        target: str,
+        *,
+        max_duplicate_families: int = 0,
+        forbid_suffixes: list[str] | None = None,
+        ratio_limit: float = 0.0,
+    ) -> tuple[list[str], list[str], str | None]:
+        """交付卫生检查（实现在 ``runtime/hygiene.py``，与验收器共用同一套判据）。
+
+        返回 ``(problems, warnings, detail)``；``detail`` 为 None 表示检查本身失败。
+        """
+        from ..runtime.hygiene import dir_inventory, hygiene_report
+
+        inventory, err = dir_inventory(self.code_runner, target)
+        if inventory is None:
+            self._last_hygiene_error = err
+            return [], [], None
+        self._last_hygiene_error = ""
+        problems, warnings_out, detail = hygiene_report(
+            inventory,
+            max_duplicate_families=max_duplicate_families,
+            forbid_suffixes=forbid_suffixes,
+            ratio_limit=ratio_limit,
+        )
+        return problems, warnings_out, detail
+
+    def _field_stat(self, path: str, field: str, kind: str) -> float | None:
+        """Compute a statistic of a field via the kernel.
+
+        kind: sum | min | max | mean | count | distinct | null_rate
+        """
+        if self.code_runner is None or not field:
+            return None
+        code = (
+            "import arcpy, statistics as _st\n"
+            f"_p = {path!r}\n_f = {field!r}\n"
+            "_vals = []\n_n = 0\n_null = 0\n_distinct = set()\n"
+            "with arcpy.da.SearchCursor(_p, [_f]) as cur:\n"
+            "    for row in cur:\n"
+            "        _n += 1\n"
+            "        _v = row[0]\n"
+            "        if _v is None:\n"
+            "            _null += 1\n"
+            "            continue\n"
+            "        _distinct.add(str(_v))\n"
+            "        try:\n"
+            "            _vals.append(float(_v))\n"
+            "        except (TypeError, ValueError):\n"
+            "            pass\n"
+            "set_result({'sum': sum(_vals), 'min': min(_vals) if _vals else None,\n"
+            "            'max': max(_vals) if _vals else None,\n"
+            "            'mean': (_st.fmean(_vals) if _vals else None),\n"
+            "            'count': _n, 'null': _null, 'distinct': len(_distinct),\n"
+            "            'null_rate': (_null / _n) if _n else None})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=180)
+        if outcome.ok and isinstance(outcome.result, dict):
+            value = outcome.result.get(kind)
+            return float(value) if value is not None else None
+        # 内核不可用或返回异常（实测长会话后可能 ok=True 但 result=None）→ 进程内兜底
+        return self._field_stat_in_process(path, field, kind)
+
+    def _raster_stats(self, path: str) -> dict[str, float] | None:
+        """Exact raster statistics (NoData-aware) via the kernel."""
+        if self.code_runner is None:
+            return None
+        code = (
+            "import arcpy, numpy as np\n"
+            f"_r = arcpy.Raster({path!r})\n"
+            "_a = arcpy.RasterToNumPyArray(_r, nodata_to_value=np.nan).astype('float64')\n"
+            "_valid = int(np.count_nonzero(~np.isnan(_a)))\n"
+            "set_result({'sum': float(np.nansum(_a)),\n"
+            "            'min': float(np.nanmin(_a)) if _valid else None,\n"
+            "            'max': float(np.nanmax(_a)) if _valid else None,\n"
+            "            'mean': float(np.nanmean(_a)) if _valid else None,\n"
+            "            'count': _valid, 'nodata': int(_a.size - _valid)})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=300)
+        if outcome.ok and isinstance(outcome.result, dict) and outcome.result:
+            return {k: v for k, v in outcome.result.items() if v is not None}
+        # 内核返回不可用（实测长会话后 ok=True/result=None）→ 落 Describe 快照
+        # （_describe 有内核+进程内双重兕底，min/max 足以支撑区间断言）
+        return self._raster_stats_in_process(path)
+
+    def _raster_stats_in_process(self, path: str) -> dict[str, float] | None:
+        """栅格统计兕底：先试 describe 快照（含进程内 arcpy），再试进程内 numpy 全量。"""
+        record = self._describe(path)
+        if record and record.get("exists"):
+            lo, hi = record.get("raster_min"), record.get("raster_max")
+            if lo is not None or hi is not None:
+                out: dict[str, float] = {}
+                if lo is not None:
+                    out["min"] = float(lo)
+                if hi is not None:
+                    out["max"] = float(hi)
+                return out or None
+        try:
+            import arcpy  # type: ignore
+            import numpy as np  # type: ignore
+
+            arr = arcpy.RasterToNumPyArray(path, nodata_to_value=np.nan).astype("float64")
+            valid = int(np.count_nonzero(~np.isnan(arr)))
+            if not valid:
+                return None
+            return {
+                "sum": float(np.nansum(arr)),
+                "min": float(np.nanmin(arr)),
+                "max": float(np.nanmax(arr)),
+                "mean": float(np.nanmean(arr)),
+                "count": float(valid),
+            }
+        except Exception:
+            return None
+
+    def _extent_within(self, target: str, reference: str) -> tuple[bool, str]:
+        """True when target's extent is inside reference's extent (small tolerance)."""
+        if self.code_runner is None or not reference:
+            return False, "缺少 reference 参数"
+        code = (
+            "import arcpy\n"
+            f"_t = {target!r}\n_r = {reference!r}\n"
+            "if not arcpy.Exists(_t) or not arcpy.Exists(_r):\n"
+            "    raise ValueError('目标或参考数据不存在')\n"
+            "_te = arcpy.Describe(_t).extent\n_re = arcpy.Describe(_r).extent\n"
+            "_tol = max(_re.width, _re.height) * 1e-6\n"
+            "_ok = (_te.XMin >= _re.XMin - _tol and _te.YMin >= _re.YMin - _tol\n"
+            "       and _te.XMax <= _re.XMax + _tol and _te.YMax <= _re.YMax + _tol)\n"
+            "set_result({'ok': bool(_ok), 'target': [_te.XMin,_te.YMin,_te.XMax,_te.YMax],\n"
+            "            'reference': [_re.XMin,_re.YMin,_re.XMax,_re.YMax]})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=180)
+        if outcome.ok and isinstance(outcome.result, dict):
+            payload = outcome.result
+            return bool(payload.get("ok")), f"target={payload.get('target')} reference={payload.get('reference')}"
+        return False, f"范围比较失败: {(outcome.error or {}).get('message', '')[:80]}"
+
+    def _overlap_pairs(self, path: str, max_allowed: int) -> tuple[int | None, bool]:
+        """Count polygon pairs that overlap/duplicate (early-exit at max_allowed)."""
+        if self.code_runner is None:
+            return None, False
+        code = (
+            "import arcpy\n"
+            f"_p = {path!r}\n"
+            f"_limit = {int(max_allowed)}\n"
+            "_oids = [(o, s) for o, s in arcpy.da.SearchCursor(_p, ['OID@', 'SHAPE@'])]\n"
+            "_count = 0\n"
+            "_truncated = False\n"
+            "for _i in range(len(_oids)):\n"
+            "    _gi = _oids[_i][1]\n"
+            "    for _j in range(_i + 1, len(_oids)):\n"
+            "        _gj = _oids[_j][1]\n"
+            "        if _gi.equals(_gj) or _gi.overlaps(_gj) or _gi.contains(_gj) or _gi.within(_gj):\n"
+            "            _count += 1\n"
+            "            if _count > _limit:\n"
+            "                _truncated = True\n"
+            "                break\n"
+            "    if _truncated:\n"
+            "        break\n"
+            "set_result({'overlaps': _count, 'truncated': _truncated})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=300)
+        if outcome.ok and isinstance(outcome.result, dict):
+            return int(outcome.result.get("overlaps", 0)), bool(outcome.result.get("truncated"))
+        return None, False
+
+    def _extent_check(self, path: str, reference: str, raw: dict[str, Any], result: Any) -> ValidationResult:
+        """Compare extents against a reference layer.
+
+        This catches the classic 'DefineProjection instead of Project' failure:
+        relabeled data keeps its original (degree-scale) extent while a truly
+        projected layer lands in meter-scale GK coordinates.
+        """
+        if self.code_runner is None:
+            return ValidationResult("extent_matches_reference", path, False, "无内核")
+        tolerance = float(raw.get("tolerance", 1.0) or 1.0)
+        code = (
+            "import arcpy\n"
+            f"_out = {path!r}\n_ref = {reference!r}\n"
+            "def _ext(p):\n"
+            "    d = arcpy.Describe(p)\n"
+            "    e = d.extent\n"
+            "    return [e.XMin, e.YMin, e.XMax, e.YMax]\n"
+            "set_result({'out': _ext(_out), 'ref': _ext(_ref)})\n"
+        )
+        outcome = self.code_runner.run(code, timeout=180)
+        payload = outcome.result if outcome.ok and isinstance(outcome.result, dict) else None
+        if not payload:
+            return ValidationResult("extent_matches_reference", path, False, f"范围读取失败: {outcome.error}")
+        diffs = [abs(a - b) for a, b in zip(payload["out"], payload["ref"])]
+        worst = max(diffs)
+        ok = worst <= tolerance
+        detail = f"max_diff={worst:.3f} (tol={tolerance}) out={payload['out']} ref={payload['ref']}"
+        return ValidationResult("extent_matches_reference", path, ok, detail)
+
+    def _feature_count(self, path: str) -> int | None:
+        record = self._describe(path)
+        return record.get("feature_count") if record else None
+
+    def _bbox(self, path: str) -> dict[str, float] | None:
+        """要素类/栅格范围框（xmin/ymin/xmax/ymax），取自 Describe 快照。"""
+        record = self._describe(path)
+        if not record or not record.get("exists"):
+            return None
+        box = record.get("extent")
+        if not isinstance(box, dict):
+            return None
+        try:
+            return {k: float(box[k]) for k in ("xmin", "ymin", "xmax", "ymax")}
+        except Exception:
+            return None
+
+    def _crs_wkid(self, path: str) -> int | None:
+        record = self._describe(path)
+        return record.get("wkid") if record else None
+
+    def _fields(self, path: str) -> list[str]:
+        record = self._describe(path)
+        return list(record.get("fields") or []) if record else []
+
+    def _raster_range(self, path: str) -> tuple[float | None, float | None] | None:
+        """栅格 (min, max)。
+
+        Describe 的 MINIMUM/MAXIMUM 取不到时，**退到 _raster_stats** 再试一次。
+        实测（14 届 4a-1 回归）：同一个栅格，``raster_not_constant`` 拿到 range=None
+        而紧随其后的 ``raster_stat_between`` 拿到了 max=6.012——前者走 Describe
+        （曾经一个 try 包住 MIN/MAX，MIN 抛异常就把 MAX 也置 None），后者走
+        _raster_stats。两条路径差异会给同一条产物两个矛盾的结论，所以这里收紧。
+        """
+        record = self._describe(path)
+        if record:
+            low, high = record.get("raster_min"), record.get("raster_max")
+            if low is not None and high is not None:
+                return low, high
+        stats = self._raster_stats(path)
+        if stats:
+            low, high = stats.get("min"), stats.get("max")
+            if low is not None and high is not None:
+                return float(low), float(high)
+        return None
+
+    def _describe(self, path: str, *, attempts: int = 2) -> dict[str, Any] | None:
+        """Describe one path via the kernel (best effort)，失败再退到进程内 arcpy。
+
+        Uses ``arcpy.Exists`` rather than ``Path.exists`` so GDB feature
+        classes/tables (which are not filesystem paths) work too.
+
+        刚被看门狗杀掉内核时，GDB 可能仍被残留进程占着，``arcpy.Exists`` 会瞬时为 False，
+        因此这里重试一次再下结论，避免把已有数据判成"不存在"。
+
+        重试后仍是**否定**结论时，再换一路真 arcpy（ArcGIS Pro python 子进程）复核一次：
+        内核会话里 arcpy 的状态可能已经脏了——DAIR-15 实测同一份 ``real_a.gdb`` 在同一
+        会话里 ``arcpy.Exists`` 恒 False，而全新的 Pro 进程里 exists=True、count=3。
+        这类假阴性会被读成"产出缺失"，逼 agent 重建数据、也污染基准结论。
+        子进程实测 14~25s，所以在肯定分支上不付这笔开销。
+        """
+        record: dict[str, Any] | None = None
+        for index in range(max(1, attempts)):
+            record = self._describe_once(path)
+            if record and record.get("exists"):
+                return record
+            if index + 1 < max(1, attempts):
+                time.sleep(1.0)
+        verified = self._describe_via_pro(path)
+        if verified is None:
+            return record
+        if verified.get("exists") and not (record or {}).get("exists"):
+            logger.warning(
+                "Describe 假阴性已纠正：%s —— 会话内判不存在，Pro 子进程判存在（count=%s）",
+                path,
+                verified.get("feature_count"),
+            )
+        return verified
+
+    @staticmethod
+    def _describe_via_pro(path: str) -> dict[str, Any] | None:
+        """用 ArcGIS Pro python 子进程复核 Describe（同会话说"不存在"时才走这里）。
+
+        不用 venv 的进程内 arcpy：那条路在基准/CLI 的 venv 里根本没有 arcpy，
+        必然返回 None，等于没复核（DAIR-15 的 ``_describe_in_process`` 兜底就是这样失效的）。
+        """
+        from ..arcpy_bridge import run_arcpy_code
+
+        if not Path(path).parent.exists():
+            # 父目录都没有，数据不可能存在 —— 脏会话也只能这么判，不必付这趟 14~25s 子进程。
+            return None
+        try:
+            outcome = run_arcpy_code(_describe_code(path), timeout_seconds=120)
+        except Exception as exc:  # 复核自己失败不该改变原结论
+            logger.warning("Describe 子进程复核异常（%s）: %s", path, exc)
+            return None
+        if outcome.status != "success" or not isinstance(outcome.data, dict):
+            message = (outcome.error or {}).get("message") or outcome.stderr or ""
+            logger.warning("Describe 子进程复核无结果（%s）: %s", path, str(message)[:200])
+            return None
+        return outcome.data
+
+    def _describe_once(self, path: str) -> dict[str, Any] | None:
+        if self.code_runner is None:
+            return self._describe_in_process(path)
+        outcome = self.code_runner.run(_describe_code(path), timeout=180)
+        if outcome.ok and isinstance(outcome.result, dict):
+            return outcome.result
+        # 内核忙/卡死时不能就此判定“不存在”（那样会误报产出缺失，把 agent 逼去重建数据）。
+        # 退回本进程内直接调 arcpy（断言评估通常在带 arcpy 的主进程里跑）。
+        return self._describe_in_process(path)
+
+    @staticmethod
+    def _describe_in_process(path: str) -> dict[str, Any] | None:
+        """不经内核、在当前进程内用 arcpy 描述数据（内核不可用时的兼容退路）。"""
+        try:
+            import arcpy  # type: ignore
+        except Exception:
+            return None
+        try:
+            record: dict[str, Any] = {"exists": bool(arcpy.Exists(path))}
+            if not record["exists"]:
+                return record
+            desc = arcpy.Describe(path)
+            sr = getattr(desc, "spatialReference", None)
+            record["wkid"] = getattr(sr, "factoryCode", None) if sr else None
+            record["crs_name"] = getattr(sr, "name", "") if sr else ""
+            record["geom_type"] = getattr(desc, "shapeType", "") or ""
+            try:
+                record["feature_count"] = int(arcpy.management.GetCount(path)[0])
+            except Exception:
+                record["feature_count"] = None
+            try:
+                record["fields"] = [f.name for f in arcpy.ListFields(path)]
+            except Exception:
+                record["fields"] = []
+            try:
+                ext = desc.extent
+                record["extent"] = {
+                    "xmin": ext.XMin, "ymin": ext.YMin, "xmax": ext.XMax, "ymax": ext.YMax,
+                }
+            except Exception:
+                record["extent"] = None
+            try:
+                record["raster_min"] = float(arcpy.management.GetRasterProperties(path, "MINIMUM").getOutput(0))
+                record["raster_max"] = float(arcpy.management.GetRasterProperties(path, "MAXIMUM").getOutput(0))
+            except Exception:
+                record["raster_min"] = None
+                record["raster_max"] = None
+            return record
+        except Exception:
+            return None
+
+    def _aprx_map_check(self, path: str, raw: dict[str, Any]) -> ValidationResult:
+        """核验 .aprx 工程：渲染器类型、各类别配色、布局四要素是否都落盘。
+
+        断言参数：
+          renderer: 期望渲染器类型（UniqueValueRenderer / GraduatedColorsRenderer）
+          colors: 期望配色，形如 "标杆社区=#1F77B4;需整改社区=#2CA02C"
+          elements: 必须存在的布局要素（子集：图名/图例/比例尺/指北针）
+
+        本进程没有 arcpy 时**不能判“版面不合格”**：那样是环境失败被当成断言失败。
+        做法与 ``map_layout_ok`` 一致——有 arcpy 就地算，没有就交给 code_runner 去
+        ArcGIS 解释器里算同一份判定；两样都没有就明确报「未核验」并带上
+        ``error_type``，让下游能把「没测」和「做错了」分开。
+        """
+        target = _resolve_assert_target(Path(path), self.code_runner)
+        if target is None:
+            # 解析不出来 ≠ 工程文件不存在：这是路径问题，不能算成「版面不合格」。
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"工程路径无法解析：{path}（当前目录与代码执行器工作区都没有这个文件）",
+                error_type=ENV_PATH_UNRESOLVED,
+            )
+        if not target.exists():
+            return ValidationResult("aprx_map_check", path, False, "工程文件不存在")
+        if not _arcpy_importable():
+            if self.code_runner is not None:
+                return self._aprx_map_via_runner(str(target), raw)
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                "未核验（需 ArcGIS）：当前进程没有 arcpy，也没有可用的代码执行器",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        try:
+            verdict = _aprx_map_verdict(str(target), raw)
+        except ImportError as exc:  # find_spec 说在、真导入却失败（arcpy 目录坏了）
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"未核验（需 ArcGIS）: {str(exc)[:120]}",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        return ValidationResult(
+            "aprx_map_check",
+            path,
+            bool(verdict["ok"]),
+            str(verdict["detail"]),
+            error_type=str(verdict.get("error_type", "") or ""),
+        )
+
+    def _aprx_map_via_runner(self, path: str, raw: dict[str, Any]) -> ValidationResult:
+        """在 ArcGIS 解释器（内核/子进程）里核验 .aprx，把结论回传。
+
+        benchmark/CLI 的 .venv 里没有 arcpy，而工程核验必须用 arcpy 打开 .aprx，
+        所以这段固定要让 code_runner 去跑。判据只有 :func:`_aprx_map_verdict` 一份，
+        这里只换进程，不在子进程里另抄一套。
+        """
+        code = (
+            "import json as _json\n"
+            "from gis_cli.recipes.store import _aprx_map_verdict as _verdict\n"
+            f"_raw = _json.loads({json.dumps(json.dumps(raw, ensure_ascii=False))})\n"
+            f"set_result(_verdict({path!r}, _raw))\n"
+        )
+        try:
+            outcome = self.code_runner.run(code, timeout=300)
+        except Exception as exc:  # pragma: no cover - 内核不可用
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"未核验（代码执行器异常）: {str(exc)[:120]}",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        if not outcome.ok:
+            detail = ""
+            if isinstance(outcome.error, dict):
+                detail = str(outcome.error.get("message") or outcome.error.get("type") or "")
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                f"未核验（ArcGIS 解释器失败）: {detail[:160]}",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        payload = outcome.result if isinstance(outcome.result, dict) else {}
+        if "ok" not in payload:  # 没拿到结论 ≠ 零问题
+            return ValidationResult(
+                "aprx_map_check",
+                path,
+                False,
+                "未核验（ArcGIS 解释器没有返回结论）",
+                error_type=ENV_NEEDS_ARCGIS,
+            )
+        return ValidationResult(
+            "aprx_map_check",
+            path,
+            bool(payload.get("ok")),
+            str(payload.get("detail") or ""),
+            # 子进程回传的 error_type 原样带回：核验报错不能被改写成「没测（需 ArcGIS）」。
+            error_type=str(payload.get("error_type") or ""),
+        )
+
+    def _image_check(self, path: str) -> ValidationResult:
+        target = Path(path)
+        if not target.exists():
+            return ValidationResult("image_not_blank", path, False, "文件不存在")
+        try:
+            from PIL import Image  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            # 缺依赖时**不能**静默回“通过”：那样图面检查等于没做，
+            # 而 benchmark 会拿它当证据（实测曾报 “std No module named 'numpy'"
+            # 却标记 OK）。现在直接说清楚是环境缺包。
+            return ValidationResult(
+                "image_not_blank", path, False, f"缺少依赖无法判定（请安装 pillow+numpy）: {exc}"
+            )
+        try:
+            with Image.open(target) as img:
+                arr = np.asarray(img.convert("L"), dtype="float32")
+            std = float(arr.std())
+            return ValidationResult("image_not_blank", path, std > 3.0, f"std={std:.2f}")
+        except Exception as exc:
+            return ValidationResult("image_not_blank", path, False, f"读图失败: {str(exc)[:120]}")
+
+    # ------------------------------------------------------------------- save
+    def _map_layout_via_runner(
+        self,
+        kind: str,
+        target: str,
+        *,
+        spec: dict[str, Any] | None,
+        image_path: str,
+        min_font_pt: float,
+    ) -> ValidationResult:
+        """在 ArcGIS 解释器（内核/子进程）里跑版面体检，把结论回传。
+
+        venue 里没有 arcpy，而 check_layout 必须读 .aprx，所以这段固定要让
+        code_runner 去跑。spec 也一并传过去（它决定“图例放图框外”这类刻意设计
+        是否算越界）。
+        """
+        code = (
+            "import json as _json\n"
+            "from gis_cli.cartography import qc as _qc\n"
+            f"_spec = _json.loads({json.dumps(json.dumps(spec or {}, ensure_ascii=False))})\n"
+            f"_r = _qc.check_layout({target!r}, spec=_spec, "
+            f"image_path={image_path!r}, min_font_pt={min_font_pt!r})\n"
+            "set_result({'verdict': _r, 'summary': _qc.summarize(_r)})\n"
+        )
+        try:
+            outcome = self.code_runner.run(code, timeout=300)
+        except Exception as exc:  # pragma: no cover - 内核不可用
+            return ValidationResult(kind, target, False, f"版面体检失败（内核异常）: {str(exc)[:120]}")
+        if not outcome.ok:
+            detail = ""
+            if isinstance(outcome.error, dict):
+                detail = str(outcome.error.get("message") or outcome.error.get("type") or "")
+            return ValidationResult(kind, target, False, f"版面体检失败: {detail[:160]}")
+        payload = outcome.result if isinstance(outcome.result, dict) else {}
+        verdict = payload.get("verdict") or {}
+        summary = str(payload.get("summary") or "")
+        return ValidationResult(kind, target, bool(verdict.get("ok")), summary)
+
+    def save(self, recipe: Recipe, *, user: bool = True) -> str:
+        """Persist a recipe (distillation target)."""
+        directory = self.user_dir if user and self.user_dir else self.builtin_dir
+        if directory is None:
+            raise ValueError("no recipe directory configured")
+        path = directory / f"{recipe.id}.yaml"
+        recipe.to_yaml(path)
+        self._recipes[recipe.id] = recipe
+        return str(path)
+
+
+def _symbol_hex(symbol: Any) -> str:
+    """取符号颜色的 #RRGGBB（ArcGIS 返回 Color 对象或 dict 两种形态）。"""
+    color = getattr(symbol, "color", None)
+    if color is None:
+        return ""
+    rgb = getattr(color, "RGB", None)
+    if rgb is None and isinstance(color, dict):
+        rgb = color.get("RGB")
+    if not rgb:
+        return ""
+    try:
+        return "#{:02X}{:02X}{:02X}".format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    except Exception:
+        return ""
+
+
+def _arcpy_importable() -> bool:
+    """当前进程能不能 import arcpy（只查不导：arcpy 导入实测要 8~11 s）。"""
+    try:
+        return importlib.util.find_spec("arcpy") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _resolve_assert_target(path: Path, code_runner: Any) -> Path | None:
+    """把工程路径解析成绝对路径（存在性判断与交给执行器都用它）。
+
+    相对路径默认按当前 CWD 解析（与就地 arcpy 的行为一致）；CWD 下找不到再看
+    code_runner 的工作区——内核的 CWD 是工作区，不先解析成绝对路径的话，同一条
+    断言只是换个进程就会报“无法打开工程”（实测 DAIR-60：CLI 传
+    ``output/成果图/x.aprx``，内核在另一个目录下打不开）。
+
+    两处都没有 → ``None``：这是**路径问题**（DAIR-63 复查列的残余面），调用方要把它
+    记成 ``PathUnresolved``，而不是拿原相对路径去 ``exists()`` 报「工程文件不存在」。
+
+    **有意的取舍（DAIR-73 复查 3，别当 bug 改回去）**：相对路径一律先解析，解析不出来
+    就记 ``PathUnresolved``，于是「产物没生成（忘了出图）」和「路径写错」在 CLI 侧不再
+    可分——两者都算「没测成」，不再给 0 分。副作用是 ``_aprx_map_check`` 里「工程文件
+    不存在」那条普通失败分支现在**只有绝对路径才走得到**（见那里的 ``target.exists()``）。
+    基准侧会把 path 绝对化，所以不受影响；CLI 侧宁可把「没产出」当「没测」，也不要拿
+    路径问题去误判版面不合格、把模型逼去乱改图。
+    """
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return Path.cwd() / path
+    workspace = getattr(code_runner, "workspace", None)
+    if workspace and (Path(workspace) / path).exists():
+        return Path(workspace) / path
+    return None
+
+
+def _aprx_map_verdict(path: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """用 arcpy 打开 .aprx，核验渲染器/配色/布局要素，返回 ``{"ok", "detail"}``。
+
+    **必须在有 arcpy 的解释器里跑**：benchmark/CLI 的 .venv 没有 arcpy，
+    ``RecipeLibrary._aprx_map_check`` 会把同一份判定交给 code_runner（内核/
+    子进程）；本函数只负责判定，不关心在哪个进程里被执行。
+
+    打开工程失败、遍历图层/布局阶段抛异常都带回 ``error_type="CheckError"``：那是
+    **真报错**，既不能算「版面不合格」，也不能算「没测（需 ArcGIS）」（DAIR-63 复查
+    列出的残余面）。第一次打开失败曾漏了 ``error_type``，于是工具层说「工程核验未通过
+    + 按提示修正渲染器/配色/布局」，而 ``CheckError`` 的 hint 又说这是「工程损坏」——
+    同一个事实两处提示互相矛盾（DAIR-73 复查 1）。
+    """
+    from arcpy import mp  # type: ignore
+
+    try:
+        project = mp.ArcGISProject(str(path))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "detail": f"无法打开工程: {str(exc)[:120]}",
+            "error_type": ENV_CHECK_ERROR,
+        }
+
+    try:
+        problems, renderer_types, found_colors = _aprx_scan(project, raw)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "detail": f"核验过程报错: {type(exc).__name__}: {str(exc)[:120]}",
+            "error_type": ENV_CHECK_ERROR,
+        }
+
+    detail = "；".join(problems[:4])
+    if not problems:
+        detail = f"渲染器={renderer_types[:1]} 配色={found_colors}"
+    return {"ok": not problems, "detail": detail}
+
+
+def _aprx_scan(
+    project: Any, raw: dict[str, Any]
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """遍历工程里的图层与布局，返回 ``(problems, renderer_types, found_colors)``。"""
+    problems: list[str] = []
+    want_renderer = str(raw.get("renderer", "") or "")
+    want_colors = _parse_color_expectations(str(raw.get("colors", "") or ""))
+    want_elements = [str(e) for e in (raw.get("elements") or [])]
+
+    found_colors: dict[str, str] = {}
+    renderer_types: list[str] = []
+    for map_obj in project.listMaps():
+        for layer in map_obj.listLayers():
+            if layer.isGroupLayer:
+                continue
+            try:
+                renderer = layer.symbology.renderer
+            except Exception:
+                continue
+            renderer_types.append(type(renderer).__name__)
+            if type(renderer).__name__ == "UniqueValueRenderer":
+                for group in renderer.groups:
+                    for item in group.items:
+                        vals = list(item.values) if item.values else []
+                        key = ""
+                        if vals:
+                            v0 = vals[0]
+                            key = str(v0[0]) if isinstance(v0, (list, tuple)) else str(v0)
+                        found_colors[key] = _symbol_hex(item.symbol)
+
+    if want_renderer and want_renderer not in renderer_types:
+        problems.append(f"渲染器为 {renderer_types or ['(无图层)']}，期望 {want_renderer}")
+    for key, expected_hex in want_colors.items():
+        actual = found_colors.get(key, "")
+        if actual.upper() != expected_hex.upper():
+            problems.append(f"{key} 配色={actual or '(未找到)'} 期望 {expected_hex}")
+
+    if want_elements:
+        element_names: list[str] = []
+        element_types: list[str] = []
+        for layout in project.listLayouts():
+            for element in layout.listElements():
+                element_names.append(str(element.name))
+                element_types.append(str(element.type).upper())
+        joined = " ".join(element_names).lower()
+        surrounds = sum(1 for t in element_types if "MAPSURROUND" in t)
+        checks = {
+            "图名": any("TEXT" in t for t in element_types),
+            "图例": any("LEGEND" in t for t in element_types),
+            "比例尺": ("scale" in joined or "比例尺" in " ".join(element_names)) or surrounds >= 2,
+            "指北针": ("north" in joined or "指北针" in " ".join(element_names)) or surrounds >= 2,
+            "地图框": any("MAPFRAME" in t for t in element_types),
+        }
+        for name in want_elements:
+            if not checks.get(name, False):
+                problems.append(f"布局缺少「{name}」")
+
+    return problems, renderer_types, found_colors
+
+
+def _parse_color_expectations(text: str) -> dict[str, str]:
+    """解析 "值=#RRGGBB;值2=#RRGGBB" 形式的期望配色。"""
+    out: dict[str, str] = {}
+    for chunk in str(text or "").split(";"):
+        if "=" in chunk:
+            key, value = chunk.split("=", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+
+
+def _fake_gdb_param(recipe: Recipe, params: dict[str, Any], workspace: str | Path | None) -> str | None:
+    """找出“指向假 .gdb”的参数（os.makedirs 建出来的普通目录）。
+
+    只拦**已经存在但不是真 GDB** 的目录：真 GDB 有 `gdb`/`timestamps`/
+    `a00000001.gdbtable`。不存在的不拦（配方可能正要用 CreateFileGDB 建）。
+    """
+    for name, spec in (recipe.params or {}).items():
+        value = params.get(name, spec.default)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip().rstrip("\\/")
+        if not text.lower().endswith(".gdb"):
+            continue
+        path = Path(text)
+        if not path.is_absolute() and workspace is not None:
+            path = Path(workspace) / path
+        if path.is_dir() and not _is_real_gdb(path):
+            return name
+    return None
+
+
+def _resolve(text: str, params: dict[str, Any]) -> str:
+    """Resolve {param} slots inside assertion values."""
+    def _sub(match: re.Match[str]) -> str:
+        key = match.group(1)
+        value = params.get(key)
+        return "" if value is None else str(value)
+
+    return _RAW_SLOT.sub(_sub, _SLOT.sub(_sub, text))

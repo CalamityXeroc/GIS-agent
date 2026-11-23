@@ -1,0 +1,48 @@
+id: am_task1_quality
+name: AM 任务一 · 数据质量检查与入库
+source: B上午
+prompt: |
+  请完成第十三届 GIS 大赛 B 卷上午的"任务一：数据质量检查与入库"：
+  1. 在 workspace/output 下创建两个文件地理数据库：temp_data.gdb（过程数据）和 result_data.gdb（结果数据）。
+  2. county.shp 丢失了坐标系。先为其定义 WGS_1984 地理坐标系，再投影到适合华中地区的
+     CGCS2000 6 度带高斯-克吕格投影（带号 111E，EPSG:4508），结果入库到 result_data.gdb。
+  3. 将 city.shp、county.shp、population.csv、population_census.csv 导入 result_data.gdb，
+     统一为上述投影坐标系，名称保持不变。
+  4. 对入库后的 county 面要素做拓扑检查，找出重叠面并从每组重叠中删除冗余面要素，
+     修复后的结果命名为 county_1。
+  请用中文说明你的方法论与关键参数，并交付可核查的产物。
+inputs:
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/city.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/county.shp"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/population.CSV"
+  - source: "workspace/input/13第十三届全国大学生GIS应用技能大赛（兰州交通大学）/数据/B上午/B上午/数据/population_census.csv"
+requirements:
+  - id: r1
+    text: 创建 temp_data.gdb 与 result_data.gdb 两个文件地理数据库
+    acceptance: 两个 .gdb 目录存在于输出目录
+  - id: r2
+    text: county 定义 WGS84 后投影到 CGCS2000 6 度带 111E（EPSG:4508）
+    acceptance: 结果图层 WKID=4508
+  - id: r3
+    text: city/county/population/population_census 入库且坐标系统一
+    acceptance: result_data.gdb 中存在对应要素类/表，矢量 WKID=4508
+  - id: r4
+    text: 拓扑检查并删除重叠面，结果命名 county_1
+    acceptance: county_1 存在，要素数 >0 且不超过原始 county 要素数
+assertions:
+  - type: file_exists
+    path: "output/result_data.gdb"
+  - type: file_exists
+    path: "output/temp_data.gdb"
+  - type: vector_exists
+    path: "output/result_data.gdb/county_1"
+  - type: feature_count_gt
+    path: "output/result_data.gdb/county_1"
+    value: 0
+  - type: crs_wkid
+    path: "output/result_data.gdb/county_1"
+    value: 4508
+  - type: fields_present
+    path: "output/result_data.gdb/county_1"
+    value: ["code"]
+timeout_seconds: 2400

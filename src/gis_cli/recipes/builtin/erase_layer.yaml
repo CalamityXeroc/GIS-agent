@@ -1,0 +1,71 @@
+id: erase_layer
+name: 擦除（Erase）
+description: 从输入图层中挖掉与擦除层重叠的部分（输入减擦除层）。用于"排除已覆盖范围"。
+domain: overlay
+category: overlay
+triggers: [擦除, erase, 挖空, 减去, 排除范围, 扣除]
+preconditions:
+  - 两图层坐标系一致
+params:
+  input_path:
+    type: string
+    required: true
+    description: 输入图层（被挖的）
+  erase_path:
+    type: string
+    required: true
+    description: 擦除范围（面图层）
+  output_path:
+    type: string
+    required: true
+    description: 输出图层
+steps:
+  - 校验存在与坐标系
+  - Erase
+  - 返回要素数与面积变化
+code_template: |
+  import arcpy, os
+  arcpy.env.overwriteOutput = True
+
+  input_path = {{input_path}}
+  erase_path = {{erase_path}}
+  output_path = {{output_path}}
+
+  for p in (input_path, erase_path):
+      if not arcpy.Exists(p):
+          raise ValueError(f"输入不存在: {p}")
+  sr1 = arcpy.Describe(input_path).spatialReference.name
+  sr2 = arcpy.Describe(erase_path).spatialReference.name
+  if sr1 != sr2:
+      raise ValueError(f"坐标系不一致（{sr1} vs {sr2}），请先统一投影")
+
+  out_folder = os.path.dirname(output_path)
+  if str(out_folder).lower().endswith(".gdb"):
+      if not arcpy.Exists(out_folder):
+          arcpy.management.CreateFileGDB(os.path.dirname(out_folder), os.path.basename(out_folder)[:-4])
+  elif out_folder and not os.path.isdir(out_folder):
+      os.makedirs(out_folder, exist_ok=True)
+  if arcpy.Exists(output_path):
+      arcpy.management.Delete(output_path)
+
+  arcpy.analysis.Erase(input_path, erase_path, output_path)
+  count = int(arcpy.management.GetCount(output_path)[0])
+  in_count = int(arcpy.management.GetCount(input_path)[0])
+  if count == 0:
+      raise ValueError("擦除后为空：擦除范围覆盖了全部输入，请确认是否预期")
+  if count > in_count:
+      raise ValueError(f"擦除后要素数变多（{count} > {in_count}），几何可能存在裂缝，请检查数据质量")
+  set_result({"output": output_path, "feature_count": count, "input_count": in_count})
+  print(f"Erase done: {count} features (from {in_count})")
+validation:
+  - type: vector_exists
+    path: "{{output_path}}"
+  - type: feature_count_gt
+    path: "{{output_path}}"
+    value: 0
+pitfalls:
+  - 擦除结果要素数不应超过输入；变多说明输入几何有裂缝/重叠，需要先做拓扑修复。
+  - 擦除后为空不一定是错误（可能确实全覆盖），但必须在下游说明。
+examples:
+  - "从全部建设用地中扣除已批范围"
+  - "排除保护区后再选址"

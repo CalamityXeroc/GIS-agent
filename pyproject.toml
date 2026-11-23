@@ -1,0 +1,149 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gis-task-cli"
+version = "0.8.0"
+description = "General-purpose GIS task solving CLI for ArcGIS Pro workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "GIS CLI Team" }]
+dependencies = [
+  "typer>=0.12.3",
+  "rich>=13.0.0",
+  "openai>=1.0.0",
+  "json5>=0.9.25",
+  "prompt-toolkit>=3.0.43",
+  # 持久 Jupyter 内核（ArcPyKernel）：缺了就只能退回一次性子进程，
+  # 每步重导 arcpy（~15s）且丢掉跨步变量。基准/CLI 跑在 venv 里时
+  # 这一步曾经一直是“persistent kernel unavailable”（实测）。
+  "jupyter-client>=8.0.0",
+  # 图片读写与像素统计：验收器的图片非空白判定、版面体检、制图叠加层都要用。
+  # 缺 Pillow 时验收只打印“image check 因缺少 PIL 不可用”；
+  # 缺 numpy 时 image_not_blank **静默返回通过**（等于图面检查完全失效）。
+  "pillow>=10.0.0",
+  "numpy>=1.26",
+  # 配方与技能都是 YAML 定义的，``recipes/schema.py`` 在**模块顶层** import yaml。
+  # 踩过的坑：这个包以前一直**没声明**，靠 langchain/litellm 的传递依赖顺带
+  # 装上；而当前开发 venv 里其实根本没装 langchain —— 等于一直在赌。
+  # 删掉重包后会直接 ImportError，新引擎起不来。
+  "pyyaml>=6.0.1",
+  # httpx 是**直接** import 的，不能赌 openai 的传递依赖：
+  # web 配置页的「测试连接」(`config_api._probe_models`) 和
+  # `llm_client._is_link_failure` 都 `import httpx`。实测 openai 3.50 的
+  # 依赖里已经不含 httpx，干净环境装完 [dev] 后 8 个 /api/config/test 用例
+  # 全红（2026-11-13 纯净版 CI 实测）。
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+office = [
+  "python-docx>=1.1.2",
+  "pypdf>=5.1.0",
+]
+dev = [
+  "pytest>=8.3.2",
+  # Python 3.10 没有 tomllib（3.11+ 才进标准库），测试要读 pyproject 就得靠它
+  "tomli>=2.0; python_version < '3.11'",
+]
+#: Web 控制台后端（P2-S1）。**可选**：不装 [web] 时 ``gis-agent`` 其余命令
+#: 照常工作，只有 ``gis-agent web`` 会提示缺依赖。
+web = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  # app.py 直接 import starlette.exceptions 做 SPA 回落，显式声明，不靠 fastapi 传递
+  # pyproj（DAIR-299）：预览接口 CRS 归一到 4326 用；缺了也能跑（降级 + crs_warning）
+  "pyproj>=3.6",
+  "starlette>=0.40",
+]
+#: GDAL 后端（P0-1b 的 GDAL 配方要它）。**必须可选**：
+#:
+#: - 缺了只降级：[gdal] 配方报"需 GDAL 后端"，引擎与 47 个 arcpy 配方照常工作。
+#: - 代码里**不**在模块顶层 import 第三方 GIS 包（只在 GDAL 执行器/断言内部按需
+#:   import），所以没装这个 extra 也不会 ImportError。
+#:
+#: 为什么**不**写 `GDAL>=3.6`：那个包是 osgeo 源码包，没有 Windows wheel，要先有
+#: libgdal/OSGeo4W 才装得上（实测 `pip download --only-binary :all: GDAL` →
+#: "from versions: none"）—— 即 `pip install gis-task-cli[gdal]` 在 Windows 上
+#: **必然失败**。真正能装的是下面这组自带 GDAL 二进制的 wheel：pyogrio/rasterio
+#: 各自打包了一份 libgdal（实测 3.12.4 / 3.12.2，互不干扰），pyproj 带 PROJ。
+#: 代价是没有 `osgeo` 模块，GDAL 配方只能用 pyogrio/rasterio 的 API。
+#: 版本号见 docs/p0-1b-env.md（在 .venv-gdal 里实测装通的组合）。
+gdal = [
+  "geopandas>=1.0",
+  "shapely>=2.0",
+  "pyproj>=3.6",
+  "pyogrio>=0.9",
+  "rasterio>=1.4",
+  "matplotlib>=3.8",
+]
+#: 锦上添花的可选依赖：缺了能跑，只是能力降级（代码里都是 try/except）。
+#:
+#: 为什么要显式声明：这几个包以前**一个都没写**在 pyproject 里，全靠
+#: litellm/langchain 的传递依赖碰运气 —— 换台机器就可能缺，而缺了又不报错，
+#: 只是“检测不到 ArcGIS Pro / 中文字体变方框 / keepalive 失效”这类静默降级。
+#:
+#: - psutil     -> 检测 ArcGIS Pro 是否在跑（与我们的 GP 调用会互相干扰）
+#: - httpx      -> 关掉 keep-alive 的 httpx.Client（抗网关抖动）
+#: - matplotlib -> 内核里配中文字体（否则自绘图的中文变方框）
+#: - json5      -> 容忍模型输出的“近似 JSON”（尾逗号/单引号）；缺了只用严格 json
+extras = [
+  "psutil>=5.9.0",
+  "httpx>=0.27.0",
+  "matplotlib>=3.8.0",
+  "json5>=0.9.25",
+]
+#: 新引擎（`gis-agent chat` / `gis-agent loop`）真正需要的最小依赖集。
+#:
+#: 为什么单列：核心依赖里的 langchain*/chromadb/litellm 只被**旧引擎**
+#: （agent/ 下的 plan-then-execute）用到，新引擎一行都没引用（已 grep 核实）。
+#: 在 CI 里装全套重包纯属浪费（chromadb 会拉 onnxruntime 等，装一次几分钟）。
+#: 这不是要拆包，只是让“新引擎的最小依赖面”可被验证 —— 它不依赖 arcpy
+#: 就能启动/规划/验收，是新引擎相对旧引擎的硬性优势，值得用 CI 焊住。
+engine = [
+  "typer>=0.12.3",
+  "rich>=13.0.0",
+  "openai>=1.0.0",
+  "json5>=0.9.25",
+  "prompt-toolkit>=3.0.43",
+  "jupyter-client>=8.0.0",
+  "pillow>=10.0.0",
+  "numpy>=1.26",
+  "pyyaml>=6.0.1",
+]
+
+[project.scripts]
+# 只保留新引擎入口。旧引擎（plan-then-execute）已下线，其命令
+# （gis-cli / gis-cli-api / gis-cli-ui 等）不再提供。
+gis-agent = "gis_cli.agent.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+# 合规规则库是 YAML 数据文件：不声明就不会进 wheel，装好的用户会直接撞
+# “读不到规则库”。内置那份必须随包走（用户覆盖走 config/compliance_rules.yaml）。
+"gis_cli.compliance" = ["*.yaml"]
+# 控制台占位页/构建产物：不声明就不会进 wheel，装好的用户 ``gis-agent web``
+# 只能看到 404。S2 起这里会换成 Vite 构建产物（仍在 static/ 下）。
+"gis_cli.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+# CI 只跑不需要 ArcGIS 的部分（``pytest -m "not arcpy"``）。
+#
+# 为什么需要这个边界：带 arcpy 的测试每个都要起一个子进程（实测单个 ~12s），
+# 全量跑 15 分钟以上；而 CI 机器上没有 ArcGIS Pro。区分靠 marker 而不是
+# 目录，因为同一个文件里往往两类都有。
+markers = [
+  "arcpy: 需要本机安装 ArcGIS Pro / arcpy 才能跑",
+  "slow: 耗时较长（全量 arcpy 测试）",
+]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# 旧引擎（若开发版里存在 legacy/，仅供追溯）不参与打包：它依赖
+# pydantic/langchain/litellm，而这些包已从 dependencies 移除，
+# 装到用户环境里会导致 import 就崩。
+exclude = ["gis_cli.legacy", "gis_cli.legacy.*"]
