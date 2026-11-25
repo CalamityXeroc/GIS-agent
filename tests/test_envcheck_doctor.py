@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""环境自检（doctor）：7 种状态各一条，全部用 monkeypatch 伪造。
+"""环境自检（doctor）：各状态各一条，全部用 monkeypatch 伪造。
 
 **为什么全部伪造**：这些用例要在没有 ArcGIS Pro 的 CI 机器上跑
 （`pytest -m "not arcpy"`），而 doctor 的全部价值恰恰是"没装 Pro 时也能把结论
@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -336,6 +337,11 @@ def test_json_payload_shape_matches_the_spec(env):
         "arcpy_importable",
         "pro_version",
         "deps",
+        "pyproj",
+        "web_deps",
+        "src_on_path",
+        "workspace",
+        "token_file",
         "path_spaces",
         "path_nonascii",
         "kernel_start",
@@ -346,6 +352,83 @@ def test_json_payload_shape_matches_the_spec(env):
 
 
 # === 启动快检（step d）===
+
+
+def test_pyproj_and_web_deps_are_checked_in_the_running_interpreter(env):
+    """这两项查的是**当前进程**：真正起 giscli web 的就是它（不是 Pro 环境）。"""
+    checks = _checks(doctor.run_checks(workspace=WORKSPACE))
+
+    assert str(Path(sys.executable).parent) in checks["pyproj"].detail
+    assert str(Path(sys.executable).parent) in checks["web_deps"].detail
+    # 缺了只是面板/预览降级，绝不能影响退出码
+    assert checks["pyproj"].status != doctor.FAIL
+    assert checks["web_deps"].status != doctor.FAIL
+
+
+def test_missing_pyproj_warns_with_a_runnable_command(env, monkeypatch):
+    monkeypatch.setitem(sys.modules, "pyproj", None)  # import pyproj → ImportError
+
+    check = _checks(doctor.run_checks(workspace=WORKSPACE))["pyproj"]
+
+    assert check.status == doctor.WARN
+    assert f'"{sys.executable}" -m pip install pyproj' in check.hint
+    assert "EPSG:4326" in check.hint, "要说清缺了会怎样，而不只是「缺了」"
+
+
+def test_missing_web_deps_warns_and_says_the_cli_still_works(env, monkeypatch):
+    real = doctor.importlib.util.find_spec
+    monkeypatch.setattr(
+        doctor.importlib.util,
+        "find_spec",
+        lambda name, *a, **k: None if name == "uvicorn" else real(name, *a, **k),
+    )
+
+    check = _checks(doctor.run_checks(workspace=WORKSPACE))["web_deps"]
+
+    assert check.status == doctor.WARN
+    assert "uvicorn" in check.detail
+    assert "CLI 其余命令不受影响" in check.hint
+    assert "-m pip install uvicorn" in check.hint
+
+
+def test_src_not_on_sys_path_warns_with_the_pythonpath_fix(env, monkeypatch):
+    import gis_cli
+
+    src_dir = Path(gis_cli.__file__).resolve().parent.parent
+    kept = [
+        entry
+        for entry in sys.path
+        if entry and Path(entry).resolve() != src_dir
+    ]
+    monkeypatch.setattr(sys, "path", kept)
+
+    check = _checks(doctor.run_checks(workspace=WORKSPACE))["src_on_path"]
+
+    assert check.status == doctor.WARN
+    assert str(src_dir) in check.detail, "路径要写进 detail，否则用户不知道装的是哪个"
+    assert "PYTHONPATH" in check.hint
+
+
+def test_workspace_and_token_file_are_reported(env, tmp_path: Path):
+    (tmp_path / ".gis_agent").mkdir()
+    token = tmp_path / ".gis_agent" / "web_token"
+    token.write_text("t", encoding="utf-8")
+
+    checks = _checks(doctor.run_checks(workspace=tmp_path))
+
+    assert checks["workspace"].status == doctor.PASS
+    assert str(tmp_path) in checks["workspace"].detail
+    assert checks["token_file"].status == doctor.PASS
+    assert str(token) in checks["token_file"].detail
+
+
+def test_missing_workspace_points_at_giscli_init(env, tmp_path: Path):
+    checks = _checks(doctor.run_checks(workspace=tmp_path / "nope"))
+
+    assert checks["workspace"].status == doctor.WARN
+    assert "giscli init" in checks["workspace"].hint
+    # token 还没生成：只跳过，不算失败
+    assert checks["token_file"].status == doctor.SKIP
 
 def test_startup_checks_use_one_fast_probe_without_importing_arcpy(env):
     report = doctor.run_startup_checks(workspace=WORKSPACE)

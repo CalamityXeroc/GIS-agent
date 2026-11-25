@@ -28,7 +28,7 @@ import { scaleDenominator } from '@/lib/scale'
 import { useThemeStore } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 
-import { describePreviewError } from './format'
+import { describeEmptyView, describePreviewError } from './format'
 import {
   LAYER_PALETTE,
   isPreviewable,
@@ -37,6 +37,7 @@ import {
   type GisLayerStyle,
 } from './store'
 import type { LayerPreviewState } from './use-layer-previews'
+import { bboxKey, quantizeViewport } from './viewport'
 
 export type CatalogStatus = 'loading' | 'error' | 'ready'
 
@@ -103,11 +104,16 @@ function highlightColor(): string {
   )
 }
 
+const countFormat = new Intl.NumberFormat('zh-CN')
+
 /**
  * 预览质量角标（DAIR-368）：要素被截 / 顶点被简化 / 超时降级，必须看得见。
  *
  * 以前只写两个字「抽稀」：看不出是“只给了前 400 个要素”还是“顶点被压过”，
  * 也看不出超时降级。角标给短标签，`title` 给完整原因（含服务端预算）。
+ *
+ * 「只给了多少」不再由这里承担——DAIR-386 起由 :func:`viewportNote` 直接写出
+ * 「视口内 X / 全量 Y」，只写「部分」看不出少在哪儿。
  */
 function previewBadge(preview: LayerPreview): { label: string; hint: string } | null {
   const lines: string[] = []
@@ -118,8 +124,20 @@ function previewBadge(preview: LayerPreview): { label: string; hint: string } | 
     lines.push('图层过大，本次只返回坐标范围')
   }
   if (preview.truncated) {
-    const total = preview.feature_count ?? '?'
-    lines.push(`只载入前 ${preview.returned_features} 个要素（共 ${total}）`)
+    // 视口内计数不精确（.gdb 内核扫到上限就停，`view_count_exact=false`）时，
+    // `total_in_view` 只是下限：拿它当分母会写出「视口内 3000 / 3000，只给了一部分」，
+    // 跟图例的「视口内 ≥3000 / 全量 900,000（未给全）」自相矛盾（DAIR-390）。
+    // 这时分母只能用全量数；连全量数都没有就不写分母，不编数字。
+    const inexact = preview.view_bbox !== null && !preview.view_count_exact
+    const inView = `${inexact ? '≥' : ''}${countFormat.format(preview.returned_features)}`
+    const total = inexact
+      ? preview.feature_count
+      : (preview.total_in_view ?? preview.feature_count)
+    lines.push(
+      total === null
+        ? `视口内 ${inView}，只给了一部分`
+        : `视口内 ${inView} / ${countFormat.format(total)}，只给了一部分`
+    )
   }
   if (preview.simplified) {
     lines.push(
@@ -131,8 +149,38 @@ function previewBadge(preview: LayerPreview): { label: string; hint: string } | 
   if (typeof preview.budget_s === 'number') {
     lines.push(`服务端读取预算 ${preview.budget_s}s`)
   }
-  const label = preview.degraded ? '降级' : preview.truncated ? '部分' : '简化'
+  const label = preview.degraded
+    ? '降级'
+    : preview.oversized
+      ? '仅范围'
+      : preview.truncated
+        ? '部分'
+        : '简化'
   return { label, hint: lines.join('\n') }
+}
+
+/**
+ * 图例里的诚实口径（DAIR-386）：`视口内 26,673 / 全量 134,819`。
+ *
+ * 只写「部分」看不出到底缺多少；只写全量又看不到当前视野里给了多少。覆盖率达到
+ * 100% 也把「已给 N（100%）」写出来——用户能直接对照「视口内多少、图上多少」，
+ * 不用自己推。这是真数字，不是「大部分」这种含糊词。
+ */
+function viewportNote(preview: LayerPreview): string | null {
+  if (preview.total_in_view === null) return null
+  const inView = `${preview.view_count_exact ? '' : '≥'}${countFormat.format(preview.total_in_view)}`
+  const total =
+    preview.feature_count === null ? null : countFormat.format(preview.feature_count)
+  const head = total
+    ? `视口内 ${inView} / 全量 ${total}`
+    : `视口内 ${inView}`
+  const coverage = preview.coverage
+  // 视口内真的零要素（拖到数据外）：0 就是 0，不是「没给全」（DAIR-391 D2）。
+  if (preview.total_in_view === 0) return head
+  // 视口内只数到下限（.gdb 内核扫到上限就停了）：给不出百分比，但必须说「没给全」，
+  // 不能落到「看起来全给了」（DAIR-388）。
+  if (coverage === null) return `${head}（未给全）`
+  return `${head} · 已给 ${countFormat.format(preview.returned_features)}（${Math.round(coverage * 100)}%）`
 }
 
 /** 地图上点/框命中的要素 → `图层路径 → 要素 id`（只认已知标识列的图层）。 */
@@ -297,6 +345,31 @@ export function MapStage({
       })
     }
 
+    // 预览按视口取（DAIR-386）：`moveend` 后把量化过的视口写回 store，
+    // useLayerPreviews 用它的指纹当 queryKey。量化后小幅平移不换 key，
+    // 不会每拖一下就把每个图层重请求一轮。
+    let viewportTimer = 0
+    const pushViewport = () => {
+      const bounds = map.getBounds()
+      const zoom = Math.floor(map.getZoom())
+      const bbox = quantizeViewport(
+        {
+          west: bounds.getWest(),
+          south: bounds.getSouth(),
+          east: bounds.getEast(),
+          north: bounds.getNorth(),
+        },
+        zoom
+      )
+      const store = useGisStore.getState()
+      if (store.viewport.zoom === zoom && bboxKey(store.viewport.bbox) === bboxKey(bbox)) return
+      store.setViewport({ bbox, zoom })
+    }
+    const scheduleViewport = () => {
+      window.clearTimeout(viewportTimer)
+      viewportTimer = window.setTimeout(pushViewport, 300)
+    }
+
     map.on('load', () => {
       setReady(true)
       const store = useGisStore.getState()
@@ -306,7 +379,10 @@ export function MapStage({
         scale: scaleDenominator(map.getZoom(), map.getCenter().lat),
         baseZoom: map.getZoom(),
       })
+      pushViewport()
     })
+
+    map.on('moveend', scheduleViewport)
 
     map.on('mousemove', (event) => {
       if (frame) return
@@ -343,10 +419,12 @@ export function MapStage({
     return () => {
       observer.disconnect()
       if (frame) cancelAnimationFrame(frame)
+      window.clearTimeout(viewportTimer)
       map.remove()
       mapRef.current = null
       setReady(false)
       useGisStore.getState().setView({ ready: false })
+      useGisStore.getState().setViewport({ bbox: null, zoom: 0 })
     }
   }, [])
 
@@ -846,7 +924,7 @@ export function MapStage({
 
       {/* 图例：只在有可见图层时出现，颜色与图层栈色块一致。 */}
       {visibleLayers.length > 0 ? (
-        <div className="absolute right-2.5 bottom-8 z-10 w-[180px] overflow-hidden rounded-[var(--gis-radius)] border border-border bg-card/95 text-[11px] shadow-[var(--gis-shadow-float)]">
+        <div className="absolute right-2.5 bottom-8 z-10 w-[196px] overflow-hidden rounded-[var(--gis-radius)] border border-border bg-card/95 text-[11px] shadow-[var(--gis-shadow-float)]">
           <div className="flex h-[24px] items-center gap-1 border-b border-border px-2 text-[10.5px] font-semibold text-muted-foreground">
             <Layers className="size-3" />
             图例 · {visibleLayers.length} 层
@@ -866,6 +944,8 @@ export function MapStage({
             <ul className="flex flex-col gap-1 px-2 py-1.5">
               {visibleLayers.map((layer) => {
                 const state = previews[layer.path]
+                // 视口里零要素是信息态，不是「失败」：图例不挂红色角标（DAIR-391）。
+                const emptyView = state?.preview ? describeEmptyView(state.preview) : null
                 const categories =
                   layer.uid === selectedUid && layer.style.mode === 'unique'
                     ? Object.entries(layer.style.categoryColors)
@@ -891,8 +971,25 @@ export function MapStage({
                       </span>
                       {state?.loading ? (
                         <Loader2 className="size-3 animate-spin text-muted-foreground" />
+                      ) : state?.refreshing ? (
+                        // 已经有几何在图上，只是在换新视口的数据：数字不动，标一下
+                        // 「更新中」就好（DAIR-393：以前这里整行变占位，看起来像
+                        // 每次缩放都要重新加载一遍）。
+                        <span className="flex items-center gap-1 tabular-nums text-muted-foreground">
+                          <Loader2 className="size-2.5 animate-spin" />
+                          <span className="text-[9.5px]">
+                            {previewBadge(state.preview!)?.label ?? ''}
+                          </span>
+                        </span>
                       ) : state?.error ? (
                         <span className="text-[9.5px] text-destructive">失败</span>
+                      ) : emptyView ? (
+                        <span
+                          className="text-[9.5px] text-muted-foreground"
+                          title={emptyView.reason}
+                        >
+                          无要素
+                        </span>
                       ) : state?.preview && !isLngLatBbox(state.preview.bbox) ? (
                         <span className="text-[9.5px] text-warning">未归一</span>
                       ) : state?.preview ? (
@@ -906,6 +1003,15 @@ export function MapStage({
                         <span className="text-[9.5px] text-muted-foreground">待补</span>
                       )}
                     </div>
+                    {/* 诚实口径（DAIR-386）：视口内真实要素数 / 全量，覆盖率不足时补百分比。 */}
+                    {state?.preview && viewportNote(state.preview) ? (
+                      <div
+                        className="ml-[17px] text-[9.5px] leading-tight tabular-nums text-muted-foreground"
+                        title={previewBadge(state.preview)?.hint}
+                      >
+                        {viewportNote(state.preview)}
+                      </div>
+                    ) : null}
                     {/* 唯一值图例：逐类改色后跟着变，与右 dock 同一份 categoryColors。 */}
                     {categories.length > 0 ? (
                       <ul className="ml-[17px] flex flex-col gap-[2px]">

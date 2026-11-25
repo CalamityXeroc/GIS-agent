@@ -32,7 +32,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -49,7 +51,7 @@ except ImportError:  # pragma: no cover - 环境312/313都已装 pyproj
 
 from ..datacatalog import bands as bands_meta
 from ..datacatalog.store import Catalog, DatasetRecord
-from ..report import geom_simplify, html_pack
+from ..report import filegdb_view, geom_simplify, html_pack, shapefile_view
 from . import catalog_api
 from .security import safe_path
 
@@ -58,10 +60,21 @@ logger = logging.getLogger(__name__)
 #: 预览响应硬上限（计划 §6）：超过就继续抽稀，绝不把几十 MB 的几何塞给浏览器。
 MAX_PREVIEW_BYTES = 5 * 1024 * 1024
 
-#: 初始要素上限。与 ``html_pack.thin_features`` 的默认值保持一致。
-DEFAULT_MAX_FEATURES = html_pack.MAX_FEATURES
-#: 调用方最多能要多少要素（再大也还是会被 5MB 上限压回来）。
-MAX_MAX_FEATURES = 5000
+#: 视口预览的要素**兜底**上限（DAIR-386 / DAIR-391）：按几何类型给，只在「顶点已经
+#: 简化到压不动、5MB 还是装不下」时才按这个数截要素。以前它同时充当读盘上限，
+#: 于是 13 万条道路的 z11 视口（28,921 条）只画出 41%——而 5MB 用了 36%、顶点用了
+#: 46%，远没到闸门（DAIR-387 D1）。真正的闸门是 :data:`MAX_PREVIEW_BYTES` 与
+#: :data:`PREVIEW_POINT_BUDGET`，读盘按 :func:`_view_read_limit` 放得更宽。
+VIEW_FEATURE_LIMITS = {"point": 5000, "line": 12000, "polygon": 3000}
+#: 视口读盘上限 = 兜底上限 × 该倍数（再被「顶点预算 ÷ 每要素最少顶点」压住）。
+#: 5MB 装得下的线要素约 3.5 万条（实测 ≈150 B/条），再往上读也画不下。
+VIEW_READ_FACTOR = 3
+#: 每种几何一个要素**最少**几个顶点：线 2、闭合环 4（``MIN_RING_POINTS``）、点不占
+#: 顶点预算。顶点预算 ÷ 这个数就是「再怎么简化也塞得下的最多要素数」。
+MIN_POINTS_PER_FEATURE = {"point": 1, "line": 2, "polygon": 4}
+#: 调用方最多能要多少要素（不能比任何一档默认值还小，否则显式传参反而拿得更少：
+#: 以前写死 5,000，线图层传 ``max_features=5000`` 比不传的 12,000 还少，DAIR-387 D3）。
+MAX_MAX_FEATURES = max(VIEW_FEATURE_LIMITS.values())
 #: 预览的顶点预算（DAIR-368）。报告侧另有 ``html_pack.MAX_COORDS = 20k`` 的口径；
 #: 网页预览要经得住缩放，给得宽一些：5MB 硬上限才是真正兼底的那道闸。
 PREVIEW_POINT_BUDGET = 60_000
@@ -107,9 +120,29 @@ TARGET_CRS = "EPSG:4326"
 #: 6：catalog 没画像时 ``feature_count`` 回退直读全量（旧缓存的 .geojson 会
 #:    继续谎报 truncated=false）+ Esri rings 按方向判洞（旧缓存里小岛还被
 #:    并成越界洞）（DAIR-375）。
-PREVIEW_SCHEMA = 6
+#: 7：视口裁剪（``bbox``/``zoom``），返回体多了 ``total_in_view`` / ``coverage``；
+#:    ``truncated`` 改成「视口内都没给全」（DAIR-386）。
+#: 8：先按顶点预算简化、把视口要素给全，要素上限退为兜底；带 bbox 的空视口从
+#:    422 改成 200 + 空 features + ``total_in_view=0``（DAIR-391）。
+#: 9：``.gdb`` 视口改走 GDAL 读盘 + 包络索引（按 OID 读、计数精确，不再被扫描
+#:    窗口截断；旧缓存的 ``view_count_exact=false`` / ``coverage`` 是偏小的下限）（DAIR-393）。
+#: 10：计数不精确又没有全量数时 ``truncated`` 也要为 true（旧缓存里是 false，前端
+#:    「部分」角标不出）（DAIR-390）。
+PREVIEW_SCHEMA = 10
 
 _transformers: dict[int, "Transformer"] = {}
+
+#: 最近一次视口预览请求的墙钟时间（`time.time()`）。
+#:
+#: 数据目录扫描的后台线程会用同一个内核预热包络索引（`catalog_scan._warm_indexes`），
+#: 内核是串行执行的——用户刚开服务就点开图层时，预览会排在「建索引」后面白等
+#: 十几秒（DAIR-393 真机复现：首图 15.8 s）。预热看这个时间戳避让。
+_LAST_PREVIEW_AT = 0.0
+
+
+def last_preview_at() -> float:
+    """最近一次预览活动的墙钟时间（0 = 还没预览过）。"""
+    return _LAST_PREVIEW_AT
 
 
 def _transformer_for(wkid: int) -> "Transformer":
@@ -193,6 +226,44 @@ PATH_MISSING = "missing"
 
 #: 允许离线预览的 catalog kind（.gdb 内的要素类在 catalog 里记作 feature_class）。
 PREVIEWABLE_KINDS = {"vector", "feature_class"}
+
+#: 几何类型（catalog ``geom_type``）→ 要素上限档位。认不出就当线（保守）。
+_GEOM_TIERS = (
+    ("point", "point"),
+    ("linestring", "line"),
+    ("polyline", "line"),
+    ("polygon", "polygon"),
+)
+
+
+def _feature_tier(geom_type: str | None) -> str:
+    """几何类型 → 档位名（认不出就当线，保守）。"""
+    text = str(geom_type or "").strip().lower()
+    for needle, tier in _GEOM_TIERS:
+        if needle in text:
+            return tier
+    return "line"
+
+
+def _feature_limit(geom_type: str | None) -> int:
+    """几何类型 → 视口预览的要素兜底上限（点密、线面重，分开给）。"""
+    return VIEW_FEATURE_LIMITS[_feature_tier(geom_type)]
+
+
+def _view_read_limit(limit: int, geom_type: str | None) -> int:
+    """视口读盘上限（DAIR-391）：比**档位默认值**宽，但不会越过顶点预算。
+
+    视口预览要的是「先保拓扑简化、把视口里的要素给全」（DAIR-387 D1）。读盘仍要有
+    上界，否则 z10 全市 134,819 条线一次读完 + 简化要 14s（实测），而 5MB 最多只装
+    得下约 3.5 万条：读得再多也只是把顶点预算耗在画不出来的要素上。
+
+    ``limit`` 传的是几何类型的档位默认值（不是调用方的兜底值）：调用方显式给的
+    ``max_features`` 只影响「 simplification 到底后还装不下」时的兜底截断。
+    """
+    tier = _feature_tier(geom_type)
+    min_points = MIN_POINTS_PER_FEATURE[tier]
+    vertex_cap = max(1, PREVIEW_POINT_BUDGET // min_points)
+    return min(int(limit) * VIEW_READ_FACTOR, vertex_cap)
 
 TIMEOUT_SUGGESTION = "要素类太大或内核不可用；已降级只读部分要素仍未读完，可先用 .geojson 预览，或等内核恢复后重试"
 
@@ -374,6 +445,75 @@ def _crs_warning(wkid: int | None) -> str | None:
     return CRS_UNKNOWN_WARNING
 
 
+def _parse_bbox(raw: str | None) -> tuple[float, float, float, float] | None:
+    """``bbox=minx,miny,maxx,maxy``（EPSG:4326）→ 四元组。空串 = 不裁剪。"""
+    text = str(raw or "").replace(" ", "")
+    if not text:
+        return None
+    parts = text.split(",")
+    bad = {
+        "code": "bad_bbox",
+        "reason": "bbox 需要 4 个用逗号分隔的经纬度：minx,miny,maxx,maxy（EPSG:4326）",
+        "suggestion": "按地图当前 bounds 传 bbox；不带 bbox 则退回全量读取",
+    }
+    if len(parts) != 4:
+        raise HTTPException(status_code=422, detail=bad)
+    try:
+        values = [float(part) for part in parts]
+    except ValueError:
+        raise HTTPException(status_code=422, detail=bad) from None
+    if any(not math.isfinite(value) for value in values):
+        raise HTTPException(status_code=422, detail=bad)
+    minx, miny, maxx, maxy = values
+    if minx >= maxx or miny >= maxy:
+        raise HTTPException(status_code=422, detail=bad)
+    return (minx, miny, maxx, maxy)
+
+
+_inverse_transformers: dict[int, "Transformer"] = {}
+
+
+def _layer_bbox(
+    bbox: tuple[float, float, float, float], wkid: int | None
+) -> tuple[float, float, float, float] | None:
+    """4326 的视口 → 图层坐标系里的视口（四角 + 中心的外接矩形）。
+
+    认不出 wkid / 没 pyproj 时返回 ``None``：宁可不裁剪（回全量 + 老文案），
+    也不要拿单位不对的矩形去筛——那会筛出一张空图，比慢更糟。
+    """
+    if wkid is None:
+        return None
+    if wkid == 4326:
+        return bbox
+    if not _HAS_PYPROJ:
+        return None
+    try:
+        transformer = _inverse_transformers.get(wkid)
+        if transformer is None:
+            transformer = Transformer.from_crs(TARGET_CRS, f"EPSG:{wkid}", always_xy=True)
+            _inverse_transformers[wkid] = transformer
+        minx, miny, maxx, maxy = bbox
+        corners = [
+            (minx, miny),
+            (maxx, miny),
+            (maxx, maxy),
+            (minx, maxy),
+            ((minx + maxx) / 2, (miny + maxy) / 2),
+        ]
+        xs: list[float] = []
+        ys: list[float] = []
+        for x, y in corners:
+            tx, ty = transformer.transform(x, y)
+            if tx != tx or ty != ty:  # NaN：投影到无穷远，不能拿来筛
+                return None
+            xs.append(tx)
+            ys.append(ty)
+        return (min(xs), min(ys), max(xs), max(ys))
+    except Exception as exc:  # pragma: no cover - pyproj 不认这个 wkid
+        logger.warning("视口转 %s 失败（wkid=%s）：%s", TARGET_CRS, wkid, exc)
+        return None
+
+
 #: 单次预览最多带回的属性列（DAIR-330 唯一值/分级符号化）。
 MAX_PREVIEW_FIELDS = 3
 
@@ -396,13 +536,20 @@ def _preview_fields(record: Any, raw: str) -> list[str]:
     return picked[:MAX_PREVIEW_FIELDS]
 
 
-def _cache_key(path: Path, max_features: int, fields: Sequence[str] = ()) -> tuple[str, float, int]:
+def _cache_key(
+    path: Path,
+    max_features: int,
+    fields: Sequence[str] = (),
+    view: str = "",
+) -> tuple[str, float, int]:
     mtime, size = _stat_key(path)
     # ``pyproj`` 可用性进键（DAIR-303 D4）：同一工作区换 venv / 补装 pyproj 后，
     # 旧的「未重投影」payload 不能再命中，否则 crs=null + 米制 bbox 会继续下发。
     digest = hashlib.sha1(
         f"{path}|{mtime}|{size}|{max_features}|schema={PREVIEW_SCHEMA}"
-        f"|pyproj={int(_HAS_PYPROJ)}|fields={','.join(fields)}".encode("utf-8", errors="replace")
+        f"|pyproj={int(_HAS_PYPROJ)}|fields={','.join(fields)}|view={view}".encode(
+            "utf-8", errors="replace"
+        )
     ).hexdigest()
     return digest, mtime, size
 
@@ -447,6 +594,58 @@ def _empty_geojson() -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": []}
 
 
+def _even_sample(collection: dict[str, Any], limit: int) -> dict[str, Any]:
+    """等间隔取 ``limit`` 个要素：铺满视口，而不是只留左上角一片。"""
+    features = collection.get("features") or []
+    limit = max(1, int(limit))
+    if len(features) <= limit:
+        return collection
+    step = len(features) / float(limit)
+    picked = [
+        features[min(len(features) - 1, int(index * step))] for index in range(limit)
+    ]
+    return {**collection, "features": picked}
+
+
+def _preview_payload(
+    collection: dict[str, Any],
+    *,
+    base: dict[str, Any],
+    stats: dict[str, Any],
+    budget: int,
+    upstream: dict[str, Any] | None,
+    expected_total: int | None,
+) -> dict[str, Any]:
+    """简化后的集合 → 响应体（大小口径与 ``_fit_payload`` 的闸门一致）。"""
+    payload = dict(base)
+    payload["geojson"] = collection
+    payload["returned_features"] = len(collection.get("features") or [])
+    payload["point_count"] = html_pack.count_points(collection)
+    payload["point_budget"] = budget
+    # 内核先减过点时，「原始顶点」要取内核看到的那份，否则 payload 会说
+    # 「input == output，没简化」——100 万点被压到 1 千点的图层会被标成没动过。
+    own_input = int(stats.get("input_points") or 0)
+    own_output = int(stats.get("output_points") or 0)
+    upstream_input = int((upstream or {}).get("input_points") or 0)
+    payload["input_points"] = max(own_input, upstream_input)
+    # 主进程这一轮没动几何（内核已经减完）时，报内核用的容差；否则报本轮的。
+    effective_tolerance = (
+        (upstream or {}).get("tolerance")
+        if own_input == own_output
+        else stats.get("tolerance")
+    )
+    if effective_tolerance is None:
+        effective_tolerance = stats.get("tolerance") or 0.0
+    payload["tolerance"] = round(float(effective_tolerance), 9)
+    # 有没有真的丢顶点：前端据此标「简化」，不用自己拿容差猜。要素被兜底截断时
+    # ``point_count`` 会小于简化统计的输出，同样算「不是原样」。
+    payload["simplified"] = payload["input_points"] > payload["point_count"]
+    payload["truncated"] = bool(
+        expected_total and expected_total > payload["returned_features"]
+    )
+    return payload
+
+
 def _fit_payload(
     collection: dict[str, Any],
     *,
@@ -454,62 +653,84 @@ def _fit_payload(
     point_budget: int,
     max_features: int | None = None,
     upstream: dict[str, Any] | None = None,
+    expected_total: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
-    """把几何压到响应 ≤5MB：**先加容差**（少顶点、保留全部要素），再只说 bbox。
+    """把几何压到响应 ≤5MB：**先加容差**（少顶点、保留全部要素），最后才截要素。
 
-    原来这里是「减半重抽要素」：要素一少，地图上直接缺块。顶点才是真正占地
-    方的，所以先用 :func:`geom_simplify.simplify_feature_collection` 按预算缩小
-    顶点（仍是保拓扑的），实在压不进去才退回只给 bbox。
+    顶点才是真正占地方的：先用 :func:`geom_simplify.simplify_feature_collection`
+    按顶点预算缩小（仍是保拓扑的，共享边界不会裂），要素一个不少。只有顶点已经
+    压不动（每条线最少 2 点、每个闭环最少 4 点）、响应仍 >5MB 时，才按要素数兜底
+    截断（``max_features``）——14 万条要素的外壳本身就超过 5MB，那是唯一的路。
 
-    ``max_features`` 只在这里（简化之前）截要素：读盘时不能截，否则
-    ``feature_count`` 拿到的就是截断后的数字，``truncated`` 会谎报成 false
-    （DAIR-368 回归）。
+    ``expected_total`` 是「这次本该给多少」：视口裁剪时是视口内真实数（不是
+    图层总数），否则是图层总数。它决定 ``truncated``——截了要素就一定是 true，
+    不能拿 ``max_features`` 当分母把它弄假。
 
-    返回 ``(最终 payload, 简化后的 collection, 实际顶点预算)``。
+    返回 ``(最终 payload, 最终 collection, 实际顶点预算)``。
     """
-    if max_features:
-        limit = max(1, int(max_features))
-        features = collection.get("features") or []
-        if len(features) > limit:
-            collection = {**collection, "features": features[:limit]}
     budget = max(200, int(point_budget))
     last: dict[str, Any] = {}
+    last_output: int | None = None
+    simplified = collection
+    stats: dict[str, Any] = {}
+    # 几何本来就压得进顶点预算（内核已按同一预算简化过，或小视口本来就少）：
+    # 先按原样组一次响应，5MB 装得下就直接回，不再白跑一轮保拓扑简化。
+    # 64k 面层的街区视口这一次简化实测 ~0.25 s，占整个响应的一成（DAIR-393）。
+    if html_pack.count_points(collection) <= budget:
+        payload = _preview_payload(
+            collection,
+            base=base,
+            stats=stats,
+            budget=budget,
+            upstream=upstream,
+            expected_total=expected_total,
+        )
+        if _encoded_size(payload) <= MAX_PREVIEW_BYTES:
+            return payload, collection, budget
     for _ in range(8):
         simplified, stats = geom_simplify.simplify_feature_collection(
             collection, max_points=budget
         )
-        payload = dict(base)
-        payload["geojson"] = simplified
-        payload["returned_features"] = len(simplified.get("features") or [])
-        payload["point_count"] = html_pack.count_points(simplified)
-        payload["point_budget"] = budget
-        # 内核先减过点时，「原始顶点」要取内核看到的那份，否则 payload 会说
-        # 「input == output，没简化」——100 万点被压到 1 千点的图层会被标成没动过。
-        own_input = int(stats.get("input_points") or 0)
-        own_output = int(stats.get("output_points") or 0)
-        upstream_input = int((upstream or {}).get("input_points") or 0)
-        payload["input_points"] = max(own_input, upstream_input)
-        # 主进程这一轮没动几何（内核已经减完）时，报内核用的容差；否则报本轮的。
-        effective_tolerance = (
-            (upstream or {}).get("tolerance")
-            if own_input == own_output
-            else stats.get("tolerance")
-        )
-        if effective_tolerance is None:
-            effective_tolerance = stats.get("tolerance") or 0.0
-        payload["tolerance"] = round(float(effective_tolerance), 9)
-        # 有没有真的丢顶点：前端据此标「简化」，不用自己拿容差猜。
-        payload["simplified"] = payload["input_points"] > int(
-            stats.get("output_points") or 0
-        )
-        payload["truncated"] = bool(
-            payload.get("feature_count")
-            and payload["feature_count"] > payload["returned_features"]
+        payload = _preview_payload(
+            simplified,
+            base=base,
+            stats=stats,
+            budget=budget,
+            upstream=upstream,
+            expected_total=expected_total,
         )
         if _encoded_size(payload) <= MAX_PREVIEW_BYTES:
             return payload, simplified, budget
         last = payload
+        output = int(stats.get("output_points") or 0)
+        if last_output is not None and output >= last_output:
+            # 顶点已经压不动了（预算再降也不减少输出点）：剩下的字节全是要素外壳，
+            # 继续降预算只是白跑几轮（z10 实测每轮 4s）——直接进要素数兜底（DAIR-391）。
+            break
+        last_output = output
         budget = max(200, budget // 2)
+
+    # 兜底：按要素数截（等间隔，保留空间均匀），直到塞进 5MB。5MB 是硬闸门，
+    # 所以即使读盘上已经抽过样（``limit == len(features)``）也要继续减。
+    features = simplified.get("features") or []
+    limit = len(features)
+    if max_features:
+        limit = min(limit, max(1, int(max_features)))
+    for _ in range(8):
+        trimmed = _even_sample(simplified, limit)
+        payload = _preview_payload(
+            trimmed,
+            base=base,
+            stats=stats,
+            budget=budget,
+            upstream=upstream,
+            expected_total=expected_total,
+        )
+        if _encoded_size(payload) <= MAX_PREVIEW_BYTES:
+            return payload, trimmed, budget
+        if limit <= 1:
+            break
+        limit = max(1, limit // 2)
     # 极端情况：单个要素的坐标就超 5MB（比如一个上百万点的多边形）。宁可只回
     # bbox 也不回一个打不开的响应；前端有 bbox 仍能说明范围。
     payload = dict(base)
@@ -549,6 +770,10 @@ class PreviewTimeout(RuntimeError):
         super().__init__(f"几何读取超过 {timeout_s:g}s")
         self.elapsed_ms = elapsed_ms
         self.timeout_s = timeout_s
+
+
+class IndexUnavailable(RuntimeError):
+    """包络索引这次用不了（内核没 osgeo / 索引读不动）：调用方退回整层扫。"""
 
 
 def _read_timeout(features: int | None = None) -> float:
@@ -669,6 +894,81 @@ def _wait_kernel_ready(code_runner: Any) -> None:
             logger.debug("预览内核预热等待失败: %s", exc)
 
 
+def kernel_warm_suggested(workspace: str | Path) -> bool:
+    """起服务时该不该把预览内核提前热起来（`import arcpy` 实测 10~12 s，DAIR-393）。
+
+    判据是「这个工作区里有没有预览非走内核不可的数据」：`.gdb` 要素类、`.gpkg`
+    等矢量走内核；`.shp` 有 `.shx` 直读、`.geojson` 直读，都不需要。空工作区、
+    只有 `.shp` 的工作区、以及测试里的假工作区都不该白起一个内核进程。
+    """
+    state = Path(workspace) / ".gis_agent" / "catalog.db"
+    if not state.is_file():
+        return False
+    try:
+        catalog = Catalog(state)
+        try:
+            records = catalog.list_datasets(limit=500)
+        finally:
+            catalog.close()
+    except Exception:  # pragma: no cover - 库被锁/损坏：不预热，照常懒加载
+        return False
+    for record in records:
+        if (record.kind or "") not in PREVIEWABLE_KINDS:
+            continue
+        suffix = Path(str(record.path)).suffix.lower()
+        if suffix == ".shp" or suffix in DIRECT_SUFFIXES:
+            continue
+        return True
+    return False
+
+
+def _load_oids_via_kernel(
+    resolved: Path,
+    oids: Sequence[int],
+    *,
+    code_runner: Any,
+    limit: int,
+    read_timeout: float,
+    fields: Sequence[str] = (),
+    point_budget: int | None = None,
+    kernel_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """索引快路：内核按 OID 只读视口里的要素（不再整层扫）。
+
+    没有 osgeo（``read_by_oids`` 回 ``fallback``）或内核报错时抛
+    :class:`IndexUnavailable`，调用方退回整层扫——索引只是加速项，不能因为它
+    让预览整体失败。
+    """
+    started = time.perf_counter()
+
+    def elapsed() -> float:
+        return round((time.perf_counter() - started) * 1000, 2)
+
+    if code_runner is None:
+        raise IndexUnavailable("未检测到 arcpy（当前环境没有 ArcGIS Pro Python）")
+    code = html_pack.layer_oids_code(
+        str(resolved), oids, limit, fields, max_points=point_budget
+    )
+    outcome = code_runner.run(code, timeout=read_timeout)
+    if not getattr(outcome, "ok", False):
+        error = getattr(outcome, "error", None)
+        if _looks_like_timeout(error):
+            raise PreviewTimeout(elapsed(), read_timeout)
+        raise IndexUnavailable(str(error)[:200])
+    payload = getattr(outcome, "result", None)
+    if not isinstance(payload, dict):
+        raise IndexUnavailable("内核没有返回结果")
+    if payload.get("fallback"):
+        raise IndexUnavailable(str(payload.get("fallback"))[:200])
+    if payload.get("error"):
+        raise IndexUnavailable(str(payload.get("error"))[:200])
+    if isinstance(payload.get("simplify"), dict) and kernel_stats is not None:
+        kernel_stats.update(payload["simplify"])
+    if fields:
+        return html_pack.esri_rows_to_feature_collection(payload.get("rows") or [], fields)
+    return html_pack.esri_geometries_to_feature_collection(payload.get("geoms") or [])
+
+
 def _load_via_kernel(
     resolved: Path,
     *,
@@ -678,14 +978,28 @@ def _load_via_kernel(
     fields: Sequence[str] = (),
     point_budget: int | None = None,
     kernel_stats: dict[str, Any] | None = None,
+    bbox: Sequence[float] | None = None,
+    view: dict[str, Any] | None = None,
+    scan_cap: int | None = None,
+    index_path: Path | None = None,
+    index_key: str = "",
 ) -> dict[str, Any]:
     """.gdb 要素类 / .shp 走内核：一次 ``arcpy.da.SearchCursor`` 取 Esri JSON。
+
+    视口预览（``bbox`` 非空）在 .gdb 上先试 GDAL：每行解码比 ``arcpy.da.SearchCursor``
+    便宜 2.4 倍、计数精确，缺 ``osgeo`` 时由内核侧退回同一函数里的顺序扫描
+    （DAIR-393）。
 
     ``point_budget`` 给定时顶点在内核里就压完（``layer_probe_code(..., max_points=)``）：
     全精度几何只在 ArcGIS 进程内存在过，进程间通道只走简化后的小 JSON。
 
     ``kernel_stats`` 是给调用方回填诊断的口子：内核已经减过点时，主进程再算一遍
     「输入顶点」只会看到内核的输出，payload 里的 ``simplified`` 就会谎报成 false。
+
+    ``bbox``（图层坐标系）给定时内核只收视口内的要素，并把视口内真实要素数
+    回填到 ``view``（DAIR-386）。``scan_cap`` 是 arcpy 兜底路径的计数窗口，
+    默认按 ``limit`` 推（``view_scan_cap``）。``index_path`` 给定时这次整层扫会顺手
+    把包络索引写出去（下一次视口就不必再扫整层，DAIR-393）。
     """
     started = time.perf_counter()
 
@@ -700,7 +1014,14 @@ def _load_via_kernel(
             ),
         )
     code = html_pack.layer_probe_code(
-        str(resolved), limit=limit, fields=fields, max_points=point_budget
+        str(resolved),
+        limit=limit,
+        fields=fields,
+        max_points=point_budget,
+        bbox=bbox,
+        scan_cap=scan_cap,
+        index_path=str(index_path) if index_path is not None else None,
+        index_key=index_key,
     )
     outcome = code_runner.run(code, timeout=read_timeout)
     if not getattr(outcome, "ok", False):
@@ -718,6 +1039,11 @@ def _load_via_kernel(
         logger.debug("内核侧几何简化 %s: %s", resolved, payload.get("simplify"))
         if kernel_stats is not None:
             kernel_stats.update(payload["simplify"])
+    if view is not None and isinstance(payload, dict):
+        total = payload.get("view_total")
+        if isinstance(total, int):
+            view["total_in_view"] = total
+            view["count_exact"] = bool(payload.get("view_count_exact"))
     if isinstance(payload, dict) and payload.get("error"):
         # 旧 catalog 里没归类的非空间表（kind 还是 feature_class）：内核取几何时
         # 报的正是这句，映射成同一个 code，前端按「只能看属性表」处理。
@@ -738,14 +1064,43 @@ def _load_via_kernel(
     return html_pack.esri_geometries_to_feature_collection(geoms or [])
 
 
+def _read_shp_view(
+    resolved: Path,
+    bbox: Sequence[float],
+    *,
+    limit: int,
+    fields: Sequence[str],
+    view: dict[str, Any],
+) -> dict[str, Any]:
+    """shapefile 的视口直读（不经内核；实测 3,000 条 93ms，内核 3.6s）。
+
+    读不懂时抛 :class:`shapefile_view.ShapefileError`，调用方退回内核路径——
+    宁可慢，也不能把一张好好的图层报成「读不出」。
+    """
+    loaded = shapefile_view.load_view(resolved, bbox=bbox, limit=limit, fields=fields)
+    view["total_in_view"] = int(loaded["total_in_view"])
+    view["count_exact"] = True
+    geoms = loaded["geoms"]
+    attrs = loaded["attrs"]
+    if fields and attrs is not None and len(attrs) == len(geoms):
+        rows = [
+            [geom, [values.get(name) for name in fields]]
+            for geom, values in zip(geoms, attrs)
+        ]
+        return html_pack.esri_rows_to_feature_collection(rows, list(fields))
+    return html_pack.esri_geometries_to_feature_collection(geoms)
+
+
 def preview_layer(
     workspace: str | Path,
     path: str,
     *,
-    max_features: int = DEFAULT_MAX_FEATURES,
+    max_features: int | None = None,
     code_runner: Any = None,
     read_timeout: float | None = None,
     fields: Sequence[str] = (),
+    bbox: str | None = None,
+    zoom: int | None = None,
 ) -> dict[str, Any]:
     """读一个矢量图层 → GeoJSON → 保拓扑简化 → 落盘缓存（键 = path + mtime + 上限）。
 
@@ -753,12 +1108,19 @@ def preview_layer(
     真实字段白名单）。空 = 只回几何（与旧行为一致）。``.geojson`` 直读本来就有
     属性，此时 ``fields`` 不参与。
 
+    ``bbox`` / ``zoom``（DAIR-386）：地图视口（4326）。给了就只读视口内的要素，
+    并用 ``total_in_view`` + ``coverage`` 说清「视口里有多少、这次给了多少」；
+    不看视口地读大图层时，400 条上限会把 13 万条道路画成几条碎线。
+    ``max_features`` 不给时按几何类型取 :data:`VIEW_FEATURE_LIMITS`。
+
     读取预算按要素数自适应（:func:`_read_timeout`）；真超时先降级读一部分
     （``truncated`` + ``degraded`` 告知），降级也超时才 422。
     """
+    global _LAST_PREVIEW_AT
+    _LAST_PREVIEW_AT = time.time()
     ws = Path(workspace).resolve()
     resolved = _resolve_target(ws, path)
-    max_features = max(1, min(int(max_features), MAX_MAX_FEATURES))
+    view_bbox = _parse_bbox(bbox)
     started = time.perf_counter()
 
     target_kind = _path_kind(resolved)
@@ -788,7 +1150,31 @@ def preview_layer(
 
     # 字段白名单必须拿到 catalog 记录；拿不到就当没要属性（不猜列名）。
     wanted = _preview_fields(record, ",".join(fields))
-    digest, mtime, size = _cache_key(resolved, max_features, wanted)
+    geom_type = record.geom_type if record is not None else ""
+    #: 要素**兜底**上限：只有顶点简化到压不动、5MB 仍装不下时才按它截（DAIR-391）。
+    limit = (
+        _feature_limit(geom_type)
+        if max_features is None
+        else max(1, min(int(max_features), MAX_MAX_FEATURES))
+    )
+    # 视口预览把读盘放宽：先简化、把视口要素给全，而不是一进来就只读 N 条
+    # （DAIR-387 D1：z11 的 28,921 条只画出 12,000 = 41%）。读盘上限按**几何类型**
+    # 的档位算，不跟着调用方的兜底值缩（否则显式传小值又变成「拿得更少」，DAIR-387 D3）。
+    read_limit = (
+        _view_read_limit(_feature_limit(geom_type), geom_type)
+        if view_bbox is not None
+        else limit
+    )
+    # 视口 → 图层坐标系。认不出 wkid 就不筛（回全量 + 老文案），不拿错的矩形硬筛。
+    layer_bbox = _layer_bbox(view_bbox, record.wkid) if (view_bbox and record) else None
+    #: 视口诊断：读到多少、是否精确（内核扫到上限时只能给下限）。
+    view: dict[str, Any] = {"total_in_view": None, "count_exact": False}
+    view_key = ""
+    if view_bbox is not None:
+        view_key = ",".join(f"{value:.6f}" for value in view_bbox)
+        if zoom is not None:
+            view_key += f"@{int(zoom)}"
+    digest, mtime, size = _cache_key(resolved, limit, wanted, view_key)
     cache_file = _cache_path(ws, digest)
     cached = _read_cached(cache_file, {"mtime": mtime, "size": size})
     if cached is not None:
@@ -802,13 +1188,35 @@ def preview_layer(
     # 预算：要素数决定时长（catalog 知道真实要素数时按它，否则按本次上限）。
     known = record.feature_count if record is not None else None
     plan = _ReadPlan(
-        max_features,
+        read_limit,
         PREVIEW_POINT_BUDGET,
-        float(read_timeout) if read_timeout else _read_timeout(min(known or max_features, max_features)),
+        float(read_timeout)
+        if read_timeout
+        else _read_timeout(min(known or read_limit, read_limit)),
     )
 
+    # 视口预览把读盘上限放宽（``read_limit``）。``.gdb`` 的视口读走
+    # ``filegdb_view``：GDAL 每行解码比 arcpy 便宜 2.4 倍、计数精确；再有包络索引时
+    # 连整表扫都不用（只按命中的 OID 读）。``scan_cap`` 只剩「缺 osgeo 退回 arcpy
+    # 顺序扫描」这一条兜底路径才用（DAIR-393）。
+    kernel_scan_cap = html_pack.view_scan_cap(limit)
+
     direct = resolved.suffix.lower() in DIRECT_SUFFIXES
-    if not direct:
+    #: `.gdb` 视口的包络索引：有就按 OID 读，没有就在这次整层扫里顺手建出来。
+    index_file: Path | None = None
+    index_key_text = ""
+    index_loaded: tuple[Any, Any] | None = None
+    gdb_view = view_bbox is not None and layer_bbox is not None and not direct and (
+        resolved.suffix.lower() != ".shp"
+    )
+    if gdb_view:
+        index_file = filegdb_view.index_path(ws, resolved)
+        index_key_text = filegdb_view.index_key(resolved, known)
+        if index_key_text:
+            index_loaded = filegdb_view.load_index(index_file, index_key_text)
+    #: shapefile + 视口：``.shx`` 直接可筛，不进内核（DAIR-386；实测 93ms vs 3.6s）。
+    shp_view = layer_bbox if (layer_bbox is not None and resolved.suffix.lower() == ".shp") else None
+    if not direct and shp_view is None:
         # 内核冷启动是一次性成本，先等它（不计入几何读取预算）；
         # 内核根本不可用时由 _load_via_kernel 转成 503 + 原因。
         _wait_kernel_ready(code_runner)
@@ -817,16 +1225,65 @@ def preview_layer(
     kernel_stats: dict[str, Any] = {}
 
     def read_once(current: _ReadPlan) -> dict[str, Any]:
+        if index_loaded is not None:
+            # 索引快路：numpy 掩码挑 OID（13 万行 ~2 ms）+ GetFeature 只读命中项。
+            oids = filegdb_view.query_index(index_loaded, layer_bbox)
+            view["total_in_view"] = len(oids)
+            view["count_exact"] = True
+            # 命中多于读盘上限时等间隔挑（与 .shp 的 ``spread`` 同一口径）：
+            # 只给「前 N 个 OID」会变成左上角一片，重复行数据更会反复画同几个要素。
+            oids = shapefile_view.spread(oids, current.limit)
+            try:
+                return _call_with_timeout(
+                    lambda: _load_oids_via_kernel(
+                        resolved,
+                        oids,
+                        code_runner=code_runner,
+                        limit=current.limit,
+                        read_timeout=current.timeout,
+                        fields=wanted,
+                        point_budget=current.point_budget,
+                        kernel_stats=kernel_stats,
+                    ),
+                    current.timeout,
+                )
+            except IndexUnavailable as exc:
+                # 内核侧没有 osgeo / 索引读不动：退回整层扫，别把「读不出」报给用户。
+                logger.warning("索引快路不可用，退回整层扫 %s: %s", resolved, exc)
+                view["total_in_view"] = None
+                view["count_exact"] = False
         if direct:
             # .geojson 直读不吃 point_budget：文件已整份在内存里，顶点在主进程减。
             # 要素数也不在这里截：要留全量给 feature_count 算 truncated
             # （``_fit_payload`` 会在简化前截）。
-            return _call_with_timeout(
+            collection = _call_with_timeout(
                 lambda: html_pack.load_layer(
                     resolved, code_runner=None, limit=None, workspace=ws
                 ),
                 current.timeout,
             )
+            if layer_bbox is not None and collection:
+                collection = html_pack.filter_by_bbox(collection, layer_bbox)
+                view["total_in_view"] = len(collection.get("features") or [])
+                view["count_exact"] = True
+            return collection
+        if shp_view is not None:
+            try:
+                return _call_with_timeout(
+                    lambda: _read_shp_view(
+                        resolved,
+                        shp_view,
+                        limit=current.limit,
+                        fields=wanted,
+                        view=view,
+                    ),
+                    current.timeout,
+                )
+            except shapefile_view.ShapefileError as exc:
+                # 直读认不了（坏文件/不支持的几何）：退回内核，宁可慢也不能报「读不出」。
+                logger.warning("shapefile 直读失败，改走内核 %s: %s", resolved, exc)
+                view["total_in_view"] = None
+                view["count_exact"] = False
         return _call_with_timeout(
             lambda: _load_via_kernel(
                 resolved,
@@ -836,6 +1293,11 @@ def preview_layer(
                 fields=wanted,
                 point_budget=current.point_budget,
                 kernel_stats=kernel_stats,
+                bbox=layer_bbox,
+                view=view,
+                scan_cap=kernel_scan_cap,
+                index_path=index_file,
+                index_key=index_key_text,
             ),
             current.timeout,
         )
@@ -883,10 +1345,23 @@ def preview_layer(
         raise HTTPException(status_code=422, detail=f"读取失败：{exc}") from exc
 
     read_ms = round((time.perf_counter() - read_started) * 1000, 2)
-    if not collection or not collection.get("features"):
+    if collection is None:
+        # 直读文件解析不出来：这是读取失败，不能因为带了 bbox 就说成「视口里空」。
         raise HTTPException(
             status_code=422, detail="图层没有可预览的要素（空图层或几何读取失败）"
         )
+    if not collection.get("features"):
+        if view_bbox is None:
+            # 不带视口：图层本身真是空的 / 几何读不出来，这不是视口现象，仍是 422。
+            raise HTTPException(
+                status_code=422, detail="图层没有可预览的要素（空图层或几何读取失败）"
+            )
+        # 带视口：拖到数据外是常态（DAIR-387 D2）。回 200 + 空 features，让图例
+        # 走信息态；回 422 会让每个图层弹一条红横幅「预览失败」。
+        collection = _empty_geojson()
+        empty_view = True
+    else:
+        empty_view = False
 
     wkid = record.wkid if record is not None else None
 
@@ -905,10 +1380,15 @@ def preview_layer(
         crs_warning = crs_warning or CRS_WARNING
 
     # 重投影后 catalog 的 extent（原 CRS 的米制值）不再可用，从集合重算。
-    bbox = (None if reprojected else (record.extent if record is not None else None)) or (
-        html_pack.bbox_of(collection)
-    )
-    if bbox is None:
+    if empty_view:
+        # 没有几何可算范围：用**本次视口**（已是 4326）说明「看的是哪一片」，
+        # 不能拿 catalog 里可能未投影的 extent 充数（前端会误报「未归一」）。
+        extent: list[float] | None = [float(value) for value in view_bbox]
+    else:
+        extent = (
+            None if reprojected else (record.extent if record is not None else None)
+        ) or html_pack.bbox_of(collection)
+    if extent is None:
         raise HTTPException(status_code=422, detail="图层没有可用的坐标范围")
 
     feature_count = record.feature_count if record is not None else None
@@ -935,21 +1415,49 @@ def preview_layer(
         "crs_name": record.crs_name if record is not None else "",
         "crs": TARGET_CRS if crs_warning is None else None,
         "crs_warning": crs_warning,
-        "bbox": [float(v) for v in bbox],
+        "bbox": [float(v) for v in extent],
         "feature_count": feature_count,
         "field_count": len(record.fields) if record is not None else 0,
         # 服务端实际给了多少读取预算：前端不用自己猜 10s（DAIR-368）。
         "budget_s": plan.timeout,
+        # 本次**读盘**上限（视口预览比兜底上限宽，见 ``_view_read_limit``）。
         "max_features": plan.limit,
         "degraded": degraded,
+        # 视口裁剪（DAIR-386）：视口里到底有多少、这次给了多少，前端据此写图例。
+        "view_bbox": list(view_bbox) if view_bbox is not None else None,
+        "view_zoom": zoom,
+        "total_in_view": view["total_in_view"],
+        "view_count_exact": bool(view["count_exact"]),
+        "coverage": None,
     }
+    # 视口内真实要素数才是「这次本该给多少」；没有视口时就是图层总数。
+    # 但内核扫到 _scan_cap 行就停时 view_count_exact=false，那个数只是**下限**：
+    # 拿它当分母会给「返回数 ≥ 下限」判成 truncated=false / coverage=1.0——
+    # 正好是这次要消灭的「少画了却说全给了」。下限不参与这两个字段（DAIR-388）。
+    exact_total = view["total_in_view"] if view["count_exact"] else None
+    expected_total = exact_total if exact_total is not None else feature_count
+    if view_bbox is None:
+        # 不带视口走老口径：「全量前 N 条」。读盘那一步对 .shp/.gdb 已经按上限截过，
+        # .geojson 是整份读进内存的，这里先截再简化（否则一条报告要把全量几何
+        # 都简化一遗）；等间隔取，避免只留左上角一片。
+        collection = _even_sample(collection, limit)
     payload, _, effective = _fit_payload(
         collection,
         base=base,
         point_budget=plan.point_budget,
-        max_features=plan.limit,
+        # 要素上限只在「顶点压不动、5MB 仍装不下」时充当兜底，不是读盘上限。
+        max_features=limit,
         upstream=kernel_stats,
+        expected_total=expected_total,
     )
+    if exact_total:
+        payload["coverage"] = round(payload["returned_features"] / exact_total, 4)
+    elif view_bbox is not None and not view["count_exact"]:
+        # 计数不精确（内核扫到 ``_scan_cap`` 就停）**且** catalog 没有全量数可当分母：
+        # ``expected_total`` 是空的，``_preview_payload`` 会把 ``truncated`` 算成 false，
+        # 前端「部分」角标就不出，只剩图例的「（未给全）」（DAIR-390）。扫到哪算哪
+        # 这件事必须说出来——但不拿 ``total_in_view``（下限）充分母，也不编全量数。
+        payload["truncated"] = True
     payload["cache"] = {
         "hit": False,
         "key": digest[:12],
@@ -1093,16 +1601,40 @@ class PreviewRuntime:
         self._runner = code_runner
         self._loader = runner_loader or _default_runner_loader(workspace)
         self._loaded = code_runner is not None
+        #: 懒加载的锁：起服务扫描线程与 lifespan（预热）会**同时**走到这里。
+        #: 以前先置 ``_loaded=True`` 再加载，另一方会拿到 ``_runner is None``
+        #: （DAIR-393 真机：`prewarm -> False`，内核起不来，首图又白等 15 s）。
+        self._load_lock = threading.Lock()
 
     def get(self) -> Any:
-        if not self._loaded:
-            self._loaded = True
-            try:
-                self._runner = self._loader()
-            except Exception as exc:  # pragma: no cover - 无 ArcGIS 的机器
-                logger.warning("预览内核不可用: %s", exc)
-                self._runner = None
+        if self._loaded:
+            return self._runner
+        with self._load_lock:
+            if not self._loaded:
+                try:
+                    self._runner = self._loader()
+                except Exception as exc:  # pragma: no cover - 无 ArcGIS 的机器
+                    logger.warning("预览内核不可用: %s", exc)
+                    self._runner = None
+                self._loaded = True
         return self._runner
+
+    def prewarm(self) -> bool:
+        """后台起内核（幂等、不阻塞）：`import arcpy` 实测 10~12 s。
+
+        数据目录没有变化时扫描根本不会碰内核（增量扫描直接跳过），用户第一次
+        点开 `.gdb` 图层就要白等这一整段（DAIR-393 真机复现：首图 14.8 s，其中
+        15 s 里绝大部分是内核冷启动）。起服务就让它开始热，与页面加载重叠。
+        """
+        runner = self.get()
+        warm = getattr(runner, "prewarm", None)
+        if not callable(warm):
+            return False
+        try:
+            return bool(warm())
+        except Exception as exc:  # pragma: no cover - 没 ArcGIS 的机器
+            logger.debug("预览内核预热失败: %s", exc)
+            return False
 
     def close(self) -> None:
         runner = self._runner
@@ -1148,8 +1680,14 @@ def build_router(
     @router.get("/api/catalog/preview")
     def get_preview(
         path: str = Query(..., description="图层路径（必须在 workspace 内）"),
-        max_features: int = Query(
-            DEFAULT_MAX_FEATURES, ge=1, le=MAX_MAX_FEATURES, description="要素上限"
+        max_features: int | None = Query(
+            None,
+            ge=1,
+            le=MAX_MAX_FEATURES,
+            description=(
+                "要素兜底上限：先按顶点预算保拓扑简化、把视口要素给全，只有简化到底"
+                "仍 >5MB 才按此截断；不传则按几何类型（点 5000 / 线 12000 / 面 3000）"
+            ),
         ),
         fields: str = Query(
             "",
@@ -1158,6 +1696,14 @@ def build_router(
                 "供唯一值/分级符号化在地图上按字段着色"
             ),
         ),
+        bbox: str = Query(
+            "",
+            description=(
+                "地图视口 minx,miny,maxx,maxy（EPSG:4326）：只读视口内的要素，"
+                "并回 total_in_view / coverage；不传则退化为全量前 N 条"
+            ),
+        ),
+        zoom: int | None = Query(None, ge=0, le=24, description="地图缩放级别（诊断用）"),
     ) -> dict[str, Any]:
         return preview_layer(
             ws,
@@ -1165,6 +1711,8 @@ def build_router(
             max_features=max_features,
             code_runner=preview_runtime.get(),
             fields=[item for item in fields.split(",") if item.strip()],
+            bbox=bbox,
+            zoom=zoom,
         )
 
     @router.get("/api/reports")

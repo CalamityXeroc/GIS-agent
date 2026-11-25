@@ -79,6 +79,10 @@ IMPORT_TO_DIST = {
 #: 由运行环境提供、不该写进 pyproject 的包。
 ENV_PROVIDED = {
     "arcpy",  # ArcGIS Pro 自带，装在它自己的 Python 环境里
+    # ArcGIS Pro 自带的 GDAL Python 绑定（3.7 实测 osgeo 3.12）：`.gdb` 视口
+    # 读走它的空间索引（DAIR-393）。缺了自动退回 arcpy 顺序扇描，不报错。
+    # 写进 pyproject 没用：`pip install GDAL` 在 Windows 上没有 wheel（见 gdal extra）。
+    "osgeo",
 }
 
 #: **旧引擎专属**的可选集成：全部在 try/except 里，缺了自动降级。

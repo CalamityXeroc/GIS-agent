@@ -11,9 +11,12 @@
 
 两条设计约束（都踩过坑）：
 
-1. **所有检查统一走 ``discover_arcgis_pro_python()`` 返回的解释器**，绝不 fallback
-   到 ``sys.executable``。用错解释器查依赖，结论会正好相反：开发 venv 里 9 个包
-   装齐了，ArcGIS Pro 环境里没装 —— 而用户真正要跑的是 Pro 那个。
+1. **Pro 环境那几项（arcpy / 版本 / 核心依赖）统一走 ``discover_arcgis_pro_python()``
+   返回的解释器，绝不 fallback 到 ``sys.executable``**。用错解释器查依赖，结论会正好
+   相反：开发 venv 里 9 个包装齐了，ArcGIS Pro 环境里没装 —— 而用户真正要跑的是 Pro
+   那个。**这条约束只适用于 Pro 环境那几项**；``pyproj`` / web 依赖 / ``src`` 是不是在
+   ``sys.path`` 上这几项查的恰恰是**当前进程**——真正起 ``giscli web`` 的是它，不是
+   Pro 环境（两者是不同的问题，各自的 hint 里都写明了查的是谁）。
 2. **两个子进程探测（arcpy 导入 / 依赖导入）并行跑**。本机实测 ``import arcpy``
    10.7s（冷启动 18.6s）、9 个包真实导入 2.3s；串起来 13s，并行后只等最慢的那个。
 
@@ -29,7 +32,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -69,6 +75,13 @@ CORE_DEPENDENCIES: tuple[tuple[str, str], ...] = (
     ("PIL", "pillow"),
     ("numpy", "numpy"),
     ("yaml", "pyyaml"),
+)
+
+#: web 控制台要的包：(import 名, pip 名)。缺了只是面板起不来，CLI 其余命令照常。
+WEB_DEPENDENCIES: tuple[tuple[str, str], ...] = (
+    ("fastapi", "fastapi"),
+    ("uvicorn", "uvicorn"),
+    ("starlette", "starlette"),
 )
 
 #: arcpy 导入探测的超时。冷启动实测 18.6s，给足余量；这里不是性能指标。
@@ -317,7 +330,7 @@ def _check_pro_installed(
             ),
         )
 
-    detail = f"{info.install_dir}（来源 {info.source}）"
+    detail = f"{info.python_executable}（{info.install_dir}，来源 {info.source}）"
     others = [path for _source, path in _existing_candidates() if path != info.python_executable]
     if not others:
         return CheckResult("pro_installed", PASS, detail)
@@ -449,6 +462,118 @@ def _is_ascii(text: str) -> bool:
     return all(ord(char) < 128 for char in text)
 
 
+# === 当前进程侧的检查（pyproj / web 依赖 / src / 工作空间 / token） ===
+#
+# 这一组查的是**跑 doctor 的这个 python**，不是 Pro 环境：起 ``giscli web`` 的就是
+# 它，缺了这些包面板画不出来 / 起不来。全部最多 WARN——它们不影响 giscli 干活。
+
+
+def _runtime_prefix() -> Path:
+    """当前进程的解释器目录（提示里路径要写死，否则用户不知道装到哪）。"""
+    return Path(sys.executable).parent
+
+
+def _check_pyproj() -> CheckResult:
+    """预览把非 4326 图层归一到 4326 靠 pyproj；缺了那些图层在图上直接消失。"""
+    try:
+        import pyproj
+    except Exception as exc:
+        return CheckResult(
+            "pyproj",
+            WARN,
+            f"缺 pyproj（{_runtime_prefix()}）：{_short(exc)}",
+            hint=(
+                f'"{sys.executable}" -m pip install pyproj'
+                "（缺了非 EPSG:4326 的图层在预览里画不出来）"
+            ),
+        )
+    version = getattr(pyproj, "__version__", "版本未知")
+    return CheckResult("pyproj", PASS, f"{version}（{_runtime_prefix()}）")
+
+
+def _check_web_deps() -> CheckResult:
+    """fastapi / uvicorn / starlette 在不在当前解释器里（``giscli web`` 要用）。"""
+    missing: list[str] = []
+    for module, dist in WEB_DEPENDENCIES:
+        try:
+            present = importlib.util.find_spec(module) is not None
+        except Exception:  # 半安装的包 find_spec 会抛，当缺失处理
+            present = False
+        if not present:
+            missing.append(dist)
+    if not missing:
+        return CheckResult(
+            "web_deps", PASS, f"fastapi / uvicorn / starlette 都在（{_runtime_prefix()}）"
+        )
+    return CheckResult(
+        "web_deps",
+        WARN,
+        f"缺 {'、'.join(missing)}（{_runtime_prefix()}）",
+        hint=(
+            f'"{sys.executable}" -m pip install '
+            + " ".join(missing)
+            + "（缺了 giscli web 起不来；CLI 其余命令不受影响）"
+        ),
+    )
+
+
+def _check_src_on_path() -> CheckResult:
+    """``gis_cli`` 是从哪里 import 进来的——shim 模式靠 ``PYTHONPATH=<repo>\\src``。"""
+    try:
+        import gis_cli
+
+        where = Path(gis_cli.__file__).resolve()
+    except Exception as exc:  # pragma: no cover - 装坏了才会走到
+        return CheckResult(
+            "src_on_path",
+            WARN,
+            f"gis_cli 导入失败：{_short(exc)}",
+            hint=r"set PYTHONPATH=<repo>\src 后重试（shim 就是这么起的）",
+        )
+    src_dir = where.parent.parent
+    wanted = os.path.normcase(str(src_dir))
+    on_path = any(
+        os.path.normcase(str(Path(entry).resolve())) == wanted
+        for entry in sys.path
+        if entry
+    )
+    detail = f"gis_cli 来自 {where}" + (
+        "；src 在 sys.path 上" if on_path else "；**src 不在 sys.path 上**"
+    )
+    return CheckResult(
+        "src_on_path",
+        PASS if on_path else WARN,
+        detail,
+        None
+        if on_path
+        else r"set PYTHONPATH=<repo>\src（或把本包装进当前 python：pip install -e .）",
+    )
+
+
+def _check_workspace(workspace: Path) -> CheckResult:
+    if workspace.is_dir():
+        return CheckResult("workspace", PASS, f"工作空间：{workspace}")
+    return CheckResult(
+        "workspace",
+        WARN,
+        f"工作空间不存在：{workspace}",
+        hint=f'giscli init "{workspace}"（会建 workspace\\input、workspace\\output、workspace\\temp）',
+    )
+
+
+def _check_token_file(workspace: Path) -> CheckResult:
+    """面板的访问 token 落在 ``<workspace>/.gis_agent/web_token``，从不上传。"""
+    path = workspace / ".gis_agent" / "web_token"
+    if path.is_file():
+        return CheckResult("token_file", PASS, f"Web token 文件：{path}")
+    return CheckResult(
+        "token_file",
+        SKIP,
+        f"Web token 还没生成：{path}",
+        hint="首次 giscli web / giscli chat 时自动创建（只在本机，别提交进仓库）",
+    )
+
+
 def _interpreter_prefix(info: ArcGISPythonInfo) -> Path:
     """Pro 环境的 ``sys.prefix``：就是 ``python.exe`` 所在目录，省掉一次子进程。"""
     return Path(info.python_executable).parent
@@ -578,7 +703,7 @@ def run_checks(
     deep: bool = False,
     workspace: str | Path | None = None,
 ) -> DoctorReport:
-    """跑完整 7 项体检。
+    """跑完整体检（Pro 环境 4 项 + 当前进程 5 项 + 工作目录 3 项）。
 
     Args:
         deep: 额外跑持久内核启动（``--deep``），默认跳过。
@@ -598,6 +723,11 @@ def run_checks(
         _check_arcpy_importable(info, arcpy_probe),
         _check_pro_version(arcpy_probe),
         _check_deps(info, deps_probe),
+        _check_pyproj(),
+        _check_web_deps(),
+        _check_src_on_path(),
+        _check_workspace(ws),
+        _check_token_file(ws),
         _check_path_spaces(ws, info),
         _check_path_nonascii(ws, info),
         _check_kernel_start(ws, info)

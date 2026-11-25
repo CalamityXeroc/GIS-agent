@@ -19,9 +19,15 @@ PATH 条目（里面是 ``scripts\\giscli.cmd``），不碰 pip、不生成 exe�
 
 ## 用法
 
-    python scripts\\install_shim.py            # 加入 PATH（幂等）
+    python scripts\\install_shim.py            # 加入 PATH（幂等，缺省是脚本所在的 scripts\\）
     python scripts\\install_shim.py --dry-run  # 只看会怎么改
-    python scripts\\install_shim.py --remove   # 还原
+    python scripts\\install_shim.py --remove   # 还原缺省那一条
+
+``--scripts-dir`` 缺省是脚本自己所在的 ``scripts\\``；要动 ``install.py`` 装的目录必须
+显式给目录，否则删的不是那一条（下面这条是 cmd 写法；PowerShell 用
+``"$env:LOCALAPPDATA\\Programs\\giscli"``，Git Bash 抄 ``install.py`` 打印的字面路径）：
+
+    python scripts/install_shim.py --remove --scripts-dir "%LOCALAPPDATA%\\Programs\\giscli"
 
 退出码：0 成功（含「本来就在」）；1 失败。
 """
@@ -210,7 +216,10 @@ def install(scripts_dir: Path | str, *, dry_run: bool = False) -> Outcome:
     _broadcast_change()
     _emit("已写入 HKCU\\Environment\\Path。")
     _emit("新开一个终端窗口后生效（当前这个窗口的 PATH 不会变）。")
-    _emit("撤销：python scripts\\install_shim.py --remove")
+    _emit(
+        "撤销：python scripts/install_shim.py --remove "
+        f'--scripts-dir "{entry}"'
+    )
     return Outcome(
         ok=True, changed=True, entry=entry, previous=previous, current=new_value,
         detail="added",

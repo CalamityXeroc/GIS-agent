@@ -726,6 +726,7 @@ export interface LayerPreview {
   field_count: number
   returned_features: number
   point_count: number
+  /** 本次服务端生效的读取上限（视口预览比兜底上限宽，见 D1）。 */
   max_features: number
   truncated: boolean
   oversized?: boolean
@@ -750,16 +751,37 @@ export interface LayerPreview {
   } | null
   cache: PreviewCacheMeta
   geojson: { type: 'FeatureCollection'; features: GeoJSONFeature[] }
+  /** 本次请求带的视口（4326）。null = 没按视口读（全量前 N 条）。 */
+  view_bbox: [number, number, number, number] | null
+  view_zoom: number | null
+  /** 视口内真实要素数；null = 没按视口读，或服务端说不清（catalog 无此层）。 */
+  total_in_view: number | null
+  /** 视口内要素是否精确（内核扫到上限时只能给下限）。 */
+  view_count_exact: boolean
+  /** `returned_features / total_in_view`；视口里没东西时为 null。 */
+  coverage: number | null
+}
+
+/** 预览请求的选项（DAIR-386）：不给视口就退化回「全量前 N 条」。 */
+export interface LayerPreviewQuery {
+  /** 服务端按几何类型自适应（点 5000 / 线 12000 / 面 3000）；不传就用服务端的。 */
+  maxFeatures?: number
+  fields?: string[]
+  /** 地图视口（EPSG:4326）：四边形 minx,miny,maxx,maxy。 */
+  bbox?: [number, number, number, number] | null
+  zoom?: number
 }
 
 export function getLayerPreview(
   path: string,
-  maxFeatures = 400,
-  fields: string[] = []
+  { maxFeatures, fields = [], bbox = null, zoom }: LayerPreviewQuery = {}
 ): Promise<LayerPreview> {
-  const params = new URLSearchParams({ path, max_features: String(maxFeatures) })
+  const params = new URLSearchParams({ path })
+  if (maxFeatures) params.set('max_features', String(maxFeatures))
   // 唯一值/分级符号化要在地图上按字段着色，属性列必须随几何一起带回来。
   if (fields.length > 0) params.set('fields', fields.join(','))
+  if (bbox) params.set('bbox', bbox.map((value) => value.toFixed(6)).join(','))
+  if (typeof zoom === 'number') params.set('zoom', String(Math.floor(zoom)))
   return request<LayerPreview>(`/api/catalog/preview?${params.toString()}`)
 }
 

@@ -540,7 +540,7 @@ def test_gdb_feature_class_timeout_is_422_with_suggestion(
     started = time.perf_counter()
     response = client.get(
         "/api/catalog/preview",
-        params={"path": str(layer)},
+        params={"path": str(layer), "max_features": 400},
         headers={"X-Web-Token": token},
     )
     elapsed = time.perf_counter() - started
@@ -570,7 +570,9 @@ def test_timeout_degrades_to_partial_features_instead_of_422(
 
     started = time.perf_counter()
     response = client.get(
-        "/api/catalog/preview", params={"path": str(layer)}, headers={"X-Web-Token": token}
+        "/api/catalog/preview",
+        params={"path": str(layer), "max_features": 400},
+        headers={"X-Web-Token": token},
     )
     elapsed = time.perf_counter() - started
 

@@ -116,6 +116,10 @@ engine = [
 [project.scripts]
 # 只保留新引擎入口。旧引擎（plan-then-execute）已下线，其命令
 # （gis-cli / gis-cli-api / gis-cli-ui 等）不再提供。
+# giscli 是主入口：它先解析「该用哪个解释器」（ArcGIS Pro 自带的那份 python），
+# 再转给真正的 CLI——Pro env 的 pip 与 pip 生成的 gis-agent.exe 都是坏的，
+# 见 src/gis_cli/boot.py 的说明。gis-agent 保留为兼容别名。
+giscli = "gis_cli.boot:main"
 gis-agent = "gis_cli.agent.cli:main"
 
 [tool.setuptools]

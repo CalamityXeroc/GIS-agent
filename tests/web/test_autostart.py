@@ -440,6 +440,34 @@ def test_web_cmd_bind_failure_keeps_running_panel_state(
     assert (state / autostart.PORT_FILE).read_text(encoding="utf-8").strip() == "8760"
 
 
+def test_web_cmd_sets_up_engine_logging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``gis web`` 起的会话也要接管引擎日志（DAIR-397 第 1 条）。
+
+    目录扫描与视口索引预热只写日志、不写界面：以前只有 ``run`` / ``chat`` 调
+    ``setup_engine_logging``，``gis web`` 的会话里 engine.log 压根不存在，
+    ``视口索引已建`` 进不了任何文件。
+    """
+    from gis_cli.ui import logging_setup
+
+    calls: list[tuple[Path, bool]] = []
+
+    def fake_run(app: Any, **kwargs: Any) -> None:
+        calls.append((tmp_path, False))
+
+    def spy(workspace: Any, **kwargs: Any) -> Path:
+        calls.append((Path(workspace), True))
+        return Path(workspace) / ".gis_agent" / "logs" / "engine.log"
+
+    monkeypatch.setattr(logging_setup, "setup_engine_logging", spy)
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    _web_cmd(tmp_path, port=8762)
+
+    assert [called for _, called in calls] == [True, False], (
+        "要先接管日志再 uvicorn.run（扫描预热在 lifespan 里就开始跑）"
+    )
+    assert calls[0][0] == tmp_path.resolve()
+
+
 def test_web_cmd_writes_panel_state_and_clears_on_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

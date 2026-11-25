@@ -145,21 +145,40 @@ web/
 - ❌ **返回英文工具列表** → 说明意图识别有误，已在最新版修复
 - 💡 **如遇问题**：见 [docs/cli.md](docs/cli.md) 与 `giscli doctor` 的自检输出
 
-### 方式一：使用 AI Agent（推荐）
-
-#### 快速测试
-
-在开始之前，建议先体检环境：
+### 方式一：装一次，之后在任何目录都能用 `giscli`（推荐）
 
 ```powershell
-# 体检：Pro 是否装好、arcpy 能否 import、依赖是否齐（约 10 秒）
+# 一次性安装：写 shim、只追加用户级 PATH（不需要管理员权限）
+python install.py
+
+# 新开一个终端窗口（PATH 才会生效）
+giscli --help
+giscli doctor
+giscli chat --workspace .\workspace
+```
+
+- `install.py` 会顺手做一次环境自检并打印结果；重复跑只更新 shim 内容，不会重复追加 PATH。
+- cmd / PowerShell / **Git Bash** 里都能敲 `giscli`：`scripts\giscli.cmd`、`scripts\giscli.ps1`、`scripts\giscli` 三份 shim 都由同一个模板生成，统一转给 `gis_cli.boot`（找 Pro 的 python + `PYTHONPATH=src`）。
+- 撤销 PATH：`python scripts/install_shim.py --remove --scripts-dir "<目录>"`，目录抄 `install.py`
+  结尾打印的那行字面路径（cmd / PowerShell / Git Bash 通用）。cmd 里也可写
+  `"%LOCALAPPDATA%\Programs\giscli"`，PowerShell 写 `"$env:LOCALAPPDATA\Programs\giscli"`——
+  `%LOCALAPPDATA%` 只有 cmd 会展开。
+  （`--scripts-dir` 不能省：缺省值是 `scripts\` 自己，删的就不是这次装进去的那一条）。
+
+> `一键启动.bat` **兼容保留**：内容已改成转发 `giscli web`（老快捷方式不会失效），
+> 新脚本请直接用 `giscli`。
+
+#### 环境自检
+
+```powershell
+# Pro python / arcpy / 核心依赖 / pyproj / web 依赖 / src / 工作空间 / token 逐项给状态与命令
 giscli doctor
 
 # 加 --deep 会多跑一次持久内核启动检查（约 20 秒）
 giscli doctor --deep
 ```
 
-7 项检查逐项给「通过 / 跳过」，全过时最后一行是 `环境正常`。跑测试套件见下文「测试覆盖」。
+全过时最后一行是 `环境正常`；「注意」不影响退出码，只有「失败」才是 1。跑测试套件见下文「测试覆盖」。
 
 #### 启动 Agent
 
@@ -167,14 +186,13 @@ giscli doctor --deep
 
 ```powershell
 # 启动 Agent 交互式会话（新引擎：过程可见、运行中可纠偏、Esc 中断）
-# giscli 是仓库自带入口：自己找 Pro 的 Python，不需要 pip 安装
 giscli chat --workspace .\workspace
 
 # 接续上一次会话
 giscli chat --continue
 
-# 或使用一键启动（Windows：装依赖 + 进入对话）
-.\一键启动.bat
+# 没装过 shim 也能在仓库里直接敲（同一份逻辑）
+.\scripts\giscli.cmd chat --workspace .\workspace
 
 # 示例对话：
 # > 你好，你可以做什么？

@@ -1,4 +1,4 @@
-import { ApiError, type DatasetItem } from '@/lib/api'
+import { ApiError, type DatasetItem, type LayerPreview } from '@/lib/api'
 
 /** 目录/图层/元数据共用的格式化与 CRS 语义（从 DAIR-325 前的 data.tsx 收拢过来）。 */
 
@@ -105,6 +105,23 @@ export interface PreviewIssue {
   elapsedMs?: number
   /** 信息态（不是错误）：例如非空间表只能看属性表。 */
   info?: boolean
+}
+
+/**
+ * 视口里零要素（DAIR-391）：带 bbox 的预览回 200 + 空 features，不是失败。
+ *
+ * 「拖到数据外」是正常操作：回 422 会让每个图层弹一条红横幅「预览失败」。这里和
+ * `describePreviewError` 的 `no_geometry` 一样走信息态，图例只提示、不报警。
+ */
+export function describeEmptyView(
+  preview: Pick<LayerPreview, 'total_in_view'>
+): PreviewIssue | null {
+  if (preview.total_in_view !== 0) return null
+  return {
+    title: '视口内无要素',
+    reason: '当前地图视野不在该图层的数据范围内，移回图层范围即可显示',
+    info: true,
+  }
 }
 
 /** 把服务端的结构化 detail（preview_timeout / kernel_unavailable / no_geometry …）解成给人看的一句话。 */

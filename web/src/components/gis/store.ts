@@ -2,6 +2,8 @@ import { create } from 'zustand'
 
 import type { DatasetItem } from '@/lib/api'
 
+import type { Bbox } from './viewport'
+
 /**
  * GIS 工作台前端状态（DAIR-325）。
  *
@@ -115,6 +117,17 @@ export interface MapViewState {
   baseZoom: number | null
 }
 
+/**
+ * 预览查询用的视口（DAIR-386）：地图 `moveend` 后按 zoom 量化再写回来。
+ *
+ * 默认 `bbox: null` = 地图还没就绪：此时不发预览请求（后端退回全量前 N 条，
+ * 大图层只会画出几根碎线，不如等地图）。
+ */
+export interface MapViewport {
+  bbox: Bbox | null
+  zoom: number
+}
+
 export type MapCommandKind = 'zoom-in' | 'zoom-out' | 'fit-all' | 'fit-layer'
 
 export interface MapCommand {
@@ -148,6 +161,7 @@ interface GisState {
   docks: DockSizes & { leftOpen: boolean; rightOpen: boolean; tableOpen: boolean }
   touched: Record<DockKey, boolean>
   view: MapViewState
+  viewport: MapViewport
   command: MapCommand | null
   rightTab: RightTab
 
@@ -177,6 +191,7 @@ interface GisState {
   syncDockDefaults: () => void
 
   setView: (patch: Partial<MapViewState>) => void
+  setViewport: (viewport: MapViewport) => void
   sendCommand: (kind: MapCommandKind, uid?: number) => void
 }
 
@@ -267,6 +282,7 @@ export const useGisStore = create<GisState>((set, get) => {
     docks: { ...defaults, leftOpen: true, rightOpen: true, tableOpen: true },
     touched: { left: false, right: false, table: false, ratio: false },
     view: { zoom: 0, scale: null, cursor: null, ready: false, baseZoom: null },
+    viewport: { bbox: null, zoom: 0 },
     command: null,
     rightTab: 'general',
 
@@ -508,6 +524,8 @@ export const useGisStore = create<GisState>((set, get) => {
     },
 
     setView: (patch) => set({ view: { ...get().view, ...patch } }),
+
+    setViewport: (viewport) => set({ viewport }),
 
     sendCommand: (kind, uid) =>
       set({

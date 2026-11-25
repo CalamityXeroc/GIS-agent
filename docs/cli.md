@@ -17,20 +17,24 @@ giscli loop "把 county.shp 定义坐标系并投影到 CGCS2000 111E"
 # 启动时就把数据目录扫全（默认不扫，见下）
 giscli chat --refresh-catalog
 
-# 一键启动（Windows，自动装依赖并进入对话）
-一键启动.bat
+# 一键启动已弃用：bat 现在只是转发到 giscli web
+# .\一键启动.bat
 ```
 
 ### `giscli`：PATH 上的入口、新窗口、`init`
 
-`scripts\giscli.cmd` 是同一套 CLI 的**全局入口**：自己找 Pro 自带的 Python
-（`ARCGIS_PRO_PYTHON` → 逐盘 glob，与 `一键启动.bat` 共用
-`scripts\find_pro_python.cmd`），再把仓库 `src` 放进 `PYTHONPATH` 后跑
-`python -m gis_cli.agent.cli`。不依赖 pip 生成的 exe，也不依赖 Pro env 的 pip
-（那两样在本机都是坏的，见 `INSTALL.md`）。
+`giscli` 是主入口。装上之后（`python install.py`），`%LOCALAPPDATA%\Programs\giscli\`
+下的三份 shim（`giscli.cmd` / `giscli.ps1` / 无扩展名的 `giscli`）都只做一件事：
+把参数交给 `python -m gis_cli.boot`。选解释器只在 `gis_cli.boot` 里做一次，用的是
+`arcpy_bridge.discover_arcgis_pro_python()` 那**同一套**发现链——找到 Pro 的
+python.exe 就把仓库 `src` 挂上 `PYTHONPATH` 再跑 `python -m gis_cli.agent.cli`，
+找不到就退回当前解释器，由 `doctor` 说清楚缺什么。
+
+不依赖 pip 生成的 exe，也不依赖 Pro env 的 pip（那两样在本机都是坏的，见 `INSTALL.md`）。
+**Git Bash 里能敲 `giscli`** 靠的是无扩展名那份——Git Bash 不认 PATHEXT。
 
 ```bash
-python scripts\install_shim.py       # 把 scripts 加进用户级 PATH（幂等，可 --remove）
+python install.py       # 写 shim + 只追加用户级 PATH（幂等）
 giscli --help                        # 任何目录可用，rc=0
 giscli init D:\giswork\demo          # 建 demo\workspace\{input,output,temp}
 cd /d D:\giswork\demo && giscli chat

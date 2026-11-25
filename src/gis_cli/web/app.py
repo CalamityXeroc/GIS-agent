@@ -84,6 +84,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         scan_service.trigger(reason="startup")
+        # 内核（`import arcpy` 10~12 s）也在后台起来：数据目录没变化时扫描不会
+        # 碰内核，第一次点开 `.gdb` 图层就会白等这段（DAIR-393）。只有工作区里
+        # 真有「预览非走内核不可」的数据才热——空工作区/纯 .shp 不值得起进程。
+        if preview_api.kernel_warm_suggested(ws):
+            preview_runtime.prewarm()
         yield
         scan_service.close()
         manager.close()

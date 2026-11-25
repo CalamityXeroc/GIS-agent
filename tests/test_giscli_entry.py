@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -38,14 +39,14 @@ def _load_script(name: str):
     return module
 
 
-# === .cmd 静态检查 =========================================================
+# === shim 静态检查 =========================================================
 
 
 @pytest.mark.parametrize(
     ("name", "where"),
     [
         ("giscli.cmd", SCRIPTS_DIR),
-        ("find_pro_python.cmd", SCRIPTS_DIR),
+        ("giscli.ps1", SCRIPTS_DIR),
         ("一键启动.bat", REPO_ROOT),
     ],
 )
@@ -63,34 +64,56 @@ def test_batch_files_are_ascii_only_and_crlf(name: str, where: Path):
     assert b"\n" not in raw.replace(b"\r\n", b""), "存在裸 LF 行尾"
 
 
-def test_giscli_cmd_is_self_contained_and_installs_nothing():
-    """入口只做三件事：找 Pro python、把 src 放上 PYTHONPATH、跑 -m。"""
+def test_checked_in_shims_are_rendered_from_the_template():
+    """``scripts/`` 下那三份是模板渲染出来的：手改会在这里红。"""
+    from gis_cli import shims
+
+    for name, rendered in shims.render_all(None, "python").items():
+        path = SCRIPTS_DIR / name
+        assert path.is_file(), f"缺少 {path}"
+        assert path.read_bytes() == shims._encode(name, rendered), (
+            f"{name} 与 gis_cli.shims 的模板不一致：用 shims.write_shims 重新生成，别手改"
+        )
+
+
+def test_giscli_cmd_is_a_thin_forwarder():
+    """入口只做三件事：推仓库根、把 src 放上 PYTHONPATH、跑 -m gis_cli.boot。"""
     text = (SCRIPTS_DIR / "giscli.cmd").read_text(encoding="ascii")
-    assert "find_pro_python.cmd" in text, "发现逻辑必须复用共享脚本"
+    assert "-m gis_cli.boot %*" in text
     assert "PYTHONPATH=%REPO_ROOT%\\src" in text, "缺 PYTHONPATH 就依赖 editable 安装了"
-    assert "-m gis_cli.agent.cli %*" in text
     assert "pip install" not in text, "入口不该碰 pip"
     # 仓库根必须由脚本位置推出，不能写死本机路径
     assert "E:\\BST_lab" not in text
     assert 'for %%I in ("%SCRIPT_DIR%\\..")' in text
+    # 候选解释器表只许 arcpy_bridge 有一份（cmd 抄的那份在 3.6→3.7 升级后指错路）
+    assert "ArcGISPro" not in text
+    assert "ARCGIS_PRO_PYTHON=" not in text
 
 
-def test_launcher_self_heals_missing_pyproj():
-    """pyproj 缺了地图上什么都不画；launcher 的 :ensure 要能自己补上（DAIR-335）。"""
+def test_bash_shim_is_what_makes_git_bash_work():
+    """Git Bash 不认 PATHEXT：只有无扩展名的 giscli 才能在那边敲出来。"""
+    raw = (SCRIPTS_DIR / "giscli").read_bytes()
+    assert raw.startswith(b"#!/usr/bin/env bash")
+    assert b"\r\n" not in raw, "sh 脚本用 CRLF 会报 '/usr/bin/env: bash\\r: No such file'"
+    text = raw.decode("utf-8")
+    assert '-m gis_cli.boot "$@"' in text
+    assert "cygpath" in text, "Git Bash 的 /e/... 必须先转成 Windows 路径"
+
+
+def test_bash_shim_skips_a_stale_override():
+    """``ARCGIS_PRO_PYTHON`` 常指向升级前的旧目录：失效就别拿它起 boot。"""
+    text = (SCRIPTS_DIR / "giscli").read_text(encoding="utf-8")
+    assert '[ -x "$ARCGIS_PRO_PYTHON" ]' in text
+    assert '[ ! -x "$BOOT_PY" ]' in text
+
+
+def test_launcher_forwards_to_giscli_web():
+    """一键启动.bat 已弃用：只转发 giscli web，保留文件名为老快捷方式兜底。"""
     bat = (REPO_ROOT / "一键启动.bat").read_text(encoding="ascii")
-    assert 'call :ensure pyproj "pyproj>=3.6"' in bat
-
-
-def test_launchers_share_one_discovery_and_never_pin_a_version():
-    bat = (REPO_ROOT / "一键启动.bat").read_text(encoding="ascii")
-    shared = (SCRIPTS_DIR / "find_pro_python.cmd").read_text(encoding="ascii")
-    assert 'call "%REPO_ROOT%\\scripts\\find_pro_python.cmd"' in bat
-    assert "PYTHONPATH=%REPO_ROOT%\\src" in bat, "不设 PYTHONPATH 就会掉回 pip 分支"
-    for text in (bat, shared):
-        assert "ARCGIS_PRO_PYTHON" in text
-        # 3.6 硬编码是上一次升级踩过的坑，不能再出现
-        assert "ArcGISPro3." not in text
-        assert "E:\\ArcGISPro*" in text
+    assert "DEPRECATED" in bat
+    assert "call giscli web %*" in bat
+    assert "pip install" not in bat, "依赖安装归 install.py / doctor，不归启动器"
+    assert "ArcGISPro" not in bat, "启动器不再自己找 Pro（发现逻辑只有一份）"
 
 
 # === init 子命令 ==========================================================
@@ -244,6 +267,18 @@ def test_shim_install_is_idempotent(shim, tmp_path: Path):
     assert state["value"].count(str(entry)) == 1
 
 
+def test_shim_install_undo_hint_names_the_entry_it_added(shim, tmp_path: Path, capsys):
+    """撤销指令必须带 ``--scripts-dir``：缺省值是 ``scripts\\`` 自己，删的不是刚加的这条。"""
+    module, state = shim
+    entry = tmp_path / "Programs" / "giscli"
+
+    module.install(entry)
+
+    undo = [line for line in capsys.readouterr().out.splitlines() if "--remove" in line]
+    assert len(undo) == 1, undo
+    assert f'--scripts-dir "{entry}"' in undo[0]
+
+
 def test_shim_install_treats_trailing_slash_as_same_entry(shim, tmp_path: Path):
     module, state = shim
     entry = tmp_path / "scripts"
@@ -359,3 +394,183 @@ def test_check_install_still_wants_install_when_src_is_nowhere(tmp_path: Path, m
 
     need, _reason = module.needs_install(repo)
     assert need, "既没装上也不在 sys.path 上，就该装"
+
+
+# === gis_cli.shims：三份脚本的生成 =========================================
+
+#: 带空格的安装路径：最容易拼错的情况（cmd 引号、bash 转义都会在这里露馅）。
+INSTALLED_ROOT = r"C:\Program Files\my repo"
+
+
+def test_installed_shims_bake_the_repo_root_in_three_dialects():
+    from gis_cli import shims
+
+    rendered = shims.render_all(INSTALLED_ROOT, r"C:\Python312\python.exe")
+
+    assert 'set "REPO_ROOT=C:\\Program Files\\my repo"' in rendered["giscli.cmd"]
+    assert "$RepoRoot = 'C:\\Program Files\\my repo'" in rendered["giscli.ps1"]
+    # bash 里反斜杠是转义符：统一成正斜杠，cygpath -m 也认这种形式
+    assert "REPO_ROOT='C:/Program Files/my repo'" in rendered["giscli"]
+    for name, text in rendered.items():
+        assert "gis_cli.boot" in text, f"{name} 没走统一入口"
+
+
+def test_write_shims_is_idempotent(tmp_path: Path):
+    from gis_cli import shims
+
+    first = shims.write_shims(tmp_path / "shim", repo_root=INSTALLED_ROOT, python="python")
+    assert all(changed for _path, changed in first), "第一次每个文件都该写"
+    second = shims.write_shims(tmp_path / "shim", repo_root=INSTALLED_ROOT, python="python")
+    assert not any(changed for _path, changed in second), "内容没变就不该重写（别动 mtime）"
+
+
+def test_write_shims_uses_crlf_for_cmd_and_lf_for_bash(tmp_path: Path):
+    from gis_cli import shims
+
+    shims.write_shims(tmp_path, repo_root=INSTALLED_ROOT, python="python")
+
+    assert b"\r\n" in (tmp_path / "giscli.cmd").read_bytes()
+    assert b"\r\n" not in (tmp_path / "giscli").read_bytes()
+
+
+# === gis_cli.boot：选解释器 ================================================
+
+
+def test_boot_execs_the_pro_python_with_src_on_pythonpath(monkeypatch):
+    from gis_cli import boot
+
+    seen = {}
+
+    def fake_call(command, env=None):
+        seen["command"] = command
+        seen["env"] = env
+        return 7
+
+    monkeypatch.setattr(boot, "discover", lambda: (r"E:\Pro\python.exe", "registry"))
+    monkeypatch.setattr(boot.subprocess, "call", fake_call)
+
+    assert boot.main(["web", "--port", "8760"]) == 7, "子进程的退出码要原样传回去"
+    assert seen["command"][:3] == [r"E:\Pro\python.exe", "-m", "gis_cli.agent.cli"]
+    assert seen["command"][3:] == ["web", "--port", "8760"]
+    assert seen["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(boot.repo_root() / "src")
+
+
+def test_boot_keeps_the_users_own_pythonpath(monkeypatch):
+    from gis_cli import boot
+
+    monkeypatch.setenv("PYTHONPATH", r"D:\mine")
+    env = boot.runtime_env(str(boot.repo_root() / "src"))
+
+    assert env["PYTHONPATH"] == str(boot.repo_root() / "src") + r";D:\mine"
+
+
+def test_boot_runs_in_process_when_already_on_the_pro_python(monkeypatch):
+    """已经在 Pro 解释器里就别再套一个 python.exe（白等一次启动）。"""
+    from gis_cli import boot
+
+    ran = []
+    monkeypatch.setattr(boot, "discover", lambda: (sys.executable, "same"))
+    monkeypatch.setattr(
+        boot, "run_in_process", lambda repo, argv, reason="": ran.append(argv) or 0
+    )
+    monkeypatch.setattr(
+        boot.subprocess, "call", lambda *a, **k: pytest.fail("不该再起一个解释器")
+    )
+
+    assert boot.main(["doctor"]) == 0
+    assert ran == [["doctor"]]
+
+
+def test_boot_without_pro_says_so_and_runs_the_local_cli(monkeypatch, capsys):
+    from gis_cli import boot
+
+    seen = []
+    monkeypatch.setattr(boot, "discover", lambda: (None, "未找到 ArcGIS Pro Python 解释器。"))
+    monkeypatch.setattr(
+        boot, "run_in_process", lambda repo, argv, reason="": seen.append(reason) or 0
+    )
+
+    assert boot.main(["doctor"]) == 0
+    err = capsys.readouterr().err
+    assert "未找到 ArcGIS Pro Python" in err
+    assert "Traceback" not in err, "入口失败不许抛栈"
+    assert seen == ["未找到 ArcGIS Pro Python 解释器。"]
+
+
+# === install.py：一条命令安装 =============================================
+
+
+def _load_install_module():
+    """``install.py`` 在仓库根（不是包），按路径加载。"""
+    path = REPO_ROOT / "install.py"
+    spec = importlib.util.spec_from_file_location("_giscli_install", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_install_target_dir_follows_localappdata(tmp_path: Path, monkeypatch):
+    if os.name != "nt":
+        pytest.skip("Windows 专有的用户级安装目录")
+    module = _load_install_module()
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert module.target_dir() == tmp_path / "Programs" / "giscli"
+
+
+def test_install_dry_run_writes_nothing(monkeypatch, tmp_path: Path, capsys):
+    module = _load_install_module()
+    monkeypatch.setattr(module, "target_dir", lambda: tmp_path / "shim")
+    monkeypatch.setattr(module, "discover_pro_python", lambda: (None, "这台机器没有 Pro"))
+    monkeypatch.setattr(module, "probe_pip_install", lambda: (False, "pip 模式跳过"))
+
+    assert module.main(["--dry-run"]) == 0
+    assert not (tmp_path / "shim").exists(), "dry-run 不许写文件"
+    out = capsys.readouterr().out
+    assert "dry-run" in out and "这台机器没有 Pro" in out
+
+
+def test_install_only_probes_the_pro_env(monkeypatch):
+    """硬约束：Pro env 的 pip 是坏的，安装流程对它只许探测，不许装东西进去。"""
+    module = _load_install_module()
+    commands = []
+    monkeypatch.setattr(
+        module,
+        "_probe",
+        lambda command, timeout: commands.append(list(command)) or (True, "ok"),
+    )
+
+    facts = module.probe_pro_env(r"E:\Pro\python.exe")
+
+    assert facts["arcpy_ok"] is True and facts["pip_ok"] is True
+    joined = [" ".join(str(part) for part in command) for command in commands]
+    assert not any("pip install" in line for line in joined)
+
+
+def test_install_undo_hint_points_at_the_shim_dir(monkeypatch, tmp_path: Path, capsys):
+    """撤销指令必须指向这次装进去的目录，且给字面路径（``%LOCALAPPDATA%`` 只 cmd 会展开）。"""
+    module = _load_install_module()
+    shim_dir = tmp_path / "Programs" / "giscli"
+
+    class _AlreadyThere:
+        ok = True
+        changed = False
+        detail = "already present"
+
+    monkeypatch.setattr(module, "target_dir", lambda: shim_dir)
+    monkeypatch.setattr(module, "discover_pro_python", lambda: (None, "这台机器没有 Pro"))
+    monkeypatch.setattr(module, "probe_pip_install", lambda: (False, "pip 模式跳过"))
+    monkeypatch.setattr(
+        module, "add_to_user_path", lambda directory, dry_run=False: _AlreadyThere()
+    )
+    monkeypatch.setattr(module, "run_doctor", lambda directory: (0, "doctor ok"))
+
+    assert module.main([]) == 0
+
+    undo = [line for line in capsys.readouterr().out.splitlines() if "--remove" in line]
+    assert len(undo) == 1, undo
+    assert "--scripts-dir" in undo[0], "少了 --scripts-dir 就会删缺省 scripts\\ 那一条"
+    assert f'"{shim_dir}"' in undo[0], "撤销指令里的目录不是这次装进去的那一条（不能靠 shell 展开环境变量）"

@@ -24,7 +24,7 @@ import math
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from . import geom_simplify
+from . import filegdb_view, geom_simplify
 from .narrative import DISCLAIMER, ImageRef, LayerRef, ReportContent
 
 logger = logging.getLogger(__name__)
@@ -356,6 +356,28 @@ def _iter_points(geometry: dict[str, Any]) -> Iterable[list[float]]:
                 yield from ring or []
 
 
+def filter_by_bbox(
+    feature_collection: dict[str, Any], bbox: Sequence[float]
+) -> dict[str, Any]:
+    """只保留 envelope 与 ``bbox`` 相交的要素（视口裁剪，DAIR-386）。
+
+    用 envelope 判交是**保守**的（跨视口的长线/大面会整条留下），但绝不会把
+    视口内的要素筛掉——「少画了」正是这次要修的问题，宁可多给不能少给。
+    """
+    minx, miny, maxx, maxy = (float(value) for value in bbox)
+    kept = []
+    for feature in feature_collection.get("features") or []:
+        if not isinstance(feature, dict):
+            continue
+        box = bbox_of({"features": [feature]})
+        if box is None:
+            continue
+        if box[0] > maxx or box[1] > maxy or box[2] < minx or box[3] < miny:
+            continue
+        kept.append(feature)
+    return {"type": "FeatureCollection", "features": kept}
+
+
 def count_points(feature_collection: dict[str, Any]) -> int:
     total = 0
     for feature in feature_collection.get("features") or []:
@@ -519,6 +541,94 @@ else:
 """
 
 
+#: 视口裁剪版的内核模板（DAIR-386 / DAIR-393）：读盘交给
+#: :mod:`gis_cli.report.filegdb_view`——有 ``osgeo`` 时走 GDAL（每行解码比 arcpy
+#: 便宜 2.4 倍、计数精确），没有时退回它内部的顺序扫描兜底。
+#: 模板只负责把两份源码嵌进内核、注入简化函数；几何简化必须在几何跨进程搬运
+#: 之前完成（5MB 闸门的前提）。
+#: ``MakeFeatureLayer`` / ``SelectLayerByAttribute`` 会挂死内核，这里一律不碰。
+_PROBE_VIEW = """\
+_geo_ns = {{}}
+exec(compile({geo_helper}, "<geom_simplify>", "exec"), _geo_ns)
+_view_ns = {{}}
+exec(compile({helper}, "<filegdb_view>", "exec"), _view_ns)
+
+_path = {path}
+_bbox = {bbox}
+_limit = {limit}
+_names = {fields}
+_max_points = {max_points}
+_scan_cap = {scan_cap}
+_index_path = {index_path}
+_index_key = {index_key}
+set_result(_view_ns["read_view"](
+    _path,
+    _bbox,
+    limit=_limit,
+    fields=_names,
+    max_points=_max_points,
+    scan_cap=_scan_cap,
+    simplify=_geo_ns["simplify_esri_geometries"],
+    index_path=_index_path,
+    index_key=_index_key,
+))
+"""
+
+
+#: 按索引 OID 读视口（DAIR-393）：不再整表扫，计数就是 OID 条数。
+_PROBE_READ_OIDS = """_geo_ns = {{}}
+exec(compile({geo_helper}, "<geom_simplify>", "exec"), _geo_ns)
+_view_ns = {{}}
+exec(compile({helper}, "<filegdb_view>", "exec"), _view_ns)
+
+_oids = {oids}
+set_result(_view_ns["read_by_oids"](
+    {path},
+    _oids,
+    limit={limit},
+    fields={fields},
+    max_points={max_points},
+    simplify=_geo_ns["simplify_esri_geometries"],
+))
+"""
+
+#: 整层扫一遍建包络索引（每层一次）。
+_PROBE_BUILD_INDEX = """_view_ns = {{}}
+exec(compile({helper}, "<filegdb_view>", "exec"), _view_ns)
+set_result(_view_ns["build_index"]({path}, {index_path}, {index_key}))
+"""
+
+
+def layer_oids_code(
+    path: str,
+    oids: Sequence[int],
+    limit: int,
+    fields: Sequence[str] | None = None,
+    *,
+    max_points: int | None = None,
+) -> str:
+    """内核里按 OID 读视口要素的代码（索引快路，DAIR-393）。"""
+    return _PROBE_READ_OIDS.format(
+        geo_helper=repr(simplify_helper_source()),
+        helper=repr(filegdb_helper_source()),
+        path=repr(str(path)),
+        oids=repr([int(value) for value in oids]),
+        limit=int(limit),
+        fields=repr([str(name) for name in (fields or ())]),
+        max_points=int(max_points or MAX_COORDS),
+    )
+
+
+def layer_index_build_code(path: str, index_path: str, index_key: str) -> str:
+    """内核里建包络索引的代码（DAIR-393）。"""
+    return _PROBE_BUILD_INDEX.format(
+        helper=repr(filegdb_helper_source()),
+        path=repr(str(path)),
+        index_path=repr(str(index_path)),
+        index_key=repr(str(index_key)),
+    )
+
+
 def simplify_helper_source() -> str:
     """:mod:`gis_cli.report.geom_simplify` 的源码，供内核 ``exec`` 载入。
 
@@ -528,12 +638,32 @@ def simplify_helper_source() -> str:
     return Path(geom_simplify.__file__).read_text(encoding="utf-8")
 
 
+def filegdb_helper_source() -> str:
+    """:mod:`gis_cli.report.filegdb_view` 的源码，供内核 ``exec`` 载入（同上）。"""
+    return Path(filegdb_view.__file__).read_text(encoding="utf-8")
+
+
+#: 视口模板的扫描窗口：收集上限的 20 倍（保底 2 万行）。扫到就停，
+#: ``view_count_exact`` 变 false——这是 .gdb 「≥N」语义的闸（DAIR-388）。
+VIEW_SCAN_FACTOR = 20
+VIEW_SCAN_FLOOR = 20_000
+
+
+def view_scan_cap(limit: int) -> int:
+    """视口计数窗口：与收集上限解耦（DAIR-391），默认沿用旧口径。"""
+    return max(int(limit) * VIEW_SCAN_FACTOR, VIEW_SCAN_FLOOR)
+
+
 def layer_probe_code(
     path: str,
     limit: int = MAX_FEATURES,
     fields: Sequence[str] | None = None,
     *,
     max_points: int | None = None,
+    bbox: Sequence[float] | None = None,
+    scan_cap: int | None = None,
+    index_path: str | None = None,
+    index_key: str | None = None,
 ) -> str:
     """内核里取几何的代码（单独成函数，便于单测断言它只用安全 API）。
 
@@ -543,8 +673,29 @@ def layer_probe_code(
     ``max_points`` 给定时切到**内核先减点**的模板：读到的几何在 ArcGIS 进程里
     就按顶点预算简化完，只把简化后的坐标回传——全精度大 JSON 不再走进程间
     通道（DAIR-368 问题 3 的真凶就是这段 40MB 的序列化+搬运）。
+
+    ``bbox``（图层坐标系，``minx,miny,maxx,maxy``）给定时切到视口裁剪模板：
+    只收集与视口相交的要素，并把视口内**真实**要素数一并报回（DAIR-386）。
+
+    ``scan_cap`` 只用于视口模板：扫到多少行就停（决定 ``view_count_exact``）。
+    不给时沿用旧口径 ``max(limit * 20, 20_000)``。DAIR-391 把「收集上限」与
+    「扫描窗口」拆开：视口预览要收更多要素（先简化再截），但计数窗口不该跟着
+    放大 2.5 倍——那会让 .gdb 大表的扫描白白变慢。
     """
     names = [str(name) for name in (fields or ())]
+    if bbox is not None:
+        return _PROBE_VIEW.format(
+            geo_helper=repr(simplify_helper_source()),
+            helper=repr(filegdb_helper_source()),
+            path=repr(str(path)),
+            limit=int(limit),
+            fields=repr(names),
+            max_points=int(max_points or MAX_COORDS),
+            bbox=repr(tuple(float(value) for value in bbox)),
+            scan_cap=int(scan_cap or view_scan_cap(limit)),
+            index_path=repr(str(index_path or "")),
+            index_key=repr(str(index_key or "")),
+        )
     if max_points is None:
         if not names:
             return _PROBE.format(path=repr(str(path)), limit=int(limit))
@@ -933,6 +1084,7 @@ __all__ = [
     "MAX_FEATURES",
     "bbox_of",
     "count_points",
+    "filter_by_bbox",
     "esri_geometries_to_feature_collection",
     "esri_geometry_to_geojson",
     "layer_probe_code",

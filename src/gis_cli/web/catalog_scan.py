@@ -8,12 +8,14 @@
 的 ``/api/catalog/*`` 只读库，所以「把数据放进 ``input/`` → 打开控制台 →
 目录是空的」必须先提交一个任务才刷新。
 
-这一层只负责三件事，且**不进入引擎启动路径**（``prewarm.py`` 头注释里写的
+这一层只负责四件事，且**不进入引擎启动路径**（``prewarm.py`` 头注释里写的
 启动阻塞是前车之鉴）：
 
 1. 起服务时在后台线程先扫一遍（首屏不等它）；
 2. 暴露一个可重复调用的入口给前端「刷新」按钮与轮询（同一时刻只扫一遍）；
-3. 扫描失败只落 ``error`` 文本，**不动库里已有记录**，GET 目录照常返回旧数据。
+3. 扫描失败只落 ``error`` 文本，**不动库里已有记录**，GET 目录照常返回旧数据；
+4. 扫完顺手给大 ``.gdb`` 要素类建**视口包络索引**（DAIR-393）：第一次打开
+   13 万行图层不必再整层扫，直接按 OID 读视口。有门槛与预算，失败只记日志。
 
 ## 「自动识别」怎么做的
 
@@ -49,6 +51,21 @@ CATALOG_DB = Path(".gis_agent") / "catalog.db"
 #: 指纹里保留的 mtime 精度：文件系统给的是浮点数，比较到微秒足够。
 _MTIME_PRECISION = 6
 
+#: 视口包络索引的预热门槛（DAIR-393）：小图层整层扫也只要几十毫秒，不值得提前建；
+#: 大 `.gdb` 要素类第一次打开才需要它（64k 面整层扫 ~4 s）。
+INDEX_WARM_MIN_FEATURES = 20_000
+#: 每轮扫描最多预热几个图层（别让「扫数据目录」变成「建库」）。
+INDEX_WARM_MAX_LAYERS = 3
+#: 每轮预热的墙钟预算（秒）：超了就下一轮再做，不拖住扫描状态。
+INDEX_WARM_BUDGET_S = 120.0
+#: 最近这么长时间内有过预览请求就让路（预览比预热索引更等不起）。
+INDEX_WARM_IDLE_S = 8.0
+#: 单层建索引的内核超时（秒）。预热和用户预览共用内核串行锁（``_exec_lock``），
+#: 而预览等锁的预算是 ``read_timeout + 45 s``（``runtime/kernel.py``）：单层放到
+#: 180 s 会把「慢」变成 PreviewTimeout → 422（DAIR-394 非阻塞项 2）。30 s 足够
+#: 建几十万行的包络索引；超时就放弃这一层、下次扫描再试，退回整层扫不影响正确性。
+INDEX_WARM_LAYER_TIMEOUT_S = 30.0
+
 #: ``scanner.refresh_catalog`` 在 ArcPy 整批失败时写进 ``stats.errors`` 的前缀。
 #: 这种失败不是「某几个文件有问题」，而是内核崩了 / 超时 900s / 脚本级失败：
 #: 一条记录都没落库，必须让界面看见，也不能记成「扫过了」（DAIR-352 打回项 1）。
@@ -57,6 +74,20 @@ KERNEL_FAILURE_PREFIX = "kernel scan failed"
 
 def _kernel_failed(errors: Iterable[str]) -> bool:
     return any(str(item).startswith(KERNEL_FAILURE_PREFIX) for item in errors)
+
+
+def _warm_failure_reason(outcome: Any, payload: Any) -> str:
+    """把「这一层没建成索引」的原因收成一行（页面上看不到，至少日志里要有）。"""
+    if isinstance(payload, dict) and payload.get("error"):
+        return str(payload["error"])
+    error = getattr(outcome, "error", None)
+    if isinstance(error, dict):
+        reason = error.get("message") or error.get("type")
+        if reason:
+            return str(reason)
+    elif error:
+        return str(error)
+    return "内核未返回结果" if getattr(outcome, "ok", False) else "未返回错误信息"
 
 
 def _is_total_failure(stats: Any) -> bool:
@@ -137,6 +168,8 @@ class CatalogScanService:
         #: 计数与退避规则在 ``datacatalog/kernel_health.py``，这一层只读它。
         self._health = health if health is not None else KernelHealth()
         self._state = ScanState()
+        #: 上一轮预热出来的视口索引层数（诊断用；只写日志，不进 scan 状态字段）。
+        self._index_warmed = 0
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         #: 上次**成功**扫描时的文件系统指纹；``None`` 表示还没成功过。
@@ -224,6 +257,9 @@ class CatalogScanService:
     def _run(self, signature: tuple, roots: list[str]) -> None:
         stats: Any = None
         error = ""
+        #: 这一轮要不要预热视口索引，以及预热用的内核。预热最长几十秒，只能出锁之后做。
+        warm = False
+        warm_kernel: Any = None
         try:
             from ..datacatalog.scanner import refresh_catalog
             from ..datacatalog.store import Catalog
@@ -281,6 +317,19 @@ class CatalogScanService:
             else:
                 self._scanned_signature = signature
                 self._failed_signature = None
+                # 数据目录这一轮扫完了：顺手给大 `.gdb` 层建视口包络索引（DAIR-393）。
+                # 建在后台扫描线程里，用户打开数据目录的这几十秒正好把它做完，
+                # 点开图层就直接走索引，不用再等第一次整层扫。
+                #
+                # 预热**必须出锁**再跑（DAIR-394 B1）：``state()``（GET
+                # /api/catalog/scan 的轮询）与 ``trigger()``（刷新按钮）拿的是同一把
+                # 锁，锁里跑最长 120 s 的预热会把轮询和刷新一起卡住，``finished_at``
+                # 也迟迟送不出去。锁内只取内核，状态字段在下面这段里已经全部落定。
+                try:
+                    warm_kernel = self._kernel() if self._kernel is not None else None
+                except Exception:  # pragma: no cover - 内核构造失败不影响扫描结果
+                    warm_kernel = None
+                warm = True
                 logger.info(
                     "catalog scan done: discovered=%s scanned=%s skipped=%s removed=%s",
                     state.discovered,
@@ -288,6 +337,83 @@ class CatalogScanService:
                     state.skipped,
                     state.removed,
                 )
+
+        if warm:
+            self._index_warmed = self._warm_indexes(warm_kernel)
+
+    def _warm_indexes(self, kernel: Any) -> int:
+        """给大 `.gdb` 要素类预建视口包络索引，返回这次建了几个（DAIR-393）。
+
+        只做「要素数 ≥ :data:`INDEX_WARM_MIN_FEATURES`、索引缺失或过期」的
+        ``feature_class``；每轮最多 :data:`INDEX_WARM_MAX_LAYERS` 个、总预算
+        :data:`INDEX_WARM_BUDGET_S` 秒。任何一步失败都只记日志——索引是加速项，
+        不能把「数据目录扫描」本身弄失败。
+        """
+        if kernel is None or not hasattr(kernel, "run"):
+            return 0
+        if self._health.blocked_for() > 0:
+            return 0
+        from ..datacatalog.store import Catalog
+        from ..report import filegdb_view, html_pack
+
+        try:
+            catalog = Catalog(self.workspace / CATALOG_DB)
+            try:
+                records = catalog.list_datasets(kind="feature_class", limit=500)
+            finally:
+                catalog.close()
+        except Exception as exc:  # pragma: no cover - 库被锁/损坏
+            logger.debug("视口索引预热跳过（读目录失败）：%s", exc)
+            return 0
+
+        deadline = time.time() + INDEX_WARM_BUDGET_S
+        built = 0
+        for record in records:
+            if built >= INDEX_WARM_MAX_LAYERS or time.time() > deadline:
+                break
+            # 用户正在看图层就别抢内核：预览和建索引都在同一个内核里串行执行，
+            # 抢过去会让「首图」白等一整轮建索引（DAIR-393 实测 15.8 s）。
+            from ..web import preview_api as _preview_api
+
+            if time.time() - _preview_api.last_preview_at() < INDEX_WARM_IDLE_S:
+                logger.debug("视口索引预热让路：最近有预览请求")
+                break
+            try:
+                count = int(record.feature_count or 0)
+                if count < INDEX_WARM_MIN_FEATURES:
+                    continue
+                if ".gdb" not in str(record.path).lower():
+                    continue
+                layer = Path(record.path)
+                if not layer.is_absolute():
+                    layer = self.workspace / layer
+                index_file = filegdb_view.index_path(self.workspace, layer)
+                key = filegdb_view.index_key(layer, count)
+                if not key or filegdb_view.load_index(index_file, key) is not None:
+                    continue
+                code = html_pack.layer_index_build_code(str(layer), str(index_file), key)
+                outcome = kernel.run(
+                    code, timeout=min(INDEX_WARM_LAYER_TIMEOUT_S, max(5.0, deadline - time.time()))
+                )
+                payload = getattr(outcome, "result", None)
+                if isinstance(payload, dict) and payload.get("skipped"):
+                    # 等内核锁的这段时间里预览已经把同一层的索引扫出来了，内核侧
+                    # 拿到锁后按指纹跳过（DAIR-397 第 3 条，实测白建 3.7 s）。
+                    logger.info("视口索引预热跳过：%s（已有索引，未重建）", record.path)
+                    continue
+                if getattr(outcome, "ok", False) and isinstance(payload, dict) and not payload.get("error"):
+                    built += 1
+                    logger.info("视口索引已建：%s（%s 条）", record.path, payload.get("count"))
+                else:
+                    # WARNING：30 s 预算不够时这是唯一现场证据，默认 INFO 下必须看得见。
+                    logger.warning(
+                        "视口索引未建成：%s %s",
+                        record.path,
+                        _warm_failure_reason(outcome, payload),
+                    )
+            except Exception as exc:  # pragma: no cover - 单个图层失败不影响其它
+                logger.debug("视口索引预热失败 %s：%s", record.path, exc)
+        return built
 
     def _fs_signature(self, roots: list[str]) -> tuple:
         """文件系统指纹：``(path, kind, mtime, size)`` 排序后的一串。

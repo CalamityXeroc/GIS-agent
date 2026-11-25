@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from gis_cli.datacatalog.kernel_health import KernelHealth
 from gis_cli.datacatalog.scanner import RefreshStats
 from gis_cli.datacatalog.scanner import refresh_catalog as real_refresh_catalog
 from gis_cli.datacatalog.store import Catalog, DatasetRecord
+from gis_cli.report import filegdb_view
 from gis_cli.web.app import create_app
 from gis_cli.web.catalog_scan import CatalogScanService
 from gis_cli.web.security import load_or_create_token
@@ -63,6 +65,19 @@ def _csv(workspace: Path, name: str = "demo.csv") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("region,pop\nA,100\nB,200\n", encoding="utf-8")
     return path
+
+
+def _big_gdb_layer(workspace: Path, count: int = 90_000) -> Path:
+    """造一个「够大」的 `.gdb` 要素类记录（预热门槛是 2 万要素）。"""
+    gdb = workspace / "input" / "数据.gdb"
+    gdb.mkdir(parents=True, exist_ok=True)
+    (gdb / "a00000001.gdbtable").write_bytes(b"fake")
+    catalog = Catalog(workspace / ".gis_agent" / "catalog.db")
+    catalog.upsert(
+        DatasetRecord(path=str(gdb / "big"), kind="feature_class", name="big", feature_count=count)
+    )
+    catalog.close()
+    return gdb / "big"
 
 
 def _shp(workspace: Path, name: str = "roads.shp") -> Path:
@@ -430,3 +445,160 @@ def test_scan_requires_the_web_token(workspace: Path, token: str):
     client = TestClient(create_app(workspace, token=token))
     assert client.post("/api/catalog/scan").status_code == 401
     assert client.get("/api/catalog/scan").status_code == 401
+
+
+def test_scan_warms_viewport_index_for_large_gdb_layer(tmp_path: Path):
+    """扫描之后给大 `.gdb` 要素类预建视口包络索引（DAIR-393）。
+
+    只做「要素数 ≥ 门槛」的层；小图层整层扫也只要几十毫秒，不值得提前建。
+    """
+    workspace = tmp_path / "ws"
+    gdb = workspace / "input" / "数据.gdb"
+    gdb.mkdir(parents=True)
+    (gdb / "a00000001.gdbtable").write_bytes(b"fake")
+    catalog = Catalog(workspace / ".gis_agent" / "catalog.db")
+    catalog.upsert(
+        DatasetRecord(path=str(gdb / "big"), kind="feature_class", name="big", feature_count=90_000)
+    )
+    catalog.upsert(
+        DatasetRecord(path=str(gdb / "small"), kind="feature_class", name="small", feature_count=100)
+    )
+    catalog.close()
+
+    calls: list[str] = []
+
+    class _Kernel:
+        def run(self, code, timeout=None):  # noqa: ANN001
+            calls.append(code)
+            return SimpleNamespace(ok=True, result={"error": "", "count": 90_000})
+
+    scanner = CatalogScanService(workspace, kernel=lambda: _Kernel())
+
+    assert scanner._warm_indexes(_Kernel()) == 1
+    assert len(calls) == 1, "只该给大图层建索引"
+    assert "build_index" in calls[0] and "big" in calls[0] and "small" not in calls[0]
+
+
+def test_index_warm_failure_is_visible_at_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """建不成索引不能再静默（DAIR-397 第 2 条）：30 s 预算超时是唯一的现场证据。"""
+    workspace = tmp_path / "ws"
+    layer = _big_gdb_layer(workspace)
+
+    class _TimeoutKernel:
+        def run(self, code, timeout=None):  # noqa: ANN001
+            return SimpleNamespace(
+                ok=False,
+                result=None,
+                error={"type": "TimeoutExpired", "message": "kernel timeout after 30.0s"},
+            )
+
+    scanner = CatalogScanService(workspace, kernel=lambda: _TimeoutKernel())
+    with caplog.at_level(logging.WARNING, logger="gis_cli.web.catalog_scan"):
+        assert scanner._warm_indexes(_TimeoutKernel()) == 0
+
+    lines = [r for r in caplog.records if "视口索引未建成" in r.getMessage()]
+    assert lines, "超时必须在日志里留下一条「未建成」"
+    assert lines[0].levelno == logging.WARNING, "默认 INFO 级别下 DEBUG 等于没有"
+    text = lines[0].getMessage()
+    assert str(layer) in text, "要能看出是哪一层"
+    assert "kernel timeout after 30.0s" in text, "要能看出原因"
+
+
+def test_index_warm_counts_kernel_side_skip_as_not_built(tmp_path: Path):
+    """内核拿到锁后按指纹跳过时不能记成「已建」（DAIR-397 第 3 条）。"""
+    workspace = tmp_path / "ws"
+    _big_gdb_layer(workspace)
+
+    class _SkippingKernel:
+        def run(self, code, timeout=None):  # noqa: ANN001
+            # 等锁期间预览已经扫出索引，内核里的 build_index 直接返回 skipped。
+            return SimpleNamespace(ok=True, result={"error": "", "count": 90_000, "skipped": True})
+
+    scanner = CatalogScanService(workspace, kernel=lambda: _SkippingKernel())
+    assert scanner._warm_indexes(_SkippingKernel()) == 0
+
+
+def test_warm_kernel_code_skips_index_written_by_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """预热拿到内核锁时预览已把索引建好：不重扫整层（DAIR-397 第 3 条）。
+
+    假内核按真实内核的做法：先执行「预览那次整层扫」（写出索引），再 exec 预热下发的
+    建索引代码。生成的代码里 ``build_index`` 持锁后按指纹查一次 → 直接 skipped，
+    不会再打开数据源扫整层。
+    """
+    workspace = tmp_path / "ws"
+    layer = _big_gdb_layer(workspace)
+    index_file = filegdb_view.index_path(workspace, layer)
+    key = filegdb_view.index_key(layer, 90_000)
+    opened: list[str] = []
+
+    def _no_open(path):  # noqa: ANN001
+        opened.append(str(path))
+        raise AssertionError("预热不该再打开数据源重扫整层")
+
+    monkeypatch.setattr(filegdb_view, "_open_layer", _no_open)
+
+    class _Kernel:
+        def run(self, code, timeout=None):  # noqa: ANN001
+            # 预览（同一内核、先拿到锁）这次整层扫把索引写出来了。
+            filegdb_view.write_index(index_file, key, [1, 2, 3], [(0.0, 0.0, 1.0, 1.0)] * 3)
+            box: dict[str, Any] = {}
+            exec(code, {"set_result": lambda value: box.setdefault("result", value)})
+            return SimpleNamespace(ok=True, result=box.get("result"))
+
+    scanner = CatalogScanService(workspace, kernel=lambda: _Kernel())
+    with caplog.at_level(logging.INFO, logger="gis_cli.web.catalog_scan"):
+        assert scanner._warm_indexes(_Kernel()) == 0
+
+    assert opened == [], "内核里应该直接按指纹跳过"
+    assert any("视口索引预热跳过" in r.getMessage() for r in caplog.records)
+
+
+def test_scan_state_does_not_block_on_index_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """预热在建索引时 ``state()`` 必须立刻返回（DAIR-394 B1）。
+
+    预热要占内核几十秒，**不能**同时占扫描状态锁：``GET /api/catalog/scan``
+    （``state()``）和刷新按钮（``trigger()``）拿的是同一把锁，锁里跑预热会让
+    前端轮询卡住、``finished_at`` 迟迟拿不到，目录树重拉被推迟到预热结束。
+    """
+    workspace = tmp_path / "ws"
+    gdb = workspace / "input" / "数据.gdb"
+    gdb.mkdir(parents=True)
+    (gdb / "a00000001.gdbtable").write_bytes(b"fake")
+    catalog = Catalog(workspace / ".gis_agent" / "catalog.db")
+    catalog.upsert(
+        DatasetRecord(path=str(gdb / "big"), kind="feature_class", name="big", feature_count=90_000)
+    )
+    catalog.close()
+
+    warming = threading.Event()
+
+    class _SlowKernel:
+        def run(self, code, timeout=None):  # noqa: ANN001
+            warming.set()
+            time.sleep(2.0)
+            return SimpleNamespace(ok=True, result={"error": "", "count": 90_000})
+
+    monkeypatch.setattr(
+        "gis_cli.datacatalog.scanner.refresh_catalog",
+        lambda *args, **kwargs: RefreshStats(discovered=1, scanned=1),
+    )
+    scanner = CatalogScanService(workspace, kernel=lambda: _SlowKernel())
+    thread = threading.Thread(target=scanner._run, args=((("x",),), [str(gdb)]), daemon=True)
+    thread.start()
+    try:
+        assert warming.wait(10.0), "预热没开始"
+        started = time.monotonic()
+        state = scanner.state()
+        elapsed = time.monotonic() - started
+    finally:
+        thread.join(10.0)
+
+    assert elapsed < 0.5, f"预热期间 state() 阻塞了 {elapsed:.2f}s"
+    assert state["running"] is False and state["finished_at"], "扫描结果要在预热结束前就可见"
+    assert scanner._index_warmed == 1, "预热本身仍要在后台做完"

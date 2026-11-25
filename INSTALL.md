@@ -2,23 +2,21 @@
 
 ## 🚀 一键安装（推荐）
 
-### Windows 用户
+### Windows / Git Bash / PowerShell
 
-1. **双击运行**：`安装.bat`
-2. 脚本会自动：
-   - ✅ 查找 ArcGIS Pro Python 环境
-   - ✅ 安装所有依赖
-   - ✅ 配置启动脚本
-   - ✅ 询问是否立即启动
-
-3. **后续使用**：双击 `快速启动.bat`
-
-### 所有平台
-
-运行 Python 安装脚本：
 ```bash
 python install.py
 ```
+
+1. 脚本会：
+   - ✅ 用 `arcpy_bridge` 的发现链找 ArcGIS Pro 的 Python
+   - ✅ 在临时 venv 里验一次 `pip install -e .` 是否可行（装不上不影响）
+   - ✅ 把 `giscli.cmd` / `giscli.ps1` / `giscli` 写进 `%LOCALAPPDATA%\Programs\giscli`
+   - ✅ **只**向用户级 PATH（`HKCU\Environment`）追加这一个目录，幂等
+   - ✅ 跑一次 `giscli doctor` 并打印结果
+2. **后续使用**：任何目录敲 `giscli`（不需要管理员权限，不装进 Pro 环境）
+
+> 旧的 `一键启动.bat` 已弃用，内容已改成转发 `giscli web`，保留文件名为老快捷方式兜底。
 
 ---
 
@@ -66,32 +64,43 @@ cd "E:\BST_lab\GIS CLI"
 
 ## 🧭 用 `giscli` 在任何目录启动（推荐）
 
-仓库自带入口 `scripts\giscli.cmd`：它用 `scripts\find_pro_python.cmd` 找到 Pro 自带的
-Python（`ARCGIS_PRO_PYTHON` → `E:\ArcGISPro*` → `D:\ArcGISPro*` →
-`C:\Program Files\ArcGIS\Pro*`），把仓库 `src` 放进 `PYTHONPATH` 后执行
-`python -m gis_cli.agent.cli`。**不需要 pip install，也不生成 exe**。
+一条命令装好，之后任何目录、cmd / PowerShell / **Git Bash** 里都能敲 `giscli`：
 
 ```bash
-# 一次性：把 scripts 目录加入用户级 PATH（幂等，重复跑不会重复追加）
-python scripts\install_shim.py
+# 一次性安装：写 shim → 只追加用户级 PATH → 跑一次自检
+python install.py
 
 # 之后（新开一个终端）在任何目录都能用
 giscli --help
+giscli doctor                        # Pro python / arcpy / 依赖 / pyproj / web / src / 工作空间
 giscli init D:\giswork\demo          # 建好 demo\workspace\{input,output,temp}
 cd /d D:\giswork\demo && giscli chat  # 数据丢进 workspace\input
 
 giscli --new-window chat              # 新开一个终端窗口跑同一件事
 
 # 撤销 PATH 改动（只删这一条，别的条目原样保留）
-python scripts\install_shim.py --remove
+# --scripts-dir 不能省：缺省值是 scripts\ 自己，删的就不是这次装进去的那一条
+# 目录用 install.py 结尾打印的字面路径（cmd / PowerShell / Git Bash 通用）；
+# 下面这条是 cmd 写法，PowerShell 换成 "$env:LOCALAPPDATA\Programs\giscli"
+python scripts/install_shim.py --remove --scripts-dir "%LOCALAPPDATA%\Programs\giscli"
 ```
+
+装的是什么：`%LOCALAPPDATA%\Programs\giscli\` 下的三份 shim（`giscli.cmd` /
+`giscli.ps1` / `giscli`），它们只做一件事——用 `arcpy_bridge` 那**同一套**发现链
+找 Pro 的 python，把仓库 `src` 放进 `PYTHONPATH` 后跑 `python -m gis_cli.agent.cli`。
+**不装进 Pro 环境、不生成 exe、不动系统 PATH。** 仓库放在中文目录也不影响。
+
+> 旧机器上如果 PATH 里还留着仓库 `scripts\` 目录（老 shim 的装法）且排在前面，
+> `giscli` 会先解析到那一份——三份 shim 内容等价，行为一样；不想要旧条目就单独删掉它。
+
+> `一键启动.bat` **兼容保留**：内容已改成转发 `giscli web`。
 
 > **已知限制（不修）**：Pro 环境里 pip 生成的
 > `...\arcgispro-py3\Scripts\gis-agent.exe` 是坏的（任何参数 rc=1、零输出），
 > Pro 环境的 pip 本身也会报 `BuildDependencyInstallError`。两者都不动——`arcpy`
 > 与 Pro 安装/许可是绑死的，硬修只会把环境搞得更乱；`giscli` 绕开它们。
-> `gis-agent` 这个名字保持原有行为不变。
-> **PATH 只改用户级**（`HKCU\Environment`），系统级 PATH 一律不碰。
+> `gis-agent` 这个名字保留为兼容别名。
+> **PATH 只改用户级**（`HKCU\Environment`），系统级 PATH 一律不碰；**不需要管理员权限**。
 
 ---
 

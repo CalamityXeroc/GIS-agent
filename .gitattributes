@@ -3,3 +3,7 @@
 # 显式声明 eol，避免 clone 时的 core.autocrlf 设置决定脚本能不能跑。
 *.bat text eol=crlf
 *.cmd text eol=crlf
+# Git Bash 的入口是无扩展名的 sh 脚本，会被 core.autocrlf 转成 CRLF；
+# 那样 exec 时报 "/usr/bin/env: 'bash\r': No such file or directory"，必须锁 LF。
+scripts/giscli text eol=lf
+*.sh text eol=lf

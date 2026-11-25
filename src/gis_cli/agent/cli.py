@@ -762,11 +762,16 @@ def web_cmd(
         console.print("缺少 Web 依赖：pip install -e .[web]")
         raise typer.Exit(code=1)
 
+    from ..ui.logging_setup import setup_engine_logging
     from ..web.app import create_app
     from ..web.autostart import read_panel_state, restore_panel_state, write_panel_state
     from ..web.security import load_or_create_token
 
     ws = (workspace or _default_web_workspace()).resolve()
+    # 引擎日志落 ``<workspace>/.gis_agent/logs/engine.log``（照 ``run`` / ``chat``）。
+    # 目录扫描与视口索引预热只写日志、不写界面，没有这一行整个会话连日志文件都不
+    # 会出现（DAIR-397 真机：十来次 ``gis web`` 会话里 engine.log 压根不存在）。
+    setup_engine_logging(ws)
     resolved_token = token or load_or_create_token(ws)
     browse_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     url = f"http://{browse_host}:{port}/?token={resolved_token}"
@@ -803,7 +808,9 @@ def main():
 
     if NEW_WINDOW_FLAG in argv:
         raise SystemExit(relaunch(argv))
-    app()
+    # 产品名：gis_cli.boot 会设 GISCLI_PROG=giscli（不设的话 --help 里会写成
+    # "python -m gis_cli.agent.cli"）；gis-agent 这个兼容别名不设，保持原样。
+    app(prog_name=os.environ.get("GISCLI_PROG") or None)
 
 
 if __name__ == "__main__":
