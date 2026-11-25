@@ -158,6 +158,7 @@ workspace/成果展示/**/Blank.atbx
 !workspace/成果展示/**/*.png
 # 保留工作区结构
 !workspace/input/.gitkeep
+!workspace/output/
 !workspace/output/.gitkeep
 !workspace/temp/.gitkeep
 !workspace/README.md

@@ -171,7 +171,8 @@ pip install -e .
 └── scripts/                   # giscli 三份 shim / install_shim.py / check_install.py
 ```
 
-运行时自动创建 `workspace/{input,output,temp}` 与 `workspace/.gis_agent/`（trace、日志、token）。
+运行时在 `<工作区>/.gis_agent/` 下写 trace、日志与 token；`workspace/{input,output,temp}`
+骨架随仓库自带（说明见 `workspace/README.md`），自己另建项目目录用 `giscli init <目录>`。
 
 ---
 
