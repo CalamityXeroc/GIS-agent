@@ -69,7 +69,7 @@ web = [
 #: **必然失败**。真正能装的是下面这组自带 GDAL 二进制的 wheel：pyogrio/rasterio
 #: 各自打包了一份 libgdal（实测 3.12.4 / 3.12.2，互不干扰），pyproj 带 PROJ。
 #: 代价是没有 `osgeo` 模块，GDAL 配方只能用 pyogrio/rasterio 的 API。
-#: 版本号见 docs/p0-1b-env.md（在 .venv-gdal 里实测装通的组合）。
+#: 版本号是在 .venv-gdal 里实测装通的组合，见 README 的「GDAL 后端」一节。
 gdal = [
   "geopandas>=1.0",
   "shapely>=2.0",

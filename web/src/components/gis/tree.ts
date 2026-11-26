@@ -4,7 +4,7 @@ import type { DatasetItem } from '@/lib/api'
  * 把 catalog 的扁平 `path` 还原成「文件夹 → .gdb → 要素类」的目录树。
  *
  * - 用所有数据集的**公共目录前缀**当根（真实工作区里是 `.../workspace/input`），
- *   这样树里不会出现 `E:\BST_lab\...` 这种机器路径。
+ *   这样树里不会出现 `E:\…\workspace\input` 这种整条机器路径。
  * - `.gdb` 目录按文件夹处理，但用数据库图标、默认展开（它是要素类的容器）。
  *   容器自身也可能有一条 `kind='gdb'` 的 catalog 记录（DAIR-369 给"打不开也必须
  *   可见"用的），它不能变成盖住成员的叶子节点。

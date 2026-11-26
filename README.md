@@ -28,7 +28,7 @@ src/gis_cli/
 ├── cartography/         # 制图：facts → design → render → qc
 ├── datacatalog/         # SQLite 数据目录（字段名 / 坐标系 / 范围）
 ├── web/                 # 本地 Web 服务（FastAPI）：datasets / profile / rows / distinct / raster bands / preview
-├── recipes/             # 48 个 GIS 方法论配方（自带验证断言）
+├── recipes/             # 47 个 GIS 方法论配方（自带验证断言）
 ├── ui/                  # 终端界面（转录 / 状态行 / 输入框 / 命令）
 ├── trace/               # 每次 run 的 JSONL + Markdown 报告
 ├── requirements/        # 需求抽取（任务书 → 可验收清单）
@@ -94,7 +94,7 @@ web/
 
 **数据与方法论**
 - SQLite 数据目录：真实字段名 / 坐标系 / 范围 / 要素数（懒扫描，启动不阻塞）
-- 48 个配方：投影 / 缓冲 / 空间连接 / 核密度 / 局部莫兰 / 可达性 / 栅格运算…
+- 47 个配方：投影 / 缓冲 / 空间连接 / 核密度 / 局部莫兰 / 可达性 / 栅格运算…
   每个配方自带 validation 断言
 - 配方沉淀：`giscli distill` 把一次成功运行泛化成候选配方（静态门禁 → 回放验证 → 采纳入库），
   采纳后下次启动自动加载并回流进 prompt；UI 里 `/distill` 同样可用
@@ -145,6 +145,10 @@ web/
 - 💡 **如遇问题**：先跑 `giscli doctor` 看自检输出，命令行选项见 `giscli --help`
 
 ### 方式一：装一次，之后在任何目录都能用 `giscli`（推荐）
+
+前置：**Python ≥ 3.10**（只用来跑 `install.py`，不必是 ArcGIS Pro 的环境），**在仓库根目录下执行**，不需要管理员权限。
+**没有 ArcGIS Pro 也能用**：浏览数据、对话、规划都不需要它，只有真实 GIS 处理与出图才要。
+完整前置与手动安装步骤见 [`INSTALL.md`](INSTALL.md)。
 
 ```powershell
 # 一次性安装：写 shim、只追加用户级 PATH（不需要管理员权限）
@@ -218,7 +222,7 @@ giscli chat --continue
 3. **Agent 会自动识别数据**：
    ```
    📁 工作区状态
-   工作区路径: E:\BST_lab\GIS CLI\workspace
+   工作区路径: <工作区>\workspace
    
    输入数据 (3 个文件):
    - province.shp (shapefile, 2.5 MB)
@@ -323,6 +327,29 @@ giscli loop "制图并导出广西专题图" --workspace .\workspace
 ```
 
 3. 输出位置：交付物在 `workspace/output/`，每次 run 的 trace 在 `workspace/.gis_agent/`（见下一节）。
+
+## GDAL 后端（可选，只有 `[gdal]` 配方需要）
+
+GDAL 后端跑在独立的 venv 里（默认仓库根的 `.venv-gdal`），不装进 ArcGIS Pro 环境，也不掺进 arcpy 那套。
+它对应 `pyproject.toml` 里的 `gdal` 可选 extra：**不装不影响正常使用**——声明了
+`backend: [arcpy, gdal]` 的配方优先走 arcpy，其余配方只走 arcpy，引擎照常工作；
+只有真要跑 GDAL 这一侧时才需要装。
+
+```powershell
+# 仓库根目录下执行；Python 3.10+ 即可，不必是 Pro 的 python
+py -3.12 -m venv .venv-gdal
+.venv-gdal\Scripts\python.exe -m pip install -e ".[gdal]"
+# 已经 pip 装过本包、不在仓库里跑：.venv-gdal\Scripts\python.exe -m pip install "gis-task-cli[gdal]"
+
+# 官方源慢（pyogrio 实测 <0.3 MB/s）就换镜像，装的是同一组包：
+# .venv-gdal\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple `
+#     geopandas pyogrio shapely pyproj rasterio matplotlib
+```
+
+- **不用装 OSGeo4W**：GDAL / PROJ 的二进制由各 wheel 自带，装完也不需要联网运行。
+- venv 不在默认位置就设 `GIS_GDAL_PYTHON=<解释器路径>`；查找顺序是 `GIS_GDAL_PYTHON` → 项目根 `.venv-gdal` → 当前目录 `.venv-gdal`。
+- 系统里若挂着指向 PostgreSQL 的 `PROJ_LIB` / `PROJ_DATA` / `GDAL_DATA`（那套 `proj.db` 版本过旧，会以 "EPSG 4326 unknown" 炸出来），GDAL 执行器会自动丢掉指向 venv 之外的这几个变量。
+- 缺解释器时配方报错会指到本节。
 
 ## 运行产物
 

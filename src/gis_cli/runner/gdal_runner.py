@@ -3,7 +3,7 @@
 
 为什么不能复用 ``runtime/code_runner.py``：那套执行器从头到尾都是 ArcGIS 的
 （持久内核启动时 ``import arcpy``，子进程也走 ``run_arcpy_code``）。GDAL 栈装在
-另一个 venv（``.venv-gdal``，见 ``docs/p0-1b-env.md``），两者互不兼容。
+另一个 venv（``.venv-gdal``，见 README 的「GDAL 后端」一节），两者互不兼容。
 
 所以这里每次起一个**一次性子进程**，但协议与 ``CodeRunner`` 的子进程路径是
 **同一份**：driver 脚本直接拿 ``arcpy_bridge._build_runner_script()``，只把
@@ -16,7 +16,7 @@
    ``"input/x.shp"`` 只能靠进程工作目录落到工作区；
 2. **清掉指向 venv 之外的 ``PROJ_LIB`` / ``PROJ_DATA`` / ``GDAL_DATA``**：本机
    PostgreSQL 的 proj.db layout 太旧，不清会以 "EPSG 4326 unknown" 的形式炸
-   （见 ``docs/p0-1b-env.md`` §4.1）；
+   （见 README 的「GDAL 后端」一节）；
 3. **超时杀进程树**：GDAL 代码常自己再起子进程（multiprocessing / 命令行），
    只杀 direct child 会留下攥着 .tif / .gpkg 句柄的孤儿，下一次写就 PermissionError。
 
@@ -42,11 +42,11 @@ logger = logging.getLogger(__name__)
 #: 覆盖解释器路径的环境变量（优先于缺省的 ``.venv-gdal``）
 PYTHON_ENV_VAR = "GIS_GDAL_PYTHON"
 
-#: 缺省 venv 目录名（DAIR-56 建的，见 docs/p0-1b-env.md）
+#: 缺省 venv 目录名（DAIR-56 建的，见 README 的「GDAL 后端」一节）
 GDAL_VENV_DIRNAME = ".venv-gdal"
 
-#: 缺环境时指给人看的那份文档
-ENV_DOC = "docs/p0-1b-env.md"
+#: 缺环境时指给人看的那份文档（随包发布的只有 README）
+ENV_DOC = "README.md 的「GDAL 后端」一节"
 
 #: 这些是**数据目录**而非解释器：指向 venv 之外时必须丢掉（见模块 docstring 第 2 点）
 _FOREIGN_ENV_KEYS = ("PROJ_LIB", "PROJ_DATA", "GDAL_DATA")

@@ -3,11 +3,11 @@ r"""启动前的安装检查：决定要不要跑 ``pip install -e .``。
 
 ## 为什么需要它
 
-``一键启动.bat`` 原来每次启动都跑 ``pip install -e .``，实测要卡几十秒到
+旧启动脚本原来每次启动都跑 ``pip install -e .``，实测要卡几十秒到
 几分钟。而 editable 安装的本质只是往 site-packages 放一个 ``.pth``：
 
     site-packages/__editable__.gis_task_cli-0.7.1.pth
-      → 内容就是一行：E:\BST_lab\GIS_CLI\src
+      → 内容就是一行：<仓库>\src
 
 源码改动**自动生效**，根本不需要重装。只有下面几种情况才真的需要：
 
